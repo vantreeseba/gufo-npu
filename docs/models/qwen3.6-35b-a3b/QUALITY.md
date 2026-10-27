@@ -88,26 +88,29 @@ other change is prose position 11, gap 0.10).
 
 ### Reference speed and memory
 
-Release build, 32 threads (Ryzen AI MAX+ 395), the GGUF in page cache, same
-run: whole-prompt forward 2.7–3.9 tok/s (17–39 tokens: each expert's rows
-are dequantized once per prompt), one token at a time 1.2 tok/s. Peak RSS
-13.5 GB, all but 0.25 GB of it file-backed pages of the memory-mapped GGUF
-(only the experts the prompts touch are read); nothing is dequantized ahead
-of use. The full test takes ~60 s.
+Release build, Ryzen AI MAX+ 395 (matrix products on 16 threads,
+`GgufProjections` in double), the GGUF in page cache, same run: whole-prompt
+forward 5.6–6.0 tok/s (17–39 tokens: each expert's rows are dequantized once
+per prompt), one token at a time 5.0 tok/s. Peak RSS 12.9 GB, all but
+0.27 GB of it file-backed pages of the memory-mapped GGUF (only the experts
+the prompts touch are read); nothing is dequantized ahead of use. The full
+test takes ~30 s.
 
 ## Decoder vs reference
 
 `tests/models/qwen36/decoder_test.cpp` (label `model`, same variables): the
-one-token decode step (`Decoder`, fp32 with an fp16 K/V cache, the MoE
-routing of `moe.hpp`) against the reference, token by token over the chat
-prompt, both on the reference's GGUF projections, so only the non-matrix
-math differs. 2026-10-27:
+CPU decode path, `Decoder` (fp32 with an fp16 K/V cache, the MoE routing of
+`moe.hpp`) over `GgufProjections` in fp32, against the reference (the same
+GGUF in double), token by token over the chat prompt. 2026-10-27:
 
 | Check | Pass | Measured |
 |---|---|---|
-| Logits rel. L2 up to the first token routed differently | < 2e-3 | 3.6e-4 (2B decoder: 4.3e-4) |
+| Logits rel. L2 up to the first token routed differently | < 2e-3 | 3.3e-4 (2B decoder on the same projections: 4.3e-4) |
 | Reference's 8th/9th expert gap where routing first differs | < 1e-3 | 1.3e-4 (position 13, layer 36) |
 | Argmax | 17/17 | 17/17 |
+
+The same decoder over the reference's own double projections gave 3.6e-4
+and the same routing differences, so the fp32 dot products add little.
 
 Top-k routing is discontinuous. In 17 tokens × 40 layers the reference saw
 7 routings whose 8th and 9th expert probabilities were within 0.1% of each

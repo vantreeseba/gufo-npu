@@ -35,6 +35,25 @@ of 3 repeats, 256 generated tokens.
 
 Reproduce: `python3 tools/bench/openai_bench.py --base-url http://<host>:13305/api/v1 --model qwen3.6-moe-35b-a3b-FLM --prompt-tokens 16,128,1024,4096,8192 --repeats 3 --max-tokens 256 --warmup 2`.
 
+## CPU decode (reference point)
+
+The CPU decode path checked by `qwen36_decoder_test`: `Decoder` over
+`GgufProjections` in fp32, straight from the UD-Q4_K_XL GGUF (2.75 GB read
+per token, mostly Q8_0; a fused Q8_0 dot, other types dequantized per row),
+16 threads, release build, GGUF in page cache. 2026-10-27: one decode pass
+over 10 chat-prompt tokens to warm up, then the same 10 tokens timed; three
+runs: 43.5, 43.6 and 43.4 ms per token, **23.0 tok/s** at short context.
+
+- Matrix products take 39.5 ms of it: the LM head 5.2 ms (540 MB, ~104 GB/s),
+  the 640 routed-expert products 18.4 ms (~29 µs each), DeltaNet and
+  attention inputs 10.1 ms. The rest is the CPU mixers and routing.
+- With one thread per hardware thread the same step took 635 ms: every
+  `SpinPool::Run` waits for all its workers, and an oversubscribed CPU parks
+  one of them for a time slice (~0.7 ms) per call.
+- The CPU reads these weights at ~70 GB/s averaged over the step, more than
+  the NPU's read bandwidth (52–56 GB/s in the plan's research; ~40 GB/s
+  each way in `bench bandwidth` below).
+
 ## DDR bandwidth (Phase 1)
 
 `gufo-npu bench bandwidth --iters 30`: 64 MiB int32 copy through all 8
