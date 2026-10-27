@@ -6,6 +6,10 @@
 #include <stdexcept>
 #include <string>
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 #include "core/parallel.hpp"
 #include "core/quant.hpp"
 
@@ -128,46 +132,229 @@ void PackQ4KSuper(const std::uint8_t* src, std::uint8_t* block, std::size_t m) {
   }
 }
 
-// Row m of a block from its kKTile fp32 weights: per group a min/max fit,
-// with the minimum rounded down onto dmin's grid (int8) and the step rounded
-// up onto d's (uint8), so every weight is within the group's 16 levels.
+// The fit sums over a group in kLanes partial sums (element l into lane
+// l % kLanes), added up in lane order at the end, so the AVX2 and scalar
+// paths give the same result.
+constexpr std::size_t kLanes = 8;
+
+float Sum(const float* lanes) {
+  float s = 0;
+  for (std::size_t j = 0; j < kLanes; ++j) {
+    s += lanes[j];
+  }
+  return s;
+}
+
+// The nearest code to (x - offset) * scale, clamped to [0, 15] first (ties
+// round up).
+float Code(float x, float offset, float scale) {
+  const float v = std::min(std::max((x - offset) * scale, 0.0f), 15.0f);
+  return static_cast<float>(static_cast<int>(v + 0.5f));
+}
+
+#if defined(__AVX2__)
+float Sum(__m256 v) {
+  alignas(32) float lanes[kLanes];
+  _mm256_store_ps(lanes, v);
+  return Sum(lanes);
+}
+
+__m256 Code(__m256 x, __m256 offset, __m256 scale) {
+  __m256 v = _mm256_mul_ps(_mm256_sub_ps(x, offset), scale);
+  v = _mm256_min_ps(_mm256_max_ps(v, _mm256_setzero_ps()),
+                    _mm256_set1_ps(15.0f));
+  return _mm256_cvtepi32_ps(
+      _mm256_cvttps_epi32(_mm256_add_ps(v, _mm256_set1_ps(0.5f))));
+}
+#endif
+
+// Error sum of squares of one group's weights `x` under (step, min) with
+// their nearest codes, weighted by `w`.
+float GroupError(const float* x, const float* w, float step, float min) {
+  const float inverse = step > 0 ? 1.0f / step : 0.0f;
+#if defined(__AVX2__)
+  const __m256 vmin = _mm256_set1_ps(min);
+  const __m256 vstep = _mm256_set1_ps(step);
+  const __m256 vinverse = _mm256_set1_ps(inverse);
+  __m256 sse = _mm256_setzero_ps();
+  for (std::size_t l = 0; l < kGroup; l += kLanes) {
+    const __m256 xv = _mm256_loadu_ps(x + l);
+    const __m256 code = Code(xv, vmin, vinverse);
+    const __m256 e =
+        _mm256_sub_ps(_mm256_add_ps(vmin, _mm256_mul_ps(vstep, code)), xv);
+    sse = _mm256_add_ps(
+        sse, _mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(w + l), e), e));
+  }
+  return Sum(sse);
+#else
+  float sse[kLanes] = {};
+  for (std::size_t l = 0; l < kGroup; l += kLanes) {
+    for (std::size_t j = 0; j < kLanes; ++j) {
+      const float code = Code(x[l + j], min, inverse);
+      const float e = min + step * code - x[l + j];
+      sse[j] += w[l + j] * e * e;
+    }
+  }
+  return Sum(sse);
+#endif
+}
+
+// For code = Code(x, lo, inverse) over one group: the sums of w * code,
+// w * code^2 and w * code * x.
+void CodeSums(const float* x, const float* w, float lo, float inverse,
+              float* sum_l, float* sum_l2, float* sum_xl) {
+#if defined(__AVX2__)
+  const __m256 vlo = _mm256_set1_ps(lo);
+  const __m256 vinverse = _mm256_set1_ps(inverse);
+  __m256 l1 = _mm256_setzero_ps();
+  __m256 l2 = _mm256_setzero_ps();
+  __m256 xl = _mm256_setzero_ps();
+  for (std::size_t l = 0; l < kGroup; l += kLanes) {
+    const __m256 xv = _mm256_loadu_ps(x + l);
+    const __m256 code = Code(xv, vlo, vinverse);
+    const __m256 wc = _mm256_mul_ps(_mm256_loadu_ps(w + l), code);
+    l1 = _mm256_add_ps(l1, wc);
+    l2 = _mm256_add_ps(l2, _mm256_mul_ps(wc, code));
+    xl = _mm256_add_ps(xl, _mm256_mul_ps(wc, xv));
+  }
+  *sum_l = Sum(l1);
+  *sum_l2 = Sum(l2);
+  *sum_xl = Sum(xl);
+#else
+  float l1[kLanes] = {};
+  float l2[kLanes] = {};
+  float xl[kLanes] = {};
+  for (std::size_t l = 0; l < kGroup; l += kLanes) {
+    for (std::size_t j = 0; j < kLanes; ++j) {
+      const float code = Code(x[l + j], lo, inverse);
+      const float wc = w[l + j] * code;
+      l1[j] += wc;
+      l2[j] += wc * code;
+      xl[j] += wc * x[l + j];
+    }
+  }
+  *sum_l = Sum(l1);
+  *sum_l2 = Sum(l2);
+  *sum_xl = Sum(xl);
+#endif
+}
+
+// One group's step and minimum, before they round onto the block's grids:
+// the weighted least-squares fit over the code assignments of 37 candidate
+// steps around the min/max one (llama.cpp's make_qkx3_quants, without its
+// minimum <= 0 clamp, since q4nx's sub-minimum is signed).
+void FitGroup(const float* x, const float* w, float* step_out, float* min_out) {
+  const auto [lo_it, hi_it] = std::minmax_element(x, x + kGroup);
+  const float lo = *lo_it;
+  const float hi = *hi_it;
+  *step_out = 0;
+  *min_out = lo;
+  if (hi <= lo) {
+    return;
+  }
+  float lanes_w[kLanes] = {};
+  float lanes_x[kLanes] = {};
+  float lanes_x2[kLanes] = {};
+  for (std::size_t l = 0; l < kGroup; l += kLanes) {
+    for (std::size_t j = 0; j < kLanes; ++j) {
+      lanes_w[j] += w[l + j];
+      lanes_x[j] += w[l + j] * x[l + j];
+      lanes_x2[j] += w[l + j] * x[l + j] * x[l + j];
+    }
+  }
+  const float sum_w = Sum(lanes_w);
+  const float sum_x = Sum(lanes_x);
+  const float sum_x2 = Sum(lanes_x2);
+  float best = GroupError(x, w, (hi - lo) / 15.0f, lo);
+  *step_out = (hi - lo) / 15.0f;
+  constexpr int kSteps = 36;
+  for (int is = 0; is <= kSteps; ++is) {
+    const float inverse =
+        (-0.9f + 0.05f * static_cast<float>(is) + 15.0f) / (hi - lo);
+    float sum_l;
+    float sum_l2;
+    float sum_xl;
+    CodeSums(x, w, lo, inverse, &sum_l, &sum_l2, &sum_xl);
+    const float det = sum_w * sum_l2 - sum_l * sum_l;
+    if (det <= 0) {
+      continue;
+    }
+    const float step = (sum_w * sum_xl - sum_x * sum_l) / det;
+    const float min = (sum_l2 * sum_x - sum_l * sum_xl) / det;
+    if (step <= 0) {
+      continue;
+    }
+    // sum w (min + step * code - x)^2, expanded over the sums above.
+    const float sse = sum_x2 + step * step * sum_l2 + min * min * sum_w +
+                      2 * (step * min * sum_l - step * sum_xl - min * sum_x);
+    if (sse < best) {
+      best = sse;
+      *step_out = step;
+      *min_out = min;
+    }
+  }
+}
+
+// Row m of a block from its kKTile fp32 weights. Each group's step and
+// minimum come from FitGroup, weighting each weight by av + |w| (llama.cpp's
+// Q4_K weighting: larger weights count more); d and dmin are set from the
+// largest of them, and each group then takes the sub-scale and sub-minimum
+// within one grid step of its fit, and the nearest codes, with the lowest
+// weighted error.
 void PackRowBlock(const float* w, std::uint8_t* block, std::size_t m) {
-  float lo[kGroups];
-  float hi[kGroups];
+  float sum_x2 = 0;
+  for (std::size_t k = 0; k < kKTile; ++k) {
+    sum_x2 += w[k] * w[k];
+  }
+  const float av = std::sqrt(2 * sum_x2 / static_cast<float>(kKTile));
+  float weight[kKTile];
+  for (std::size_t k = 0; k < kKTile; ++k) {
+    weight[k] = av + std::abs(w[k]);
+  }
+  float step[kGroups];
+  float min[kGroups];
+  float max_step = 0;
   float max_abs_min = 0;
   for (std::size_t g = 0; g < kGroups; ++g) {
-    const auto [lo_it, hi_it] =
-        std::minmax_element(w + g * kGroup, w + (g + 1) * kGroup);
-    lo[g] = *lo_it;
-    hi[g] = *hi_it;
-    max_abs_min = std::max(max_abs_min, std::abs(lo[g]));
+    FitGroup(w + g * kGroup, weight + g * kGroup, &step[g], &min[g]);
+    max_step = std::max(max_step, step[g]);
+    max_abs_min = std::max(max_abs_min, std::abs(min[g]));
   }
+  const std::uint16_t d_bits = Bf16AtLeast(max_step / 255.0f);
   const std::uint16_t dmin_bits = Bf16AtLeast(max_abs_min / 127.0f);
-  const float dmin = quant::Bf16ToFloat(dmin_bits);
-  std::int8_t mn[kGroups];
-  float need[kGroups];  // the step each group needs from its minimum
-  float max_need = 0;
-  for (std::size_t g = 0; g < kGroups; ++g) {
-    const float q = dmin > 0 ? std::floor(lo[g] / dmin) : 0.0f;
-    mn[g] = static_cast<std::int8_t>(std::clamp(q, -127.0f, 127.0f));
-    need[g] = (hi[g] - dmin * static_cast<float>(mn[g])) / 15.0f;
-    max_need = std::max(max_need, need[g]);
-  }
-  const std::uint16_t d_bits = Bf16AtLeast(max_need / 255.0f);
   const float d = quant::Bf16ToFloat(d_bits);
+  const float dmin = quant::Bf16ToFloat(dmin_bits);
   SetSuper(block, m, d_bits, dmin_bits);
   for (std::size_t g = 0; g < kGroups; ++g) {
-    const float sc = d > 0 ? std::ceil(need[g] / d) : 0.0f;
-    SetSub(block, m, g, static_cast<std::uint8_t>(std::clamp(sc, 0.0f, 255.0f)),
-           mn[g]);
-    float step;
-    float min;
-    Params(block, m, g, &step, &min);
+    const float* x = w + g * kGroup;
+    const float* wg = weight + g * kGroup;
+    const float sc0 = d > 0 ? std::nearbyint(step[g] / d) : 0.0f;
+    const float mn0 = dmin > 0 ? std::nearbyint(min[g] / dmin) : 0.0f;
+    float best = INFINITY;
+    float best_sc = 0;
+    float best_mn = 0;
+    for (int dsc = -1; dsc <= 1; ++dsc) {
+      const float sc = std::clamp(sc0 + static_cast<float>(dsc), 0.0f, 255.0f);
+      for (int dmn = -1; dmn <= 1; ++dmn) {
+        const float mn =
+            std::clamp(mn0 + static_cast<float>(dmn), -127.0f, 127.0f);
+        const float sse = GroupError(x, wg, d * sc, dmin * mn);
+        if (sse < best) {
+          best = sse;
+          best_sc = sc;
+          best_mn = mn;
+        }
+      }
+    }
+    SetSub(block, m, g, static_cast<std::uint8_t>(best_sc),
+           static_cast<std::int8_t>(best_mn));
+    float step_g;
+    float min_g;
+    Params(block, m, g, &step_g, &min_g);
+    const float inverse = step_g > 0 ? 1.0f / step_g : 0.0f;
     for (std::size_t l = 0; l < kGroup; ++l) {
-      float code =
-          step > 0 ? std::nearbyint((w[g * kGroup + l] - min) / step) : 0.0f;
-      code = std::clamp(code, 0.0f, 15.0f);
-      SetCode(block, m, g * kGroup + l, static_cast<std::uint8_t>(code));
+      SetCode(block, m, g * kGroup + l,
+              static_cast<std::uint8_t>(Code(x[l], min_g, inverse)));
     }
   }
 }

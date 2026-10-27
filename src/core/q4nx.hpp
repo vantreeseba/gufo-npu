@@ -48,9 +48,9 @@ std::size_t PaddedRows(std::size_t rows);
 
 // Packs a GGUF weight of `rows` x `dim` (row-major, ggml block types).
 // Q4_K keeps its codes; every other type is dequantized and requantized: per
-// 32 in-features a min/max fit whose minimum and step round onto the block's
-// d and dmin grid (step up, minimum down), so a weight is off by at most half
-// a step (its group's range / 15 plus d) / 2. Padding rows are zero.
+// 32 in-features the step and minimum with the lowest error (weighted towards
+// larger weights, as llama.cpp's Q4_K quantizer does; the extremes may clip),
+// rounded onto the block's d and dmin grids. Padding rows are zero.
 Matrix Pack(gguf::GgmlType type, const std::uint8_t* data, std::size_t rows,
             std::size_t dim);
 // One GGUF weight in a fused matrix.

@@ -124,9 +124,10 @@ int CheckRequant() {
                                   src + (g + 1) * q4nx::kGroup);
         max_abs_min = std::fmax(max_abs_min, std::fabs(lo[g]));
       }
-      // A group's minimum sits up to dmin below its own, so it needs a step
-      // of up to (hi - lo + dmin) / 15, which its uint8 sub-scale rounds up
-      // by at most d. Every weight is within half its step.
+      // A min/max fit would put every weight within half of its group's step,
+      // (hi - lo + dmin) / 15 rounded up by at most d. The packer trades the
+      // extremes for a lower error overall (it may clip a weight at either
+      // end), but no weight may be off by more than that whole step.
       const float dmin = max_abs_min / 127.0f * kUp;
       float max_need = 0;
       for (std::size_t g = 0; g < kGroups; ++g) {
@@ -135,7 +136,7 @@ int CheckRequant() {
       const float d = max_need / 255.0f * kUp;
       for (std::size_t g = 0; g < kGroups; ++g) {
         const float bound =
-            0.5f * ((hi[g] - lo[g] + dmin) / 15.0f + d) * 1.0001f + 1e-9f;
+            ((hi[g] - lo[g] + dmin) / 15.0f + d) * 1.0001f + 1e-9f;
         for (std::size_t l = 0; l < q4nx::kGroup; ++l) {
           const std::size_t i =
               r * kDim + kb * q4nx::kKTile + g * q4nx::kGroup + l;
@@ -151,8 +152,16 @@ int CheckRequant() {
       }
     }
   }
-  std::printf("ok: requant within half a step (rel rms %.4f)\n",
-              std::sqrt(err2 / ref2));
+  // The min/max fit gave 0.0787 on these weights.
+  constexpr double kMaxRelRms = 0.074;
+  const double rel_rms = std::sqrt(err2 / ref2);
+  if (rel_rms > kMaxRelRms) {
+    std::fprintf(stderr, "FAIL: requant rel rms %.4f > %.4f\n", rel_rms,
+                 kMaxRelRms);
+    return 1;
+  }
+  std::printf("ok: requant within a step, rel rms %.4f (min/max fit 0.0787)\n",
+              rel_rms);
   return 0;
 }
 
