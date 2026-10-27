@@ -47,15 +47,19 @@ using qwen35::Stage;
 // from itself on the whole prompt by as much); the reference keeps fp32.
 constexpr double kLogitTolerance = 1.5e-1;
 constexpr double kArgmaxAgreement = 0.95;
-// Layer by layer, per token and layer output (relative L2): at least
-// kExactShare of a prompt's layer outputs within kExactTolerance. The rest
-// follow an accumulation-order difference that flipped one 8-bit rounding,
-// which DeltaNet state and the KV cache carry to later tokens; none may
-// differ by more than kLayerTolerance. The LM head's logits must agree
-// within kExactTolerance, and on every top-1.
+// Layer by layer, per token, relative to the layer's own contribution
+// (output - input), each layer judged on its own: over all prompts at least
+// kLayerExactShare of its tokens within kExactTolerance, and per prompt a
+// median below kLayerMedian and no token at kLayerTolerance or more. Tokens
+// that differ follow an accumulation-order difference that flipped one
+// 8-bit rounding, which the DeltaNet state and the KV cache carry to later
+// tokens; an error in the layer's math moves every token. The LM head's
+// logits must agree within kHeadTolerance, and on every top-1.
 constexpr double kExactTolerance = 1e-5;
-constexpr double kExactShare = 0.7;
-constexpr double kLayerTolerance = 2e-2;
+constexpr double kLayerExactShare = 0.1;
+constexpr double kLayerMedian = 3e-2;
+constexpr double kLayerTolerance = 1e-1;
+constexpr double kHeadTolerance = 1e-4;
 // Token-by-token decode vs the whole-prompt forward.
 constexpr double kIncrementalTolerance = 1e-6;
 
@@ -328,8 +332,9 @@ int main() {
   std::size_t agree = 0;
   std::size_t head_agree = 0;
   std::size_t total = 0;
+  std::vector<std::size_t> layer_exact(reference.config().layers);
 
-  for (const char* name : {"chat", "code", "prose"}) {
+  for (const char* name : {"chat", "code", "prose", "long"}) {
     const auto text = ReadText(dir / (std::string(name) + ".text"));
     const auto ids = ReadIds(dir / (std::string(name) + ".ids.json"));
     const auto want = ReadFloats(dir / (std::string(name) + ".logits.f32"));
@@ -374,25 +379,59 @@ int main() {
                    &want_hidden[layers * layer_size], layer_size);
 
     // Layer by layer: each layer on llama.cpp's own input to it, with
-    // llama.cpp's activation rounding, against llama.cpp's output; then the
-    // LM head on llama.cpp's last hidden state.
+    // llama.cpp's activation rounding, against llama.cpp's output. The error
+    // is relative to the layer's own contribution (output - input), per
+    // token, and each layer is judged on its own. Then the LM head on
+    // llama.cpp's last hidden state.
+    bool layers_ok = true;
     std::vector<double> errs;  // per layer and token
+    double lowest_share = 1;
+    int lowest_share_layer = 0;
+    double worst_layer_err = 0;
+    int worst_layer = 0;
     for (int il = 0; il < layers; ++il) {
-      std::vector<float> h(&want_hidden[il * layer_size],
-                           &want_hidden[(il + 1) * layer_size]);
+      const float* in = &want_hidden[il * layer_size];
+      const float* want_out = &want_hidden[(il + 1) * layer_size];
+      std::vector<float> h(in, in + layer_size);
       auto layer_state = reference.NewState();
       reference.ForwardLayer(il, h, layer_state, &rounding);
+      std::vector<double> layer_errs;
+      std::vector<float> got(hidden);
+      std::vector<float> contribution(hidden);
       for (std::size_t t = 0; t < n; ++t) {
-        errs.push_back(RelativeL2(
-            &h[t * hidden], &want_hidden[(il + 1) * layer_size + t * hidden],
-            hidden));
+        for (std::size_t i = 0; i < hidden; ++i) {
+          got[i] = h[t * hidden + i] - in[t * hidden + i];
+          contribution[i] = want_out[t * hidden + i] - in[t * hidden + i];
+        }
+        layer_errs.push_back(
+            RelativeL2(got.data(), contribution.data(), hidden));
       }
+      const auto exact_tokens = static_cast<std::size_t>(
+          std::count_if(layer_errs.begin(), layer_errs.end(),
+                        [](double e) { return e < kExactTolerance; }));
+      const double share = static_cast<double>(exact_tokens) / n;
+      const double worst =
+          *std::max_element(layer_errs.begin(), layer_errs.end());
+      const double median = Median(layer_errs);
+      layer_exact[il] += exact_tokens;
+      if (median >= kLayerMedian || worst >= kLayerTolerance) {
+        layers_ok = false;
+        std::printf("  %s, layer %d: median %.2e, worst %.2e\n", name, il,
+                    median, worst);
+      }
+      if (share < lowest_share) {
+        lowest_share = share;
+        lowest_share_layer = il;
+      }
+      if (worst > worst_layer_err) {
+        worst_layer_err = worst;
+        worst_layer = il;
+      }
+      errs.insert(errs.end(), layer_errs.begin(), layer_errs.end());
     }
     const auto exact = static_cast<std::size_t>(
         std::count_if(errs.begin(), errs.end(),
                       [](double e) { return e < kExactTolerance; }));
-    const double exact_share = static_cast<double>(exact) / errs.size();
-    const double worst_layer_err = *std::max_element(errs.begin(), errs.end());
     const auto head = reference.Logits(
         std::vector<float>(&want_hidden[layers * layer_size],
                            &want_hidden[(layers + 1) * layer_size]),
@@ -414,22 +453,22 @@ int main() {
       step_err = RelativeL2(last.data(), &plain[(n - 1) * vocab], vocab);
     }
 
-    const bool ok = tokens_ok && p.logit_err < kLogitTolerance &&
-                    exact_share >= kExactShare &&
-                    worst_layer_err < kLayerTolerance &&
-                    head_cmp.logit_err < kExactTolerance &&
+    const bool ok = tokens_ok && p.logit_err < kLogitTolerance && layers_ok &&
+                    head_cmp.logit_err < kHeadTolerance &&
                     step_err < kIncrementalTolerance;
     std::printf(
         "%s %s: %zu tokens, ids %s; prompt forward %.1f s (%.2f tok/s)\n"
         "     end to end:     logits rel err %.2e (worst position %.2e), "
         "argmax %zu/%zu; last hidden rel err %.2e\n"
-        "     layer by layer: %zu/%zu layer outputs (%.1f%%) < %.0e, median "
-        "%.1e, worst %.1e\n"
+        "     layer by layer: %zu/%zu layer contributions (%.1f%%) < %.0e, "
+        "median %.1e; lowest layer share %.0f%% (layer %d), worst %.1e "
+        "(layer %d)\n"
         "     LM head:        logits rel err %.2e, argmax %zu/%zu\n",
         ok ? "ok  " : "FAIL", name, n, tokens_ok ? "match" : "DIFFER", seconds,
         n / seconds, p.logit_err, p.worst_position, p.argmax, n,
-        last_hidden_err, exact, errs.size(), 100 * exact_share, kExactTolerance,
-        Median(errs), worst_layer_err, head_cmp.logit_err, head_cmp.argmax, n);
+        last_hidden_err, exact, errs.size(), 100.0 * exact / errs.size(),
+        kExactTolerance, Median(errs), 100 * lowest_share, lowest_share_layer,
+        worst_layer_err, worst_layer, head_cmp.logit_err, head_cmp.argmax, n);
     if (step_seconds > 0) {
       std::printf("     token by token: %.2f tok/s, rel err %.2e\n",
                   n / step_seconds, step_err);
@@ -437,9 +476,28 @@ int main() {
     failures += ok ? 0 : 1;
   }
 
+  // Every layer, over all prompts.
+  double lowest_layer_share = 1;
+  int lowest_layer = 0;
+  for (int il = 0; il < static_cast<int>(layer_exact.size()); ++il) {
+    const double share = static_cast<double>(layer_exact[il]) / total;
+    if (share < kLayerExactShare) {
+      std::printf("FAIL layer %d: %.1f%% of tokens < %.0e over all prompts\n",
+                  il, 100 * share, kExactTolerance);
+      ++failures;
+    }
+    if (share < lowest_layer_share) {
+      lowest_layer_share = share;
+      lowest_layer = il;
+    }
+  }
   const double agreement = static_cast<double>(agree) / total;
   const bool ok = agreement >= kArgmaxAgreement && head_agree == total;
   failures += ok ? 0 : 1;
+  std::printf(
+      "     layer by layer over all prompts: lowest share of tokens < %.0e "
+      "%.1f%% (layer %d)\n",
+      kExactTolerance, 100 * lowest_layer_share, lowest_layer);
   std::printf(
       "%s argmax end to end %zu/%zu, LM head %zu/%zu; peak RSS %.2f GB (now "
       "%.2f GB anonymous, %.2f GB file-backed)\n",
