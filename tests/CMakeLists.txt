@@ -63,6 +63,10 @@ add_test(NAME qwen35_decoder_test COMMAND qwen35_decoder_test)
 set_tests_properties(qwen35_decoder_test PROPERTIES SKIP_RETURN_CODE 77
                      LABELS model)
 
+add_executable(qwen35_config_test models/qwen35/config_test.cpp)
+target_link_libraries(qwen35_config_test PRIVATE gufo_npu_qwen35)
+add_test(NAME qwen35_config_test COMMAND qwen35_config_test)
+
 add_test(NAME cli_version COMMAND gufo-npu version)
 set_tests_properties(cli_version PROPERTIES PASS_REGULAR_EXPRESSION
                      "^gufo-npu ${GUFO_NPU_VERSION}")

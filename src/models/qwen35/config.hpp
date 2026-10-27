@@ -32,13 +32,20 @@ struct Config {
   int linear_value_heads = 0;
   int linear_head_dim = 0;  // key and value head dim
 
-  // MoE (qwen35moe only).
+  // MoE (qwen35moe only): `experts_used` of `experts` routed SwiGLU experts
+  // (softmax over all router logits, top-k, weights renormalized to sum 1)
+  // plus one shared expert scaled by sigmoid(ffn_gate_inp_shexp . x).
   int experts = 0;
   int experts_used = 0;
   int expert_ffn = 0;
   int shared_expert_ffn = 0;
 
+  // Without output.weight the LM head is token_embd.
   bool tied_embeddings = false;
+
+  bool IsMoe() const { return experts > 0; }
+  // Width of the dense FFN, or of the MoE shared expert.
+  int FfnWidth() const { return IsMoe() ? shared_expert_ffn : ffn; }
 
   // MTP layers (index >= layers) are full attention.
   bool IsFullAttention(int layer) const {
