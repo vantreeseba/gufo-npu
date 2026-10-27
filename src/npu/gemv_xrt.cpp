@@ -33,18 +33,20 @@ const char* EpilogueName(Epilogue e) {
 
 std::string Q4nxGemvSequence(std::size_t dim, std::size_t padded_rows,
                              Prologue prologue, Epilogue epilogue,
-                             std::size_t tokens) {
-  return "q4nx_gemv_k" + std::to_string(dim) + "_n" +
+                             std::size_t tokens, const std::string& design) {
+  return design + "_k" + std::to_string(dim) + "_n" +
          std::to_string(padded_rows) + "_" + PrologueName(prologue) + "_" +
          EpilogueName(epilogue) + "_t" + std::to_string(tokens);
 }
 
 struct GemvRuntime::Impl {
   std::filesystem::path dir;
+  GemvDesign design;
   HwContext hw;
   std::map<std::string, std::unique_ptr<Sequence>> sequences;
 
-  explicit Impl(const std::filesystem::path& d) : dir(d), hw(d, "q4nx_gemv") {}
+  Impl(const std::filesystem::path& d, const GemvDesign& g)
+      : dir(d), design(g), hw(d, g.name) {}
 
   Sequence& Get(const std::string& name) {
     auto& slot = sequences[name];
@@ -59,8 +61,10 @@ struct GemvRuntime::Impl {
   }
 };
 
-GemvRuntime::GemvRuntime(const std::filesystem::path& kernel_dir)
-    : impl_(std::make_unique<Impl>(kernel_dir)) {}
+GemvRuntime::GemvRuntime(const std::filesystem::path& kernel_dir,
+                         GemvDesign design)
+    : design_(std::move(design)),
+      impl_(std::make_unique<Impl>(kernel_dir, design_)) {}
 
 GemvRuntime::~GemvRuntime() = default;
 
@@ -121,8 +125,8 @@ struct Q4nxGemv::Impl {
   Impl(GemvRuntime::Impl& rt, const q4nx::Matrix& m, Prologue p, Epilogue e)
       : w_bytes(m.bytes.size()), w(rt.hw.Buffer(w_bytes)) {
     for (std::size_t t = 0; t < kGemvTokens; ++t) {
-      sequences[t] =
-          &rt.Get(Q4nxGemvSequence(m.dim, m.padded_rows, p, e, t + 1));
+      sequences[t] = &rt.Get(
+          Q4nxGemvSequence(m.dim, m.padded_rows, p, e, t + 1, rt.design.name));
     }
     std::memcpy(w.map<void*>(), m.bytes.data(), w_bytes);
     w.sync(XCL_BO_SYNC_BO_TO_DEVICE);
@@ -146,20 +150,22 @@ Q4nxGemv::Q4nxGemv(GemvRuntime& runtime, const q4nx::Matrix& weights,
       rows_(weights.rows),
       padded_rows_(weights.padded_rows),
       epilogue_(epilogue) {
-  if (weights.dim > kGemvMaxDim) {
+  const GemvDesign& design = runtime.design();
+  if (weights.dim > design.max_dim) {
     throw std::invalid_argument("q4nx GEMV: dim above the design's maximum");
   }
-  // Must match VARIANTS in kernels/designs/q4nx_gemv.py.
+  // Must match the design's variants (kernels/designs/q4nx_gemv.py, or a
+  // model's own copy).
   if (epilogue == Epilogue::kSwiGlu) {
     y_token_stride_ = padded_rows_ / 4;
-  } else if (padded_rows_ == kGemvHidden) {
-    y_token_stride_ = kGemvSlot;
+  } else if (padded_rows_ == design.hidden || rows_ == design.hidden) {
+    y_token_stride_ = design.slot();
   } else {
     y_token_stride_ = padded_rows_;
   }
-  impl_->x.emplace(runtime, kGemvInputBytes);
+  impl_->x.emplace(runtime, design.input_bytes());
   impl_->y.emplace(runtime, y_bytes());
-  impl_->residual.emplace(runtime, kGemvResidualBytes);
+  impl_->residual.emplace(runtime, design.residual_bytes());
 }
 
 Q4nxGemv::~Q4nxGemv() = default;
