@@ -1,0 +1,105 @@
+#pragma once
+
+#include <filesystem>
+#include <memory>
+#include <vector>
+
+#include "core/gguf.hpp"
+#include "models/qwen35/config.hpp"
+#include "models/qwen35/decoder.hpp"
+#include "models/qwen35/npu_decoder.hpp"
+
+// Qwen3.6-35B-A3B prompt processing (prefill) on the NPU, v1
+// (docs/research/NPU-MOE-PREFILL.md). The prompt goes through the model
+// layer by layer, all of it (up to kMaxPromptChunk tokens per pass) through
+// each layer before the next, so each expert's weights are converted once per
+// pass. Nothing is kept beside the decoder's own weights: the NPU converts
+// them from the decoder's device buffers (q4nx) to bfp16 per pass
+// (qwen36_35b_a3b_dequant), and bfp16 GEMMs (qwen36_35b_a3b_prefill)
+// multiply them. Per layer:
+//   1. GEMM context: the input projection, the mixer on the CPU (the
+//      family's PrefillMixer: chunked DeltaNet or causal attention), the
+//      output projection, in blocks of up to 1,024 tokens.
+//   2. CPU: post-attention norm, router logits in fp32, top 8 (moe.hpp, as
+//      decode routes), and the tokens grouped by expert.
+//   3. Dequant context: the experts with tokens and the shared expert, and
+//      the next layer's dense matrices.
+//   4. GEMM context: each expert's gate + up over its tokens (rows padded to
+//      256, 512 or 1,024), SwiGLU times the router weight on the CPU, its
+//      down, and the sum into the residual on the CPU. The shared expert is
+//      one more expert, over every token, weighed by its sigmoid gate.
+// So two context switches per layer (~5 ms each). It fills the same
+// DecodeState NpuDecoder decodes from, and the MTP layer's cache.
+namespace gufo_npu::qwen36_35b_a3b {
+
+// Tokens per pass: the prompt is processed in passes of at most this many.
+inline constexpr int kMaxPromptChunk = 16384;
+
+class NpuPrefill {
+public:
+  // Reads `decoder`'s device weights in place; `file` and `decoder` must
+  // outlive it. Throws for models other than Qwen3.6-35B-A3B's shapes.
+  NpuPrefill(const gguf::File& file, qwen35::NpuDecoder& decoder,
+             const std::filesystem::path& kernel_dir);
+  ~NpuPrefill();
+  NpuPrefill(const NpuPrefill&) = delete;
+  NpuPrefill& operator=(const NpuPrefill&) = delete;
+
+  const qwen35::Config& config() const;
+
+  // Runs `count` tokens from state.position and advances the state. With
+  // `hidden`, writes each token's final residual (before output_norm), count
+  // rows of hidden values: the MTP head's input.
+  void Run(const int* tokens, int count, qwen35::DecodeState& state,
+           float* hidden);
+
+  // The MTP layer's cache: for i < count, the pair (hidden row i, tokens[i])
+  // at position + i, where hidden row i is the main model's final residual
+  // at position + i - 1. Appends the MTP attention's keys and values to
+  // `mtp` (an NpuDecoder MTP state); computes no logits.
+  void FillMtp(const float* hidden, const int* tokens, int count, int position,
+               qwen35::DecodeState& mtp);
+
+  // A test hook. With `experts` ([token][layer][experts_used] for the next
+  // Run's tokens, e.g. NpuDecoder::experts() recorded token by token), each
+  // token goes to those experts instead of its own top k, weighed by its own
+  // router probabilities renormalized over them; nullptr routes by itself.
+  // Wherever they differ from its own choice, routing_differences() counts
+  // it and routing_gap() keeps the largest relative probability gap between
+  // an expert only `experts` chose and one only the prefill chose (as
+  // tests/models/qwen36_35b_a3b/npu_decode_test.cpp measures near ties).
+  void FollowRouting(const std::vector<int>* experts);
+  int routing_differences() const;
+  double routing_gap() const;
+
+  // Where the time went since construction.
+  struct Profile {
+    long passes = 0;             // layer-by-layer passes over the prompt
+    long dequants = 0;           // NPU dequant calls
+    long gemms = 0;              // NPU GEMM calls
+    long switches = 0;           // moves between the two NPU programs
+    double dequant_seconds = 0;  // in dequant batches (and their switches)
+    double gemm_seconds = 0;     // in GEMM batches (and their switches)
+    double sync_seconds = 0;     // syncing operand buffers
+    double setup_seconds = 0;    // building the calls (runs, windows)
+    double deltanet_seconds = 0;
+    double attention_seconds = 0;
+    double router_seconds = 0;  // router logits, top k, grouping
+    double expert_seconds = 0;  // gathering rows, SwiGLU, scatter-add
+    double other_seconds = 0;   // the rest (embedding, norms, conversions)
+  };
+  const Profile& profile() const;
+
+private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
+// The prompt hook for SpeculativeGenerate: every prompt token but the last
+// through `prefill`, and the MTP cache over them; the decoder then runs the
+// last token for its logits. Prompts shorter than kMinPrefillPrompt, which
+// the decoder's two-token passes run faster, are left to the decoder.
+inline constexpr int kMinPrefillPrompt = 64;
+qwen35::PromptPrefill PrefillPrompt(NpuPrefill& prefill);
+
+}  // namespace gufo_npu::qwen36_35b_a3b

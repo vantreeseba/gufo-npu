@@ -1,6 +1,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -28,6 +29,7 @@
 #include "models/qwen35/npu_decoder.hpp"
 #include "models/qwen35/npu_prefill.hpp"
 #include "models/qwen35/reference.hpp"
+#include "models/qwen36_35b_a3b/npu_prefill.hpp"
 #include "npu/device.hpp"
 #include "npu/gemv.hpp"
 
@@ -556,6 +558,84 @@ int BenchMtp(const std::vector<std::string_view>& args) {
   return 0;
 }
 
+// bench prefill for Qwen3.6-35B-A3B: its own NPU prefill
+// (qwen36_35b_a3b::NpuPrefill, through PrefillPrompt, so prompts shorter
+// than kMinPrefillPrompt take the decode path), per length the time to the
+// first token and where the prefill's time went (per run).
+int BenchMoePrefill(gufo_npu::qwen35::NpuDecoder& npu,
+                    const gufo_npu::gguf::File& file,
+                    const std::filesystem::path& kernels,
+                    const std::vector<int>& ids,
+                    const std::vector<int>& lengths, int runs,
+                    bool decode_path) {
+  namespace qwen35 = gufo_npu::qwen35;
+  namespace moe = gufo_npu::qwen36_35b_a3b;
+  moe::NpuPrefill prefill(file, npu, kernels);
+  const auto hook = moe::PrefillPrompt(prefill);
+  std::printf("%8s %10s %8s %8s %12s %7s %7s %6s %7s %7s %7s %7s %7s %7s %7s\n",
+              "tokens", "TTFT mean", "min", "max", "prompt tok/s", "deq s",
+              "GEMM s", "switch", "sync s", "setup s", "DN s", "attn s",
+              "route s", "exp s", "other s");
+  for (const int length : lengths) {
+    const std::vector<int> prompt(ids.begin(), ids.begin() + length);
+    auto ttft_of = [&](const qwen35::PromptPrefill& h) {
+      std::vector<double> ttft;
+      for (int run = 0; run <= runs; ++run) {
+        qwen35::SpeculativeStats stats;
+        qwen35::SpeculativeGenerate(npu, prompt, 1, {}, true, {}, &stats, h);
+        if (run > 0) {
+          ttft.push_back(stats.prefill_seconds);
+        }
+      }
+      return ttft;
+    };
+    auto stats_of = [&](const std::vector<double>& t) {
+      double mean = 0;
+      for (const double v : t) {
+        mean += v / static_cast<double>(t.size());
+      }
+      return std::array<double, 3>{mean, *std::min_element(t.begin(), t.end()),
+                                   *std::max_element(t.begin(), t.end())};
+    };
+    if (decode_path) {
+      const auto s = stats_of(ttft_of({}));
+      std::printf("%8d %10.3f %8.3f %8.3f %12.0f  (decode path)\n", length,
+                  s[0], s[1], s[2], length / s[0]);
+    }
+    moe::NpuPrefill::Profile first;
+    std::vector<double> ttft;
+    for (int run = 0; run <= runs; ++run) {
+      if (run == 1) {
+        first = prefill.profile();
+      }
+      qwen35::SpeculativeStats stats;
+      qwen35::SpeculativeGenerate(npu, prompt, 1, {}, true, {}, &stats, hook);
+      if (run > 0) {
+        ttft.push_back(stats.prefill_seconds);
+      }
+    }
+    const auto& last = prefill.profile();
+    const auto s = stats_of(ttft);
+    const double r = runs;
+    std::printf(
+        "%8d %10.3f %8.3f %8.3f %12.0f %7.3f %7.3f %6.0f %7.3f %7.3f %7.3f "
+        "%7.3f %7.3f %7.3f %7.3f\n",
+        length, s[0], s[1], s[2], length / s[0],
+        (last.dequant_seconds - first.dequant_seconds) / r,
+        (last.gemm_seconds - first.gemm_seconds) / r,
+        (last.switches - first.switches) / r,
+        (last.sync_seconds - first.sync_seconds) / r,
+        (last.setup_seconds - first.setup_seconds) / r,
+        (last.deltanet_seconds - first.deltanet_seconds) / r,
+        (last.attention_seconds - first.attention_seconds) / r,
+        (last.router_seconds - first.router_seconds) / r,
+        (last.expert_seconds - first.expert_seconds) / r,
+        (last.other_seconds - first.other_seconds) / r);
+    std::fflush(stdout);
+  }
+  return 0;
+}
+
 // Time to first token of `generate --device npu` per prompt length: prompt
 // processing (NpuPrefill), the MTP cache over the prompt and the first
 // token, as SpeculativeGenerate runs them with MTP drafting. The prompts are
@@ -590,10 +670,7 @@ int BenchPrefill(const std::vector<std::string_view>& args) {
   }
   namespace qwen35 = gufo_npu::qwen35;
   const auto file = gufo_npu::gguf::File::Open(model);
-  if (qwen35::ReadConfig(*file).IsMoe()) {
-    std::fprintf(stderr, "bench prefill: MoE models have no NPU prefill yet\n");
-    return 1;
-  }
+  const bool moe = qwen35::ReadConfig(*file).IsMoe();
   const gufo_npu::Tokenizer tokenizer(*file);
   const int longest = *std::max_element(lengths.begin(), lengths.end());
   std::string text = "Here is some background text.";
@@ -610,6 +687,10 @@ int BenchPrefill(const std::vector<std::string_view>& args) {
         false));
   }
   qwen35::NpuDecoder npu(*file, KernelDir(kernels));
+  if (moe) {
+    return BenchMoePrefill(npu, *file, KernelDir(kernels), ids, lengths, runs,
+                           decode_path);
+  }
   qwen35::NpuPrefill prefill(*file, KernelDir(kernels));
   const auto hook = qwen35::PrefillPrompt(prefill);
   std::printf("%8s %10s %8s %8s %12s %6s %8s %8s %8s %8s %8s\n", "tokens",
@@ -726,10 +807,13 @@ int Generate(const std::vector<std::string_view>& args) {
   if (device == "npu") {
     const auto load_start = std::chrono::steady_clock::now();
     qwen35::NpuDecoder npu(*file, KernelDir(kernels));
-    // MoE models have no NPU prefill yet: their prompt goes through the
-    // decoder, two tokens per pass.
+    // Prompt processing: the family's for dense models, Qwen3.6-35B-A3B's
+    // own for the MoE one (reading the decoder's weights in place).
     std::optional<qwen35::NpuPrefill> prefill;
-    if (!npu.config().IsMoe()) {
+    std::optional<gufo_npu::qwen36_35b_a3b::NpuPrefill> moe_prefill;
+    if (npu.config().IsMoe()) {
+      moe_prefill.emplace(*file, npu, KernelDir(kernels));
+    } else {
       prefill.emplace(*file, KernelDir(kernels));
     }
     const double load_seconds =
@@ -741,7 +825,22 @@ int Generate(const std::vector<std::string_view>& args) {
     qwen35::SpeculativeStats stats;
     qwen35::SpeculativeGenerate(
         npu, ids, max_tokens, stop, speculate, print, &stats,
-        prefill ? qwen35::PrefillPrompt(*prefill) : qwen35::PromptPrefill{});
+        prefill       ? qwen35::PrefillPrompt(*prefill)
+        : moe_prefill ? gufo_npu::qwen36_35b_a3b::PrefillPrompt(*moe_prefill)
+                      : qwen35::PromptPrefill{});
+    if (moe_prefill && moe_prefill->profile().passes > 0) {
+      const auto& pp = moe_prefill->profile();
+      std::fprintf(stderr,
+                   "\n[prefill: %ld dequant calls in %.3f s, %ld GEMMs in "
+                   "%.3f s, %ld program switches, %.3f s syncing, %.3f s "
+                   "building calls; CPU %.3f s "
+                   "DeltaNet, %.3f s attention, %.3f s routing, %.3f s "
+                   "experts, %.3f s other]",
+                   pp.dequants, pp.dequant_seconds, pp.gemms, pp.gemm_seconds,
+                   pp.switches, pp.sync_seconds, pp.setup_seconds,
+                   pp.deltanet_seconds, pp.attention_seconds, pp.router_seconds,
+                   pp.expert_seconds, pp.other_seconds);
+    }
     if (prefill) {
       const auto& pp = prefill->profile();
       std::fprintf(stderr,

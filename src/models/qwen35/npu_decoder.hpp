@@ -3,11 +3,13 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "core/gguf.hpp"
 #include "models/qwen35/config.hpp"
 #include "models/qwen35/decoder.hpp"
+#include "npu/gemv.hpp"
 
 // Qwen3.5 / Qwen3.6 decode on the NPU. Every matrix product, every RMS norm
 // before one, the residual adds and SwiGLU run in the q4nx GEMV (its resnorm
@@ -85,6 +87,27 @@ public:
   // MoE models: the experts layer `layer` chose for the last Step's first
   // token, config().experts_used of them by descending weight.
   const int* experts(int layer) const;
+
+  // The weights the decoder keeps on the device, for an NPU prefill that
+  // converts them in place (src/models/qwen36_35b_a3b): each layer's input
+  // and output projections (q4nx in the GEMV's block order; rows include
+  // padding) and, for MoE layers, its expert arena (npu::ExpertArena of
+  // config().experts + 1 experts, the shared one last); the MTP head's
+  // eh_proj and its block's input projection.
+  struct DeviceMatrix {
+    npu::Buffer weights;
+    std::size_t rows = 0;
+    std::size_t dim = 0;
+  };
+  struct DeviceWeights {
+    struct Layer {
+      std::optional<DeviceMatrix> in, out;
+      std::optional<npu::Buffer> arena;
+    };
+    std::vector<Layer> layers;
+    std::optional<DeviceMatrix> eh_proj, mtp_in;
+  };
+  DeviceWeights device_weights() const;
 
   // Wall time inside NPU submissions since construction, and their count;
   // CPU time in the mixers and draft input (including buffer syncs), and in

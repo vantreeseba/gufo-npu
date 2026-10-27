@@ -604,6 +604,26 @@ DecodeState NpuDecoder::NewMtpState() const {
   return impl_->mixer.NewState();
 }
 
+NpuDecoder::DeviceWeights NpuDecoder::device_weights() const {
+  auto matrix = [](const npu::Q4nxGemv& g) {
+    return DeviceMatrix{g.weights(), g.padded_rows(), g.dim()};
+  };
+  DeviceWeights w;
+  for (const auto& b : impl_->layers) {
+    DeviceWeights::Layer& l = w.layers.emplace_back();
+    l.in = matrix(*b.in);
+    l.out = matrix(*b.out);
+    if (b.arena) {
+      l.arena = *b.arena;
+    }
+  }
+  if (impl_->has_mtp) {
+    w.eh_proj = matrix(*impl_->eh_proj);
+    w.mtp_in = matrix(*impl_->mtp.in);
+  }
+  return w;
+}
+
 double NpuDecoder::npu_seconds() const {
   return impl_->npu_seconds;
 }

@@ -79,12 +79,14 @@ if(GUFO_NPU_ENABLE_XRT)
   find_package(XRT REQUIRED)
   add_library(gufo_npu_runtime STATIC src/npu/device_xrt.cpp
                                      src/npu/gemm_xrt.cpp
-                                     src/npu/gemv_xrt.cpp)
+                                     src/npu/gemv_xrt.cpp
+                                     src/npu/program_xrt.cpp)
   target_link_libraries(gufo_npu_runtime PUBLIC gufo_npu_core XRT::xrt_coreutil)
 else()
   add_library(gufo_npu_runtime STATIC src/npu/device_stub.cpp
                                      src/npu/gemm_stub.cpp
-                                     src/npu/gemv_stub.cpp)
+                                     src/npu/gemv_stub.cpp
+                                     src/npu/program_stub.cpp)
   target_link_libraries(gufo_npu_runtime PUBLIC gufo_npu_core)
 endif()
 
@@ -101,8 +103,12 @@ set_source_files_properties(src/models/qwen35/npu_prefill.cpp
   src/models/qwen35/prefill_mixer.cpp PROPERTIES
   COMPILE_OPTIONS "-march=x86-64-v3;-O3")
 
+# Per-model packages: their own NPU programs and host wiring.
+add_subdirectory(src/models/qwen36_35b_a3b)
+
 add_executable(gufo-npu src/cli/main.cpp)
-target_link_libraries(gufo-npu PRIVATE gufo_npu_qwen35_npu)
+target_link_libraries(gufo-npu PRIVATE gufo_npu_qwen35_npu
+                      gufo_npu_qwen36_35b_a3b)
 install(TARGETS gufo-npu RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 if(GUFO_NPU_BUILD_KERNELS)
