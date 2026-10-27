@@ -39,6 +39,25 @@ HTTP range requests). "Inferred" marks conclusions not read directly.
 - DMA zero-compression exists on core and memtile DMAs, not the shim, and
   4-bit weights have few zero bytes: no use for weights.
 
+## System RAM vs the GPU carve-out
+
+- The test box has 128 GB of LPDDR5X; the BIOS reserves 64 GiB as GPU
+  "VRAM" (`mem_info_vram_total`) and Linux sees ~61 GiB. Both halves are the
+  same DRAM behind the same memory controllers (~256 GB/s peak).
+- Everything gufo-npu loads for the NPU lives in system RAM: the GGUF is
+  mmapped by the host, and NPU buffers are amdxdna BOs (`xrt::ext::bo`,
+  shmem or pinned user pages), never amdgpu VRAM. XRT cannot allocate from
+  the GPU carve-out.
+- Which half a buffer sits in does not change its speed: same DRAM, and the
+  NPU's ~56 GB/s read limit is on its own side of the fabric. What matters
+  when the GPU and NPU run at once is total DRAM traffic: the NPU's 56 GB/s
+  plus whatever the GPU reads share ~256 GB/s. A GPU job near the DRAM limit
+  would slow NPU decode; untested.
+- Footprint: the carve-out leaves ~61 GiB for the OS, the GGUF page cache
+  and the NPU's pinned weights (~1.2 GB for Qwen3.5-2B, ~20 GB for the 35B).
+  Shrinking the carve-out in the BIOS frees system RAM if the GPU is not
+  needed.
+
 ## On-chip memory
 
 - Core tiles: 64 KB data memory in 8 banks (allocator models 4); a core can

@@ -119,3 +119,18 @@ stops after 64). Three runs in a row per row, 2026-10-27:
   speculative decoding with the MTP head (a few tokens per weight read; a
   4-token GEMV costs about the same as one).
 - Prompts run token by token through the decode path (prefill is Phase 4).
+
+### NPU power mode
+
+`xrt-smi configure --pmode <mode>` (needs CAP_SYS_ADMIN; the box runs
+`default`), same binaries and prompt, three generate runs each, 2026-10-27:
+
+| Mode | Read GB/s | Single call, submit→done | Per call in a runlist | FFN in GEMV | Decode tok/s |
+|---|---|---|---|---|---|
+| default | 56.0 | 67–70 µs | 25–28 µs | 368 µs | 35.4–35.5 |
+| performance | 55.9 | 69 µs | 27 µs | 370 µs | 35.4 |
+| turbo | 56.0 | 55 µs | 25 µs | 358 µs | 35.6–35.8 |
+
+Turbo shortens the single-call round trip by ~14 µs and the GEMVs by ~3%
+(+0.6% decode). Bandwidth does not move, so the NPU clock is not the limit.
+gufo-npu does not change the power mode.
