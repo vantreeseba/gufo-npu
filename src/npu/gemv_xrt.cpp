@@ -151,7 +151,8 @@ Q4nxGemv::Q4nxGemv(GemvRuntime& runtime, const q4nx::Matrix& weights,
   }
   // Must match VARIANTS in kernels/designs/q4nx_gemv.py.
   if (epilogue == Epilogue::kSwiGlu) {
-    y_token_stride_ = padded_rows_ / 4;
+    // Compact bf16 tokens MAX_DIM apart, where the act input stage reads them.
+    y_token_stride_ = kGemvMaxDim / 2;
   } else if (padded_rows_ == kGemvHidden) {
     y_token_stride_ = kGemvSlot;
   } else {

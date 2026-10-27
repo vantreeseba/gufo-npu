@@ -28,7 +28,15 @@ set(q4nx_gemv_OUTPUTS
   q4nx_gemv_k2048_n248832_resnorm_store_t1.insts.elf
   q4nx_gemv_k2048_n248832_resnorm_store_t2.insts.elf
   q4nx_gemv_k2048_n32768_resnorm_store_t1.insts.elf
-  q4nx_gemv_k2048_n32768_resnorm_store_t2.insts.elf)
+  q4nx_gemv_k2048_n32768_resnorm_store_t2.insts.elf
+  q4nx_gemv_k2048_n1024_resnorm_swiglu_t1.insts.elf
+  q4nx_gemv_k2048_n1024_resnorm_swiglu_t2.insts.elf
+  q4nx_gemv_k512_n2048_act_store_t1.insts.elf
+  q4nx_gemv_k512_n2048_act_store_t2.insts.elf
+  q4nx_gemv_k2048_n9216_resnorm_swiglu_scaled_rounds9_t1.insts.elf
+  q4nx_gemv_k2048_n9216_resnorm_swiglu_scaled_rounds9_t2.insts.elf
+  q4nx_gemv_k4608_n2048_act_store_k9_t1.insts.elf
+  q4nx_gemv_k4608_n2048_act_store_k9_t2.insts.elf)
 set(q4nx_gemv_SOURCES aie/q4nx_gemv.cc)
 
 set(kernel_outputs)

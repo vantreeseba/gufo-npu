@@ -59,6 +59,12 @@ Compiling NPU kernels needs no NPU; running them does. Run NPU work with
 - Successful optimizations become the default, without extra switches.
 - IRON reuses any kernel object already in a compile work dir, even when the
   source changed; designs clear their work dir before compiling.
+- Runs from an instruction ELF (`xrt::module`) and runs given their
+  instruction stream as a BO (`.insts.bin`, the path for patching DDR
+  offsets per call, as the MoE gathers do) cannot share a runlist
+  (`ERT_CMD_STATE_NEW`). A runtime-sequence wait costs ~4.5 µs, so group DMA
+  tasks and await only the last of each group per channel
+  (docs/research/NPU-MOE.md).
 - In a runtime sequence, waiting on a DMA task (`wait=True`, a task group's
   `finish()`) takes the next completion token of that task's shim channel,
   whichever task sent it. Await the tasks of one channel in the order they
