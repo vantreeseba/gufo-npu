@@ -11,13 +11,15 @@ namespace {
 }  // namespace
 
 std::string Q4nxGemvSequence(std::size_t dim, std::size_t padded_rows, Prologue,
-                             Epilogue, std::size_t tokens) {
-  return "q4nx_gemv_k" + std::to_string(dim) + "_n" +
+                             Epilogue, std::size_t tokens,
+                             const std::string& design) {
+  return design + "_k" + std::to_string(dim) + "_n" +
          std::to_string(padded_rows) + "_t" + std::to_string(tokens);
 }
 
 struct GemvRuntime::Impl {};
-GemvRuntime::GemvRuntime(const std::filesystem::path&, Flow) {
+GemvRuntime::GemvRuntime(const std::filesystem::path&, Flow, GemvDesign design)
+    : design_(std::move(design)) {
   NoXrt();
 }
 GemvRuntime::~GemvRuntime() = default;

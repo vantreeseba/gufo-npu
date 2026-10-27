@@ -9,6 +9,7 @@
 #include "core/gguf.hpp"
 #include "models/qwen35/config.hpp"
 #include "models/qwen35/decoder.hpp"
+#include "models/qwen35/generate.hpp"
 #include "npu/gemv.hpp"
 
 // Qwen3.5 / Qwen3.6 decode on the NPU. Every matrix product, every RMS norm
@@ -121,23 +122,6 @@ private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
-
-struct SpeculativeStats {
-  int prompt_tokens = 0;
-  int generated_tokens = 0;
-  int steps = 0;     // verify passes
-  int accepted = 0;  // drafts kept
-  double prefill_seconds = 0;
-  double decode_seconds = 0;
-};
-
-// Prompt processing ahead of the decoder (NpuPrefill): runs prompt tokens
-// [0, k) into a fresh `state` and returns k (< prompt.size()), writing each
-// token's final residual to rows [0, k) of `hidden`; with `mtp`, also fills
-// the MTP cache at positions [1, k] (pairs (hidden row p - 1, prompt[p])).
-using PromptPrefill =
-    std::function<int(const std::vector<int>& prompt, DecodeState& state,
-                      DecodeState* mtp, float* hidden)>;
 
 // Greedy decoding with MTP speculation: each step verifies one MTP draft in a
 // 2-token pass and keeps it when the main model agrees, so the output is the

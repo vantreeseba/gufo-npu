@@ -34,8 +34,8 @@ const char* EpilogueName(Epilogue e) {
 
 std::string Q4nxGemvSequence(std::size_t dim, std::size_t padded_rows,
                              Prologue prologue, Epilogue epilogue,
-                             std::size_t tokens) {
-  return "q4nx_gemv_k" + std::to_string(dim) + "_n" +
+                             std::size_t tokens, const std::string& design) {
+  return design + "_k" + std::to_string(dim) + "_n" +
          std::to_string(padded_rows) + "_" + PrologueName(prologue) + "_" +
          EpilogueName(epilogue) + "_t" + std::to_string(tokens);
 }
@@ -43,6 +43,7 @@ std::string Q4nxGemvSequence(std::size_t dim, std::size_t padded_rows,
 struct GemvRuntime::Impl {
   std::filesystem::path dir;
   Flow flow;
+  GemvDesign design;
   HwContext hw;
   // The kernel of the instruction-buffer flow.
   std::optional<xrt::kernel> kernel;
@@ -50,8 +51,8 @@ struct GemvRuntime::Impl {
   // Instruction-buffer flow: one buffer per variant, shared by its calls.
   std::map<std::string, std::unique_ptr<InstrSequence>> instructions;
 
-  Impl(const std::filesystem::path& d, Flow f)
-      : dir(d), flow(f), hw(d, "q4nx_gemv") {
+  Impl(const std::filesystem::path& d, Flow f, const GemvDesign& g)
+      : dir(d), flow(f), design(g), hw(d, g.name) {
     if (flow == Flow::kInstructionBuffer) {
       kernel.emplace(*hw.context, hw.kernel_name);
     }
@@ -94,8 +95,10 @@ struct GemvRuntime::Impl {
   }
 };
 
-GemvRuntime::GemvRuntime(const std::filesystem::path& kernel_dir, Flow flow)
-    : impl_(std::make_unique<Impl>(kernel_dir, flow)) {}
+GemvRuntime::GemvRuntime(const std::filesystem::path& kernel_dir, Flow flow,
+                         GemvDesign design)
+    : design_(std::move(design)),
+      impl_(std::make_unique<Impl>(kernel_dir, flow, design_)) {}
 
 GemvRuntime::~GemvRuntime() = default;
 
@@ -156,7 +159,8 @@ struct Q4nxGemv::Impl {
   Impl(GemvRuntime::Impl& r, const q4nx::Matrix& m, Prologue p, Epilogue e)
       : rt(r), w_bytes(m.bytes.size()), w(rt.hw.Buffer(w_bytes)) {
     for (std::size_t t = 0; t < kGemvTokens; ++t) {
-      sequences[t] = Q4nxGemvSequence(m.dim, m.padded_rows, p, e, t + 1);
+      sequences[t] =
+          Q4nxGemvSequence(m.dim, m.padded_rows, p, e, t + 1, rt.design.name);
       rt.Require(sequences[t]);
     }
     std::memcpy(w.map<void*>(), m.bytes.data(), w_bytes);
@@ -181,21 +185,23 @@ Q4nxGemv::Q4nxGemv(GemvRuntime& runtime, const q4nx::Matrix& weights,
       rows_(weights.rows),
       padded_rows_(weights.padded_rows),
       epilogue_(epilogue) {
-  if (weights.dim > kGemvMaxDim) {
+  const GemvDesign& design = runtime.design();
+  if (weights.dim > design.max_dim) {
     throw std::invalid_argument("q4nx GEMV: dim above the design's maximum");
   }
-  // Must match VARIANTS in kernels/designs/q4nx_gemv.py.
+  // Must match the design's variants (kernels/designs/q4nx_gemv.py, or a
+  // model's own copy).
   if (epilogue == Epilogue::kSwiGlu) {
     // Compact bf16 tokens MAX_DIM apart, where the act input stage reads them.
-    y_token_stride_ = kGemvMaxDim / 2;
-  } else if (padded_rows_ == kGemvHidden) {
-    y_token_stride_ = kGemvSlot;
+    y_token_stride_ = design.max_dim / 2;
+  } else if (padded_rows_ == design.hidden || rows_ == design.hidden) {
+    y_token_stride_ = design.slot();
   } else {
     y_token_stride_ = padded_rows_;
   }
-  impl_->x.emplace(runtime, kGemvInputBytes);
+  impl_->x.emplace(runtime, design.input_bytes());
   impl_->y.emplace(runtime, y_bytes());
-  impl_->residual.emplace(runtime, kGemvResidualBytes);
+  impl_->residual.emplace(runtime, design.residual_bytes());
 }
 
 Q4nxGemv::~Q4nxGemv() = default;
