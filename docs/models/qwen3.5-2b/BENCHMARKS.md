@@ -378,7 +378,22 @@ adds, SwiGLU, DeltaNet and attention on the CPU, with two chunks in flight
 (one chunk's GEMMs run while the CPU mixes the other). The MTP cache over
 the prompt comes from the same GEMMs (eh_proj and the block's input
 projection, no LM head). The decoder then runs the last prompt token, which
-gives the first logits, and decodes on from the filled state.
+gives the first logits, and decodes on from the filled state. Prompts under
+7 tokens skip prefill (see below).
+
+**Requirements.** `generate --device npu` now also loads
+`bfp16_gemm.xclbin` (built and installed with the other kernels) into a
+second hardware context, and keeps a bfp16 copy of the projection weights
+next to the decoder's q4nx copy: about **1.56 GB more pinned host memory**
+(memlock unlimited, as before) and ~2.7 s more at load.
+
+**Numerics.** The GEMMs round their activations to bfp16 inside the mmul (8
+values per shared exponent) and write bf16 outputs, where the decode GEMV
+rounds its input to bf16 and writes fp32. Against the decode path the
+logits after prefill differ by 1.0–2.6e-2 (relative L2) up to 600 tokens and
+3.3e-2 at 1–2k; greedy output after prefill agrees with the decode path's
+for the first 26 of 48 tokens on the chat prompt (then a near-tie flips).
+Details in QUALITY.md.
 
 ### Prefill GEMM
 
@@ -414,19 +429,50 @@ on the NPU (runs under the shared NPU lock), 2026-10-27:
 
 | Prompt tokens | Decode path (2 tokens per pass) | **NPU prefill** | Prompt tok/s | FLM TTFT (tokens) | FLM tok/s |
 |---|---|---|---|---|---|
-| 35 | 0.504 s | **0.106 s** (0.106–0.107) | 329 | 0.60 s (35) | 58.6 |
-| 125 | 1.774 s | **0.120 s** (0.120–0.120) | 1,044 | 0.61 s (125) | 204.7 |
-| 1,024 | 14.63 s | **0.351 s** (0.348–0.352) | 2,921 | 1.80 s (1,055) | 586.6 |
-| 2,048 | ~32.9 s (2,120 tokens) | **0.655 s** (0.650–0.661) | 3,127 | – | – |
-| 4,096 | – | **1.321 s** (1.313–1.332) | 3,101 | 3.34 s (4,246) | 1,272 |
+| 35 | 0.504 s | **0.107 s** (0.107–0.107) | 327 | 0.60 s (35) | 58.6 |
+| 476 | – | **0.182 s** (0.181–0.183) | 2,617 | – | – |
+| 1,000 | 14.63 s (1,024 tokens) | **0.312 s** (0.311–0.313) | 3,204 | 1.80 s (1,055) | 586.6 |
+| 2,048 | ~32.9 s (2,120 tokens) | **0.584 s** (0.573–0.591) | 3,504 | – | – |
+| 4,096 | – | **1.237 s** (1.234–1.240) | 3,312 | 3.34 s (4,246) | 1,272 |
 
 - Built on the decode branch's fp16 K/V cache and compact q4nx scales
   (e3605ce). The decode-path column is the same binary with the prompt token
   by token (two per pass) through NpuDecoder; the 2,120-token figure is
   from the draft-vocabulary section above (before the fp16 cache).
-- Against FLM: 5.7x faster TTFT on short prompts (MVP target < 0.3 s: met),
-  5.1x at ~1k, 2.5x at ~4k; prompt throughput 2.4–5.6x FLM's at the same
-  lengths, and at 4k 2.2x FLM's best (1,388 tok/s, at 8.5k tokens).
+- Against FLM: 5.6x faster TTFT on short prompts (MVP target < 0.3 s: met),
+  5.8x at ~1k, 2.7x at ~4k; prompt throughput 2.6–5.6x FLM's at the same
+  lengths, and at 4k 2.4x FLM's best (1,388 tok/s, at 8.5k tokens).
+
+**Chunk plan.** A pass runs one or two chunks of 256, 512 or 1,024 rows;
+`PlanPasses` picks them for the least estimated time from the measured
+GEMM throughput per size (11, 14.5, 17 TFLOPS) and ~0.14 ms of CPU work per
+token, counting two lanes as overlapped (about max(GEMMs of both, CPU of
+both)) and one lane as GEMMs then CPU. The previous rule (the largest size
+two lanes fill, else 256) ran four 256-row chunks for 1,000 tokens (the
+chunks cover the prompt but its last token):
+
+| Prompt tokens | Previous rule | Planned | TTFT before → after |
+|---|---|---|---|
+| 476 | 256 + 219 (MTP cache: 256, 219) | same (MTP cache: one 512-row call) | 0.184 → 0.182 s |
+| 1,000 | 256 + 256, 256 + 231 | 512 + 487 | 0.339 → 0.312 s |
+| 2,048 | 512 + 512, 256 + 256, 256 + 255 | 1,024 + 1,023 | 0.655 → 0.584 s |
+| 4,096 | 1,024 + 1,024, 512 + 512, 256 + 256, 256 + 255 | 1,024 + 1,024, 1,024 + 1,023 | 1.321 → 1.237 s |
+
+A single 1,024-row chunk for 1,000 tokens would take the least NPU time
+(~0.17 s against ~0.20 s) but loses the overlap with the CPU's ~0.14 s.
+
+**Short prompts.** A prefill pass costs ~0.10 s however short the prompt
+(98 GEMM calls of at least 256 rows), the decode path ~28 ms per two
+tokens. `bench prefill --decode-path`, 3 warm runs each:
+
+| Prompt tokens | 2 | 3 | 4 | 5 | 6 | 8 | 10 | 12 | 16 |
+|---|---|---|---|---|---|---|---|---|---|
+| Decode path | 0.030 | 0.056 | 0.058 | 0.084 | 0.086 | 0.115 | 0.142 | 0.170 | 0.226 s |
+| Prefill | 0.100 | 0.101 | 0.101 | 0.101 | 0.102 | 0.102 | 0.104 | 0.102 | 0.103 s |
+
+So the hook leaves prompts under 7 tokens to the decoder (now: 6 tokens
+0.088 s, 7 tokens 0.105 s, 8 tokens 0.102 s). A chat prompt is at least ~10
+tokens, so in practice this is the bare-prompt case.
 
 `gufo-npu generate --device npu` end to end, the prompts of the
 draft-vocabulary section above, 128 tokens at most; one warm-up run, then
@@ -434,8 +480,8 @@ three (the text was identical in all four runs of each prompt):
 
 | Prompt | Prompt tokens | Time to first token | Decode after it |
 |---|---|---|---|
-| "Explain in a few sentences why the sky is blue." | 24 | 0.11, 0.11, 0.11 s | 53.46, 53.65, 53.62 tok/s |
-| 2,120 tokens ("Item i: …", then the sky question) | 2,120 | 0.70, 0.69, 0.68 s (32.9 s on the decode path) | 48.68, 49.06, 48.95 tok/s |
+| "Explain in a few sentences why the sky is blue." | 24 | 0.11, 0.11, 0.11 s | 53.53, 53.62, 53.50 tok/s |
+| 2,120 tokens ("Item i: …", then the sky question) | 2,120 | 0.70, 0.68, 0.69 s (32.9 s on the decode path) | 49.28, 48.85, 49.10 tok/s |
 
 Where the time goes (seconds per run, same runs; GEMM is the time the CPU
 waits for the NPU, i.e. GEMM time not hidden behind CPU work):
@@ -443,14 +489,14 @@ waits for the NPU, i.e. GEMM time not hidden behind CPU work):
 | Prompt tokens | GEMMs | GEMM wait | Buffer syncs | DeltaNet (CPU) | Attention (CPU) | Other CPU |
 |---|---|---|---|---|---|---|
 | 35 | 98 | 0.068 | 0.001 | 0.003 | 0.001 | 0.004 |
-| 125 | 98 | 0.068 | 0.003 | 0.008 | 0.001 | 0.009 |
-| 1,024 | 390 | 0.151 | 0.024 | 0.062 | 0.021 | 0.061 |
-| 2,048 | 584 | 0.275 | 0.047 | 0.125 | 0.061 | 0.114 |
-| 4,096 | 780 | 0.491 | 0.090 | 0.260 | 0.216 | 0.227 |
+| 476 | 194 | 0.077 | 0.011 | 0.028 | 0.005 | 0.029 |
+| 1,000 | 194 | 0.125 | 0.022 | 0.064 | 0.016 | 0.055 |
+| 2,048 | 196 | 0.217 | 0.042 | 0.130 | 0.053 | 0.111 |
+| 4,096 | 392 | 0.430 | 0.086 | 0.258 | 0.199 | 0.225 |
 
 - Short prompts are the GEMM pass at M = 256 (68 ms) plus one decode step
   for the last token and an MTP draft (~35 ms).
-- At 4k the NPU is busy ~0.69 s of 1.32 s; the CPU side (attention O(n²),
+- At 4k the NPU is busy ~0.70 s of 1.24 s; the CPU side (attention O(n²),
   DeltaNet, and the bf16/fp32 conversions and norms between GEMMs) is the
   larger part. Next levers: NPU attention (IRON `PrefillAttention`) for long
   prompts, fusing the DeltaNet conv into the recurrence jobs, keeping GEMM
@@ -465,7 +511,8 @@ What mattered on the way (warm TTFT, same benchmark):
 | Chunks of up to 1,024 tokens, two in flight, vectorized CPU side (GEMM wait at 4k 1.14 → 0.49 s), DeltaNet split into (head, 32-column) jobs on the shared state | 0.73 s | 3.61 s |
 | The same jobs on cache-line-aligned job-local copies of the state (the shared, 16-byte-aligned rows put two jobs on one cache line: DeltaNet 2.38 → 0.26 s) | 0.36 s | 1.46 s |
 | AVX-512 attention kernels, chosen at run time (attention at 4k 0.35 → 0.28 s) | 0.36 s | 1.39 s |
-| The decoder's fp16 K/V cache, read by the attention kernels directly (widened in registers): attention at 4k 0.28 → 0.22 s | **0.35 s** | **1.32 s** |
+| The decoder's fp16 K/V cache, read by the attention kernels directly (widened in registers): attention at 4k 0.28 → 0.22 s | 0.35 s | 1.32 s |
+| Chunk sizes planned by estimated time (above) | **0.31 s** (1,000 tokens) | **1.24 s** |
 
 The fp16 cache is read directly rather than through an fp32 copy: the
 kernels converting it in registers (0.216 s at 4k) beat the same kernels

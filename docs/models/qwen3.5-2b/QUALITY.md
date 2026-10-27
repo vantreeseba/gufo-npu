@@ -150,27 +150,47 @@ values the decode GEMV multiplies). 2026-10-27, every shape and chunk size:
   with little margin; an exact bf16 A would need a second (lo) mmul pass.
 - `bfp16_test` (hosted CI) checks the packer bit for bit against IRON's
   `pack_b` order and rounding (ties to even, saturation at +127).
+- Determinism: a DMA wait takes its shim channel's next completion token,
+  whichever task issued it (the q4nx GEMV's rare nondeterminism). Every
+  compiled GEMM sequence has exactly one token-issuing task per channel (a
+  column's last C drain), awaited once, so it cannot take another task's
+  token. A stress run of every (M, K, N), alone and with two calls in
+  flight on separate buffers as prefill's lanes run them, compared 634,544
+  outputs bit for bit with the first: none differed (2026-10-27).
 
 `qwen35_npu_prefill_test` (labels `npu`, `model`; needs
-`GUFO_NPU_QWEN35_2B_Q4_GGUF` and `GUFO_NPU_QWEN35_2B_ORACLE`): each oracle
-prompt, and a 600-token prompt over several chunks, through NpuPrefill (all
-but the last token), then the decoder runs the last token and 16 greedy
-steps teacher-forced on the decode path's tokens; the reference is the same
-prompt token by token through NpuDecoder (same q4nx weights). Pass: final
-hidden state of every prompt position within 5e-2, logits within 5e-2, the
-first token equal, argmax agreement >= 95%. 2026-10-27:
+`GUFO_NPU_QWEN35_2B_Q4_GGUF` and `GUFO_NPU_QWEN35_2B_ORACLE`): the oracle
+prompts and prompts of 1, 2, 256, 257, 600, 1,100 and 2,049 tokens (one and
+two 256-row chunks, two lanes of 256, of 512 and of 1,024), all but the last
+token through NpuPrefill; the reference is the same tokens through NpuDecoder
+two per pass (same q4nx weights). It compares the final residual of every
+prompt position; the state the decoder continues from, layer by layer (each
+DeltaNet layer's conv window and recurrent state, each attention layer's
+fp16 K/V cache); the MTP layer's K/V cache from NpuPrefill::FillMtp against
+NpuDecoder::FillMtp on the same hidden rows; then the decoder runs the last
+token and 16 greedy steps from both states, teacher-forced on the decode
+path's tokens. Pass: hidden < 6e-2, every state and the MTP cache < 8e-2,
+logits < 5e-2 (relative L2), the first token equal, argmax agreement >=
+95%. 2026-10-27:
 
-| Prompt | Tokens | Hidden rel err | Logits rel err | Argmax |
-|---|---|---|---|---|
-| chat | 19 | 3.6e-2 | 1.0e-2 | 17/17 |
-| code | 15 | 2.4e-2 | 1.3e-2 | 17/17 |
-| prose | 39 | 2.0e-2 | 1.3e-2 | 17/17 |
-| long | 600 | 3.7e-2 | 2.6e-2 | 17/17 |
+| Prompt | Tokens | Hidden | Conv | DeltaNet state | K/V | MTP K/V | Logits | Argmax |
+|---|---|---|---|---|---|---|---|---|
+| chat | 19 | 3.6e-2 | 3.4e-2 | 3.6e-2 | 2.5e-2 | 1.1e-2 | 1.0e-2 | 17/17 |
+| code | 15 | 2.4e-2 | 2.0e-2 | 2.3e-2 | 2.0e-2 | 1.1e-2 | 1.3e-2 | 17/17 |
+| prose | 39 | 2.0e-2 | 2.0e-2 | 2.1e-2 | 1.9e-2 | 1.2e-2 | 1.3e-2 | 17/17 |
+| len1 | 1 | – | – | – | – | – | 0 | 17/17 |
+| len2 | 2 | 3.6e-2 | 2.5e-2 | 4.0e-2 | 2.0e-2 | 3.3e-3 | 6.9e-3 | 17/17 |
+| len256 | 256 | 3.4e-2 | 3.2e-2 | 3.7e-2 | 3.1e-2 | 1.2e-2 | 1.4e-2 | 17/17 |
+| len257 | 257 | 3.4e-2 | 3.0e-2 | 3.7e-2 | 3.1e-2 | 1.2e-2 | 1.4e-2 | 17/17 |
+| len600 | 600 | 3.8e-2 | 4.4e-2 | 5.5e-2 | 3.8e-2 | 1.2e-2 | 2.6e-2 | 17/17 |
+| len1100 | 1,100 | 3.9e-2 | 3.4e-2 | 5.6e-2 | 3.9e-2 | 1.2e-2 | 3.3e-2 | 17/17 |
+| len2049 | 2,049 | 4.0e-2 | 3.8e-2 | 5.8e-2 | 3.9e-2 | 1.2e-2 | 3.2e-2 | 17/17 |
 
 - With the fp16 K/V cache and compact q4nx scales (decode branch e3605ce);
   prefill writes the cache in fp16 as the decoder does.
-- 68/68 argmax; the first token after the prompt is the same on every
-  prompt.
+- 170/170 argmax; the first token after the prompt is the same on every
+  prompt. The DeltaNet states carry the largest error (they integrate
+  every token's); a wrong offset or a stale window would be of order 1.
 - MTP speculative decoding after prefill gives the plain greedy output
   after prefill token for token (48 tokens). Greedy decoding after prefill
   and after the token-by-token prompt agree on the first 26 of 48 tokens
@@ -179,8 +199,9 @@ first token equal, argmax agreement >= 95%. 2026-10-27:
   differences pick the other token, not nondeterminism.
 - The gap to the decode path is mostly the bfp16 activations: each of the
   96 GEMMs of a pass (4 per layer) adds ~7e-3 where the decode GEMV only
-  rounds its input to bf16, and the residual stream accumulates it. The DeltaNet and
-  attention mixers run in fp32 on the CPU with the decoder's arithmetic.
+  rounds its input to bf16, and the GEMMs write bf16 where the GEMV writes
+  fp32; the residual stream accumulates it. The DeltaNet and attention
+  mixers run in fp32 on the CPU with the decoder's arithmetic.
 
 ## Fast decoder vs reference
 
@@ -198,4 +219,5 @@ one), argmax 19/19.
 |---|---|
 | Each NPU op vs CPU reference | relative error < 1e-2 |
 | NPU model vs CPU reference, teacher-forced, same weights | greedy argmax match |
+| Prefill vs one-token decode on the NPU | identical next token: met (`qwen35_npu_prefill_test`, first token equal on all 10 prompts of 1–2,049 tokens, 170/170 argmax over 17 steps each; greedy output equal for the first 26 of 48 tokens on the chat prompt) |
 | MTP head vs a reference | to be decided (no HF oracle) |
