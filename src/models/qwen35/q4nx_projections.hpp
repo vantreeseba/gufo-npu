@@ -8,10 +8,13 @@
 #include "models/qwen35/config.hpp"
 #include "models/qwen35/projections.hpp"
 
-// Qwen3.5 projections on the CPU over q4nx weights: the same packed weights
-// the NPU decoder uses (NpuDecoder), so tests can separate the NPU's error
-// from requantization. Each stage's matrices are stacked (qkv + z, q + k + v,
-// gate + up); the DeltaNet alpha and beta rows (16 each, F32) stay in fp32.
+// Qwen3.5 / Qwen3.6 projections on the CPU over q4nx weights: the same packed
+// weights the NPU decoder uses (NpuDecoder), so tests can separate the NPU's
+// error from requantization. Each stage's matrices are stacked (qkv + z,
+// q + k + v, gate + up); the DeltaNet alpha and beta rows and the MoE router
+// (F32 in the GGUF) stay in fp32, as on the NPU path. MoE routed experts that
+// are Q4_K are unpacked per call by q4nx's rule (their codes carry over), so
+// only the experts that requantize are held packed.
 namespace gufo_npu::qwen35 {
 
 class Q4nxProjections : public Projections {
@@ -22,6 +25,8 @@ public:
 
   void Apply(Stage stage, int layer, const float* x, int tokens,
              float* y) const override;
+  void ApplyExpert(Stage stage, int layer, int expert, const float* x,
+                   int tokens, float* y) const override;
 
 private:
   struct Layer;

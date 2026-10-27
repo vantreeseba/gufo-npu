@@ -9,21 +9,29 @@
 #include "models/qwen35/config.hpp"
 #include "models/qwen35/decoder.hpp"
 
-// Qwen3.5 decode on the NPU. Every matrix product, every RMS norm before one,
-// the residual adds and SwiGLU run in the q4nx GEMV (its resnorm input stage
-// and SwiGLU output stage); the residual stream stays on the device. Each
-// GEMV writes into the input region of the next, so the calls from one
-// layer's mixer output to the next layer's input projection (out, gate + up,
-// down, next in) run as one chain. The CPU runs the token mixers (Gated
-// DeltaNet, attention) and the DeltaNet alpha/beta rows: 25 NPU submissions
-// per step.
+// Qwen3.5 / Qwen3.6 decode on the NPU. Every matrix product, every RMS norm
+// before one, the residual adds and SwiGLU run in the q4nx GEMV (its resnorm
+// input stage and SwiGLU output stage); the residual stream stays on the
+// device. Each GEMV writes into the input region of the next, so the calls
+// from one layer's mixer output to the next layer's input projection (out,
+// gate + up, down, next in) run as one chain. The CPU runs the token mixers
+// (Gated DeltaNet, attention) and the DeltaNet alpha/beta rows: 25 NPU
+// submissions per step for Qwen3.5-2B.
 //
-// A step takes one or two tokens; the weights are read once for both. The
-// second token of a pair can be a speculative draft: Resolve() keeps it or
-// rolls the state back to just after the first. The MTP head drafts the
-// token after next on the NPU as well (two submissions per draft); its LM
-// head scores only the draft vocabulary, and the main model still checks
-// each draft over every token.
+// MoE models (qwen35moe, Qwen3.6-35B-A3B) keep each layer's experts and its
+// shared expert in one device arena. After the mixer's output projection
+// (its own submission) the CPU routes in fp32 (moe.hpp) and points two
+// gathers at the chosen experts (npu::Q4nxGather): gate + up with SwiGLU
+// scaled by the router weights, then one down over all of them, chained
+// with the next layer's input projection. Two submissions per layer.
+//
+// A dense model's step takes one or two tokens; the weights are read once
+// for both. The second token of a pair can be a speculative draft: Resolve()
+// keeps it or rolls the state back to just after the first. The MTP head
+// drafts the token after next on the NPU as well (two submissions per
+// draft); its LM head scores only the draft vocabulary, and the main model
+// still checks each draft over every token. MoE models take one token per
+// step and have no MTP head here yet.
 namespace gufo_npu::qwen35 {
 
 class NpuDecoder {
@@ -36,6 +44,11 @@ public:
 
   const Config& config() const;
   DecodeState NewState() const;
+
+  // Tokens a Step can take (2, or 1 for MoE models), and whether Draft()
+  // works.
+  int step_tokens() const;
+  bool can_draft() const;
 
   // Runs `token` at state.position, advances the state and returns the
   // logits (vocab values, valid until the next call).
@@ -67,11 +80,17 @@ public:
                int position, DecodeState& state);
   DecodeState NewMtpState() const;
 
+  // MoE models: the experts layer `layer` chose for the last Step's first
+  // token, config().experts_used of them by descending weight.
+  const int* experts(int layer) const;
+
   // Wall time inside NPU submissions since construction, and their count;
-  // CPU time in the mixers and draft input (including buffer syncs).
+  // CPU time in the mixers and draft input (including buffer syncs), and in
+  // MoE routing (including patching the gathers).
   double npu_seconds() const;
   long submissions() const;
   double cpu_seconds() const;
+  double router_seconds() const;
 
 private:
   struct Impl;
@@ -89,9 +108,10 @@ struct SpeculativeStats {
 
 // Greedy decoding with MTP speculation: each step verifies one MTP draft in a
 // 2-token pass and keeps it when the main model agrees, so the output is the
-// main model's greedy output. The prompt runs two tokens per pass. With
-// `draft` false, every step decodes one token (no MTP). `on_token` sees each
-// generated id (including a stop id) as it is produced.
+// main model's greedy output. The prompt runs step_tokens() tokens per pass.
+// With `draft` false, every step decodes one token (no MTP); `draft` needs
+// can_draft(). `on_token` sees each generated id (including a stop id) as it
+// is produced.
 std::vector<int> SpeculativeGenerate(NpuDecoder& model,
                                      const std::vector<int>& prompt,
                                      int max_tokens,
