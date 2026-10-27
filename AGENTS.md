@@ -32,11 +32,15 @@ Compiling NPU kernels needs no NPU; running them does. Run NPU work with
 ## Tests
 
 - Run the smallest test that covers the change. Tests that need the NPU carry
-  the CTest label `npu`. Model tests exit 77 (skip) without
-  `GUFO_NPU_QWEN36_MODEL`; a skip is not a pass.
+  the CTest label `npu`. A model's tests live in `tests/models/<model>/` and
+  carry its label (`ctest -L qwen35_2b`), plus `model` when they need
+  weights and `kernels` for NPU op tests. Model tests exit 77 (skip) without
+  their model's variables (e.g. `GUFO_NPU_QWEN36_MODEL`); a skip is not a
+  pass.
 - Each NPU kernel has an op test against the CPU reference
   (relative error < 1e-2). Model changes need the teacher-forced greedy-argmax
-  match. Record checks in `docs/models/qwen3.6-35b-a3b/QUALITY.md`.
+  match. Record checks in the model's `docs/models/<model>/QUALITY.md`, and
+  retained or rejected optimizations in its `EXPERIMENTS.md`.
 - Timings are compared per request and per phase, against FLM and against
   main, with the same prompts and toolchain. Record them in `BENCHMARKS.md`.
 - Model tests (CTest label `model`) need, for Qwen3.5-2B:
@@ -50,8 +54,13 @@ Compiling NPU kernels needs no NPU; running them does. Run NPU work with
 ## Kernels
 
 - Designs live in `kernels/designs/<name>.py` and expose
-  `compile_to(out_dir, dev)`. Add each to `GUFO_NPU_KERNEL_DESIGNS` in
-  `kernels/CMakeLists.txt`.
+  `compile_to(out_dir, dev)`. Register each with `gufo_npu_add_kernel(NAME
+  DESIGN [SOURCES] MODEL)` (`cmake/GufoNpuKernels.cmake`) in
+  `kernels/CMakeLists.txt`. A design with more outputs than
+  `<name>.xclbin` + `<name>.insts.elf` keeps its shapes, sequence names and
+  `OUTPUTS` in a pure-data `<name>_variants.py` (no IRON imports), which the
+  build reads at configure time (`build.py --list-outputs --design PATH`).
+  `-DGUFO_NPU_MODELS=qwen35_2b` builds only that model's kernels.
 - Decode is bound by NPU read bandwidth (~56 GB/s; `bench bandwidth`) and
   by per-dispatch cost.
   Chain dependent dispatches in one `xrt::runlist` and fuse ops so a token
@@ -78,6 +87,38 @@ Compiling NPU kernels needs no NPU; running them does. Run NPU work with
   in runtime parameters), so every call runs in one hardware context and
   can join a runlist. `kernels/designs/q4nx_gemv.py` checks that all its
   shapes build the same array configuration.
+
+## Code layout
+
+Follows gufo: numerical code is per model, so a change made for one model
+cannot move another's output or speed; shared code carries no model's
+numerics. On the NPU the unit of isolation is the xclbin (one core program,
+one hardware context, one flow), as a kernel source file is in gufo.
+
+- Shared:
+  - `src/core`: GGUF reading, quant formats (q4nx, bfp16) and their
+    packers, tokenizer, vector helpers, pools. A format change (such as
+    q4nx rounding) is qualified on every model that uses it.
+  - `src/npu`: XRT plumbing (device, buffers, runlists, instruction
+    patching), no model constants.
+  - `src/models/qwen35`: the Qwen3.5/3.6 family's CPU code (config,
+    reference, CPU decoder, MoE routing, MTP, chat), as gufo's `qwen/`
+    package serves several sizes. A change here is qualified on each family
+    model.
+- Per model (`qwen35_2b`, `qwen36_35b_a3b`, `qwen35_4b`): NPU decoder and
+  prefill, kernel designs, core programs and xclbins with their shape
+  lists, op and model tests (`tests/models/<model>/`), docs
+  (`docs/models/<slug>/`: README, BENCHMARKS, QUALITY, EXPERIMENTS) and
+  tools. A model may borrow another's kernel only through a split-out
+  library, and its docs say so.
+- Moving there: today the 2B and the 35B still share
+  `src/models/qwen35/npu_decoder.*` and the `q4nx_gemv` design and xclbin,
+  and the 2B's prefill sits in `src/models/qwen35/`. The plan is to fork the
+  decode kernel per model (`src/models/<model>/kernels/`, xclbin
+  `<model>_decode`), trim each copy to its own shapes, split the NPU decoder
+  per model and select the model through a registry by GGUF arch and shape.
+  New models start in their own package and never edit another model's
+  kernels.
 
 ## Development
 
