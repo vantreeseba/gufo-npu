@@ -133,7 +133,8 @@ Measured and researched since the plan was approved; see
 `docs/models/qwen3.6-35b-a3b/BENCHMARKS.md` and
 `docs/research/STRIX-HALO-NPU.md`.
 
-**Second model: Qwen3.5-2B** (fast side-task model and bring-up target). Same
+**Second model: Qwen3.5-2B** (fast side-task model and bring-up target; see
+the scope change below: it is now the MVP). Same
 family as the 35B: 24 layers in the same 3 DeltaNet : 1 gated attention
 pattern, hidden 2048, head dim 256, 248k vocab and tokenizer, tied
 embeddings, one MTP layer. It is dense, so it exercises everything except
@@ -166,3 +167,32 @@ routing and experts. Est. ~1.1 GB read per token, ~45–50 tok/s NPU ceiling.
   reusables: `GEMM` + `DequantBFP`, `PrefillAttention`, `LMHead`.
 - Next measurements: read-only NPU bandwidth; THP vs no-THP weight buffers;
   NPU/iGPU contention.
+
+## Scope change (2026-10-27): MVP is Qwen3.5-2B
+
+Decided with the user: the **first pass (MVP) is Qwen3.5-2B only**, end to end
+(CPU reference, NPU decode, NPU prefill, server). **Qwen3.6-35B-A3B is the
+second pass**: it adds the router, top-k and MoE expert kernels, expert
+selection by `DispatchTime` offsets, and the MoE prefill path on top of the
+shared Qwen3.5 layers. Sections above that name the 35B as the MVP now
+describe the second pass.
+
+MVP targets (Qwen3.5-2B, same machine, against FLM's measured 28.0 tok/s
+decode and 0.60 s short-prompt TTFT; see `docs/models/qwen3.5-2b/BENCHMARKS.md`):
+
+- decode ≥ 38 tok/s at 1k context (ceiling ~45–50)
+- TTFT < 0.3 s for short prompts
+- prefill ≥ FLM's (~590 tok/s at 1k, ~1,390 at 8.5k)
+- output quality: teacher-forced greedy-argmax match against the CPU
+  reference and HF transformers
+
+MVP phases:
+
+2. CPU reference for Qwen3.5-2B (GGUF first, since it carries the MTP head;
+   then the FLM pack).
+3. NPU decode: int4 GEMV, Gated DeltaNet step, gated GQA decode attention,
+   RMSNorm/RoPE/gating, LM head; ~2 fused dispatches per layer, chained.
+4. NPU prefill: GEMM + DequantBFP projections, chunked DeltaNet, IRON
+   `PrefillAttention`.
+5. `gufo-npu serve` for the 2B.
+6. Then: MTP speculative decode for the 2B, and the 35B second pass.

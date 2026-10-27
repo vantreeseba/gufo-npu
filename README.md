@@ -1,7 +1,8 @@
 # gufo-npu
 
-An open-source engine for running **Qwen3.6-35B-A3B** on the **AMD XDNA2 NPU**
-in Strix Halo (Ryzen AI MAX+ 395), on Linux.
+An open-source engine for running Qwen models on the **AMD XDNA2 NPU** in Strix
+Halo (Ryzen AI MAX+ 395), on Linux. The MVP targets **Qwen3.5-2B**; the second
+pass adds **Qwen3.6-35B-A3B** (MoE).
 
 The only NPU runtime for this model today, [FastFlowLM](https://github.com/ROCm/FastFlowLM),
 ships its kernels as closed binaries. gufo-npu writes its own kernels with
