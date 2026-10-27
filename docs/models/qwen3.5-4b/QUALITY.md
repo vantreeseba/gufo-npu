@@ -109,3 +109,23 @@ greedy with and without prefill agree on all 48 tokens checked (the 2B: 26
 of 48). The growth is open (EXPERIMENTS.md); the tolerances above are this
 model's measurements with headroom, and a wrong offset or stale window still
 gives errors of order 1.
+
+Where the growth comes from (2026-10-27): the same prefill with its GEMMs
+replaced by exact fp32 projections over the same q4nx weights
+(`Q4nxProjections`, fp32 operands, no bf16 round trip), against the fp32 CPU
+decoder run token by token, then the real prefill (bfp16 GEMMs) against the
+same decoder. Worst relative error over the layers:
+
+| Prompt | fp32 projections: conv / DeltaNet state / K/V | bfp16 GEMMs: conv / DeltaNet state / K/V | Final hidden vs the double reference: fp32 / bfp16 |
+|---|---|---|---|
+| 256 | 4.2e-5 / 2.4e-5 / 6.9e-5 | 4.4e-2 / 3.2e-2 / 2.5e-2 | 1.7e-4 / 2.6e-2 |
+| 1,100 | 1.0e-4 / 9.9e-5 / 1.7e-4 | 9.8e-2 / 1.2e-1 / 1.2e-1 | 1.3e-3 / 1.5e-1 |
+| 2,049 | 4.5e-5 / 1.3e-4 / 2.0e-4 | 1.2e-1 / 1.4e-1 / 1.9e-1 | – |
+
+With exact projections the batched CPU side (the DeltaNet over 32 value
+heads and 16 key heads, conv windows, gated norms, chunked attention, chunk
+boundaries) matches token-by-token decode to ~1e-4 at every length, with no
+growth: the growth is all bfp16 rounding in the GEMMs (activations rounded
+to bfp16 inside the mmul, outputs to bf16), compounding over 32 layers of
+width 2560 (the 2B: 24 of 2048). That justifies the looser tolerances; a
+tighter prefill needs a more precise GEMM (EXPERIMENTS.md).

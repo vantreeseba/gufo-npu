@@ -55,9 +55,12 @@ constexpr int kSteps = 16;  // teacher-forced decode steps after the prompt
 // states <= 2.8e-2, logits <= 1.9e-2; at 2,049 tokens hidden 1.3e-1, conv
 // windows 2.8e-1, DeltaNet states 1.1e-1, K/V 1.8e-1, MTP K/V 1.4e-2, logits
 // <= 8.8e-2 (2B at 2,049: 4.1e-2, 4.4e-2, 5.8e-2, 4.4e-2, 1.3e-2, 3.3e-2).
-// The decode steps after prefill still agree on every top-1 and speculative
+// With exact fp32 projections in place of the GEMMs the same batched path
+// matches token-by-token decode to ~1e-4 at every length, so the growth is
+// the GEMMs' bfp16 rounding (QUALITY.md, "Where the growth comes from"). The
+// decode steps after prefill still agree on every top-1 and speculative
 // output equals greedy. A wrong offset or a stale window gives errors of
-// order 1. docs/models/qwen3.5-4b/QUALITY.md.
+// order 1.
 constexpr double kMaxHiddenError = 2e-1;
 constexpr double kMaxStateError = 4e-1;
 constexpr double kMaxLogitError = 1.5e-1;

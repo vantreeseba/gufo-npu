@@ -52,17 +52,24 @@ vector) but its shapes never reach it. Qwen3.6-35B-A3B's do: its mixer
 output is also 4,096 against a hidden of 2,048, so a two-token MoE step (MTP
 verify, two-token prompt passes) would lose the same values.
 
-## Prefill error growth (open)
+## Prefill error growth: bfp16, not the batched path
 
 The prefill (bfp16 GEMMs) against the decode path matches the 2B's accuracy
 on short prompts (up to 39 tokens: hidden <= 3.1e-2, logits <= 1.9e-2) but
 drifts about three times faster with prompt length: at 2,049 tokens hidden
 1.3e-1, conv windows 2.8e-1, DeltaNet states 1.1e-1, K/V 1.8e-1, logits
-8.8e-2 (2B: 4.1e-2, 4.4e-2, 5.8e-2, 4.4e-2, 3.3e-2). The value-head mapping
-in the prefill's DeltaNet and the attention grouping were reviewed and match
-decode; the end-to-end checks hold (decode after prefill agrees on every
-top-1, greedy with and without prefill agree on all 48 tokens checked, where
-the 2B agrees on 26). The tolerances of `qwen35_4b_npu_prefill_test` are
-set from these measurements. Worth trying: the second, lo-part GEMM pass
-that the 2B's prefill notes (about twice the GEMM time), and measuring the
-growth against the CPU reference instead of the decode path.
+8.8e-2 (2B: 4.1e-2, 4.4e-2, 5.8e-2, 4.4e-2, 3.3e-2).
+
+The 4B is the first model to prefill with more DeltaNet value heads (32)
+than key heads (16), so a batched-path bug was checked for by splitting the
+error (a diagnostic build of the prefill whose GEMMs are exact fp32
+projections over the same q4nx weights, against the fp32 CPU decoder token
+by token; QUALITY.md has the table). With exact projections the states agree
+to 2e-5 to 2e-4 at 256, 1,100 and 2,049 tokens, with no growth; with the
+bfp16 GEMMs they reach 1.2-1.9e-1 at 2,049. The batched mixer path is right;
+the growth is bfp16 rounding compounding over 32 layers of width 2560. The
+end-to-end checks hold (decode after prefill agrees on every top-1, greedy
+with and without prefill agree on all 48 tokens checked, where the 2B agrees
+on 26), so `qwen35_4b_npu_prefill_test` keeps tolerances set from the 4B's
+measurements. A tighter prefill would need a more precise GEMM, e.g. the
+second, lo-part pass the 2B's prefill notes (about twice the GEMM time).
