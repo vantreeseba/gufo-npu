@@ -61,6 +61,30 @@ Config ReadConfig(const gguf::File& file) {
       c.linear_value_heads % c.linear_key_heads != 0) {
     throw std::runtime_error("qwen35: inconsistent shape metadata");
   }
+  const bool moe = c.architecture == "qwen35moe";
+  if (moe != c.IsMoe() ||
+      (moe && (c.experts_used <= 0 || c.experts_used > c.experts ||
+               c.expert_ffn <= 0 || c.shared_expert_ffn <= 0)) ||
+      (!moe && c.ffn <= 0)) {
+    throw std::runtime_error("qwen35: inconsistent FFN or expert metadata");
+  }
+  return c;
+}
+
+bool HasMtpLayer(const gguf::File& file, const Config& c) {
+  return c.mtp_layers > 0 &&
+         file.FindTensor("blk." + std::to_string(c.layers) +
+                         ".nextn.eh_proj.weight") != nullptr;
+}
+
+Config RequireDenseTied(Config c, const char* who) {
+  if (c.IsMoe() || !c.tied_embeddings) {
+    throw std::runtime_error(
+        std::string(who) +
+        " supports dense models with tied embeddings only; this GGUF (" +
+        c.architecture + ") has " +
+        (c.IsMoe() ? "MoE layers" : "an untied output.weight"));
+  }
   return c;
 }
 

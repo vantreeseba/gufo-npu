@@ -8,9 +8,9 @@
 #include "models/qwen35/config.hpp"
 #include "models/qwen35/projections.hpp"
 
-// Fast single-token decode for dense Qwen3.5, in fp32: the reference's math,
-// one token per step. The reference (reference.hpp) stays the oracle; these
-// are tested against it.
+// Fast single-token decode for Qwen3.5 / Qwen3.6, dense or MoE, in fp32: the
+// reference's math, one token per step. The reference (reference.hpp) stays
+// the oracle; these are tested against it.
 namespace gufo_npu::qwen35 {
 
 // Per-sequence state of a decode (decoder layers, then MTP layers).
@@ -87,6 +87,9 @@ public:
 private:
   struct Weights;
   struct Scratch;
+  // Adds the routed experts of MoE layer `il` to the shared expert's output
+  // in the scratch, scaled by its gate (input: the normed hidden state).
+  void MoeFfn(int il);
   Mixer mixer_;
   const Projections& projections_;
   std::unique_ptr<Weights> weights_;

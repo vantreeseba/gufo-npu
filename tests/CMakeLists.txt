@@ -63,6 +63,42 @@ add_test(NAME qwen35_decoder_test COMMAND qwen35_decoder_test)
 set_tests_properties(qwen35_decoder_test PROPERTIES SKIP_RETURN_CODE 77
                      LABELS model)
 
+add_executable(qwen35_config_test models/qwen35/config_test.cpp)
+target_link_libraries(qwen35_config_test PRIVATE gufo_npu_qwen35)
+add_test(NAME qwen35_config_test COMMAND qwen35_config_test)
+
+# Qwen3.6-35B-A3B (arch qwen35moe): GUFO_NPU_QWEN36_MODEL is its GGUF.
+add_executable(qwen36_gguf_load_test models/qwen36/gguf_load_test.cpp)
+target_link_libraries(qwen36_gguf_load_test PRIVATE gufo_npu_qwen35)
+add_test(NAME qwen36_gguf_load_test COMMAND qwen36_gguf_load_test)
+set_tests_properties(qwen36_gguf_load_test PROPERTIES SKIP_RETURN_CODE 77
+                     LABELS model)
+
+add_executable(qwen36_reference_llama_test
+               models/qwen36/reference_llama_test.cpp)
+target_link_libraries(qwen36_reference_llama_test PRIVATE gufo_npu_qwen35)
+add_test(NAME qwen36_reference_llama_test COMMAND qwen36_reference_llama_test)
+set_tests_properties(qwen36_reference_llama_test PROPERTIES
+                     SKIP_RETURN_CODE 77 LABELS model TIMEOUT 3600)
+
+add_executable(qwen36_mtp_test models/qwen36/mtp_test.cpp)
+target_link_libraries(qwen36_mtp_test PRIVATE gufo_npu_qwen35)
+add_test(NAME qwen36_mtp_test COMMAND qwen36_mtp_test)
+set_tests_properties(qwen36_mtp_test PROPERTIES SKIP_RETURN_CODE 77
+                     LABELS model TIMEOUT 3600)
+
+add_executable(qwen36_q4nx_requant_test models/qwen36/q4nx_requant_test.cpp)
+target_link_libraries(qwen36_q4nx_requant_test PRIVATE gufo_npu_qwen35)
+add_test(NAME qwen36_q4nx_requant_test COMMAND qwen36_q4nx_requant_test)
+set_tests_properties(qwen36_q4nx_requant_test PROPERTIES SKIP_RETURN_CODE 77
+                     LABELS model TIMEOUT 7200)
+
+add_executable(qwen36_decoder_test models/qwen36/decoder_test.cpp)
+target_link_libraries(qwen36_decoder_test PRIVATE gufo_npu_qwen35)
+add_test(NAME qwen36_decoder_test COMMAND qwen36_decoder_test)
+set_tests_properties(qwen36_decoder_test PROPERTIES SKIP_RETURN_CODE 77
+                     LABELS model TIMEOUT 3600)
+
 add_test(NAME cli_version COMMAND gufo-npu version)
 set_tests_properties(cli_version PROPERTIES PASS_REGULAR_EXPRESSION
                      "^gufo-npu ${GUFO_NPU_VERSION}")
