@@ -3,11 +3,16 @@
 // XRT helpers shared by the NPU runtime sources. Only compiled with XRT.
 
 #include <chrono>
+#include <cstdint>
+#include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <initializer_list>
+#include <iterator>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "xrt/experimental/xrt_elf.h"
 #include "xrt/experimental/xrt_ext.h"
@@ -81,6 +86,61 @@ struct Sequence {
       run.set_arg(index++, *bo);
     }
     return run;
+  }
+};
+
+// One instruction sequence (<dir>/<name>.insts.bin) run through the kernel's
+// instruction-buffer argument (the "legacy" flow): the host owns the words
+// and may rewrite them between calls. Runs of this flow and of the ELF flow
+// cannot share a runlist (XRT leaves a mixed one in ERT_CMD_STATE_NEW).
+struct InstrSequence {
+  std::vector<std::uint32_t> words;
+  xrt::bo bo;
+
+  // `kernel` is xrt::kernel(*hw.context, hw.kernel_name).
+  InstrSequence(HwContext& hw, const xrt::kernel& kernel,
+                const std::filesystem::path& path)
+      : words(ReadWords(path)) {
+    if (words.empty()) {
+      throw std::runtime_error("empty instruction sequence " + path.string());
+    }
+    // The firmware refuses instruction buffers that are not cacheable.
+    bo = xrt::bo(hw.device, words.size() * sizeof(std::uint32_t),
+                 XCL_BO_FLAGS_CACHEABLE, kernel.group_id(1));
+    Sync();
+  }
+
+  // Copies `words` to the device buffer.
+  void Sync() {
+    std::memcpy(bo.map<void*>(), words.data(),
+                words.size() * sizeof(std::uint32_t));
+    bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  }
+
+  xrt::run Run(const xrt::kernel& kernel,
+               std::initializer_list<const xrt::bo*> args) {
+    xrt::run run(kernel);
+    run.set_arg(0, kOpcodeRun);
+    run.set_arg(1, bo);
+    run.set_arg(2, static_cast<std::uint32_t>(words.size()));
+    int index = 3;
+    for (const xrt::bo* arg : args) {
+      run.set_arg(index++, *arg);
+    }
+    return run;
+  }
+
+  static std::vector<std::uint32_t> ReadWords(
+      const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+      throw std::runtime_error("cannot read " + path.string());
+    }
+    const std::string bytes((std::istreambuf_iterator<char>(in)), {});
+    std::vector<std::uint32_t> words(bytes.size() / sizeof(std::uint32_t));
+    std::memcpy(words.data(), bytes.data(),
+                words.size() * sizeof(std::uint32_t));
+    return words;
   }
 };
 

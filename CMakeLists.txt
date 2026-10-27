@@ -42,6 +42,7 @@ target_include_directories(nlohmann_json SYSTEM INTERFACE
 
 # CPU-only core: no XRT, safe for hosted CI and unit tests.
 add_library(gufo_npu_core STATIC
+  src/core/bfp16.cpp
   src/core/diagnose.cpp
   src/core/gguf.cpp
   src/core/q4nx.cpp
@@ -81,10 +82,12 @@ set_source_files_properties(src/core/q4nx.cpp PROPERTIES
 if(GUFO_NPU_ENABLE_XRT)
   find_package(XRT REQUIRED)
   add_library(gufo_npu_runtime STATIC src/npu/device_xrt.cpp
+                                     src/npu/gemm_xrt.cpp
                                      src/npu/gemv_xrt.cpp)
   target_link_libraries(gufo_npu_runtime PUBLIC gufo_npu_core XRT::xrt_coreutil)
 else()
   add_library(gufo_npu_runtime STATIC src/npu/device_stub.cpp
+                                     src/npu/gemm_stub.cpp
                                      src/npu/gemv_stub.cpp)
   target_link_libraries(gufo_npu_runtime PUBLIC gufo_npu_core)
 endif()
@@ -94,6 +97,10 @@ add_library(gufo_npu_qwen35_npu STATIC src/models/qwen35/npu_decoder.cpp
                                        src/models/qwen35/q4nx_projections.cpp)
 target_link_libraries(gufo_npu_qwen35_npu PUBLIC gufo_npu_qwen35
                       gufo_npu_runtime)
+# Prompt processing on the NPU (GEMMs) with the mixers batched on the CPU.
+target_sources(gufo_npu_qwen35_npu PRIVATE src/models/qwen35/npu_prefill.cpp)
+set_source_files_properties(src/models/qwen35/npu_prefill.cpp PROPERTIES
+  COMPILE_OPTIONS "-march=x86-64-v3;-O3")
 
 add_executable(gufo-npu src/cli/main.cpp)
 target_link_libraries(gufo-npu PRIVATE gufo_npu_qwen35_npu)

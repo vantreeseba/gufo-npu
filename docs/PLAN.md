@@ -150,10 +150,32 @@ routing and experts. Est. ~1.1 GB read per token, ~45–50 tok/s NPU ceiling.
 - Dispatch: ~66 µs sync vs ~20 µs chained (measured). Fuse to ~2 dispatches
   per layer using IRON's `flm.DecodeLayer` as the template, chain them in a
   runlist, keep runtime-parameter words few (~2 µs each).
-- Expert selection: confirmed workable with one xclbin and mlir-aie
-  `DispatchTime` scalars for the 8 expert offsets (host builds the sequence
-  after top-8). FLM's pack stores each expert contiguously, so one linear DMA
-  per expert.
+- Expert selection (measured 2026-10-27, docs/research/NPU-MOE.md): two
+  gather calls per layer in the q4nx GEMV xclbin. One does the 9 experts'
+  gate + up as 9 rounds, scaled by the router weights; the other does one
+  down whose K is the 9 experts' outputs. The host patches the expert
+  offsets and scales into each call's instruction stream (instruction-buffer
+  flow, 3.2 µs per layer).
+  - 414 µs per layer chained (39.6 GB/s), against 948 µs for one call per
+    expert matrix. Correct to 4.9e-4.
+  - ELF and instruction-buffer runs can't share a runlist, so an MoE model
+    runs every decode call in the instruction-buffer flow
+    (`npu::Flow::kInstructionBuffer`). Dense models stay on the ELF flow,
+    which is ~2% faster on Qwen3.5-2B decode (39.1 vs 38.2 tok/s, same
+    output).
+  - The router runs on the CPU in fp32: a second sync per layer, so ~81
+    submissions per token.
+  - Projection: ~48 ms per token (~21 tok/s, FLM 16.5), ~26 tok/s with MTP.
+    Measured (2026-10-27, docs/models/qwen3.6-35b-a3b/BENCHMARKS.md):
+    19–20 tok/s without a draft, 26–29 with MTP (73–83% of drafts kept).
+  - Two-token passes read the pair's expert union (9 to 17 experts with the
+    shared one, a gather variant per count; `MAX_DIM` is 8,704 so one down
+    gather covers 17); each token weighs the other's experts 0, so its
+    result is bit-identical to a one-token pass.
+  - Open: quality of 4.625-bit weights where the GGUF keeps Q8_0 or Q5_K
+    (QUALITY.md: ~87% top-1 against llama.cpp on the as-stored GGUF); the
+    MoE prefill (a grouped expert GEMM over q4nx: no room for a bfp16 copy
+    of the experts).
 - Bandwidth: weight layout matters ~5× (contiguous 128 KB runs vs strided).
   Pre-pack weights at load/convert time; never stream strided.
 - MTP: FLM's Qwen3.6 pack has **no MTP tensors**, so FLM cannot speculate.
@@ -196,3 +218,29 @@ MVP phases:
    `PrefillAttention`.
 5. `gufo-npu serve` for the 2B.
 6. Then: MTP speculative decode for the 2B, and the 35B second pass.
+
+## Phase 4 decisions (2026-10-27)
+
+Prefill for the 2B, as built (numbers in
+`docs/models/qwen3.5-2b/BENCHMARKS.md` and `QUALITY.md`):
+
+- **Projections: IRON's `flm.GEMM` over a resident bfp16 copy of the
+  decoder's q4nx weights** (`kernels/designs/bfp16_gemm.py`), packed on the
+  host at load (1.56 GB more pinned memory, ~2.7 s). Measured 11–18 TFLOPS
+  at the 2B's shapes, compute-bound from 256 tokens per call, so a weight
+  format that reads fewer bytes would not help; a q4nx-native GEMM (unpack
+  each 32x256 block once in the core, TileFuse-style) would save the memory
+  and the second copy but needs the same bfp16 mmul and was not needed for
+  speed. No on-device `DequantBFP` per chunk: it would re-read and re-write
+  the weights every chunk.
+- **Mixers on the CPU, batched over the chunk**: the DeltaNet recurrence
+  runs token by token per (value head, 32-column block) job; a chunked or
+  parallel-scan form is not needed (~2 µs per token for all heads). Causal
+  attention is a blocked online-softmax kernel (AVX-512 when the CPU has
+  it, else AVX2). NPU
+  attention (IRON `PrefillAttention`) is left for longer prompts, where the
+  CPU's O(n²) part grows.
+- **Two chunks in flight** (up to 1,024 tokens each): one chunk's GEMMs run
+  on the NPU while the CPU runs the other's mixers.
+- The prompt's last token goes through the decoder, which produces the
+  first logits (the decode LM head) and continues from the prefilled state.

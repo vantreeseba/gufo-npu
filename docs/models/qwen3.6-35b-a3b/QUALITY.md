@@ -5,8 +5,9 @@ Planned contracts (see [the plan](../../PLAN.md)):
 | Check | Tolerance | State |
 |---|---|---|
 | CPU reference vs llama.cpp (CPU), teacher-forced logits | see below | enforced |
-| Each NPU op vs CPU reference | relative error < 1e-2 | |
-| NPU model vs CPU reference, teacher-forced | greedy argmax match | |
+| Each NPU op vs CPU reference | relative error < 1e-2 | enforced: MoE gathers 4.8e-4 (1 token), 4.8e-4 to 7.9e-4 (2 tokens, unions of 9 to 17) |
+| NPU decode vs CPU decoder over the same q4nx weights, teacher-forced, routing followed | logits rel. L2 < 1e-2 per prompt, argmax ≥ 98%, routing differences at near ties only | enforced (below) |
+| NPU MTP speculation vs plain greedy decode | identical output | enforced: 400 tokens after 4 prompts, 73% of drafts accepted |
 | Prefill vs one-token decode | identical next token | reference: identical logits |
 | CPU decoder vs reference | see below | enforced |
 | MTP head (reference) vs main model's top-1 | ≥ 50% of drafts | enforced (69%) |
@@ -17,7 +18,7 @@ There is no HF transformers oracle for this model here (the BF16 weights are
 
 ## CPU reference vs llama.cpp
 
-`tests/models/qwen36/reference_llama_test.cpp` (label `model`;
+`tests/models/qwen36_35b_a3b/reference_llama_test.cpp` (label `model`;
 `GUFO_NPU_QWEN36_MODEL` is the UD-Q4_K_XL GGUF, `GUFO_NPU_QWEN36_ORACLE` the
 output of `tools/reference/qwen36_llama_oracle.py`). llama.cpp
 0c1e57098bba43ac29e6e3b677cdceebdd22334f via llama-cpp-python 0.3.36, built
@@ -113,7 +114,7 @@ test takes ~110 s.
 
 ## Decoder vs reference
 
-`tests/models/qwen36/decoder_test.cpp` (label `model`, same variables): the
+`tests/models/qwen36_35b_a3b/decoder_test.cpp` (label `model`, same variables): the
 CPU decode path, `Decoder` (fp32 with an fp16 K/V cache, the MoE routing of
 `moe.hpp`) over `GgufProjections` in fp32, against the reference (the same
 GGUF in double), token by token over the chat prompt. 2026-10-27:
@@ -140,7 +141,7 @@ be at a near tie.
 
 ## MTP head
 
-`tests/models/qwen36/mtp_test.cpp` (label `model`, same variables).
+`tests/models/qwen36_35b_a3b/mtp_test.cpp` (label `model`, same variables).
 Neither oracle runs this model's MTP layer (llama.cpp's MTP context API is
 experimental), so the reference's head (`Reference::Mtp`, the `blk.40`
 nextn layer with its MoE FFN) is checked against the main model: teacher
@@ -166,7 +167,7 @@ matter inside the MTP block's own cache).
 What the NPU's q4nx format (`src/core/q4nx.hpp`: 4.625 bits per weight,
 4-bit codes, 8-bit sub-scale and sub-minimum per 32, bf16 d and dmin per row
 and 256 inputs) costs when every matrix is stored in it.
-`tests/models/qwen36/q4nx_requant_test.cpp` (label `model`, same variables)
+`tests/models/qwen36_35b_a3b/q4nx_requant_test.cpp` (label `model`, same variables)
 runs the fp32 CPU decoder teacher forced over the four oracle prompts (chat,
 code, prose and a 230-token prose passage; 301 positions) with four weight
 sets:
@@ -231,7 +232,7 @@ values better, in the same format, recovers part of it without the bytes
 
 The q4nx format fixes the bytes and the kernel, but for every weight that
 is not Q4_K the packer still chooses each row's d and dmin and each group's
-sub-scale, sub-minimum and codes. `tests/models/qwen36/q4nx_quality_test.cpp`
+sub-scale, sub-minimum and codes. `tests/models/qwen36_35b_a3b/q4nx_quality_test.cpp`
 (label `model`; `GUFO_NPU_QWEN36_TEXT` is the output of
 `tools/reference/fetch_text.py`) compares ways of choosing them, against the
 GGUF as stored, with the weight sets above:
@@ -282,7 +283,7 @@ GGUF as stored, with the weight sets above:
 | **library (new default)** | **0.0230** | **94.65%** | **0.0268** | **93.80%** | **0.0301** | **93.07%** | 278 / 277 | 1.4 ns per weight |
 | imatrix | 0.0111 | 95.84% | 0.0149 | 94.65% | | | 281 / 281 | |
 | imatrix, mean x² alone | | | 0.0157 | 95.51% | | | 282 / 280 | |
-| Unsloth's imatrix | 0.0107 | 96.70% | 0.0147 | 95.64% | | | 280 / 279 | |
+| Unsloth's imatrix | 0.0107 | 96.70% | 0.0147 | 95.64% | 0.0175 | 94.85% | 280 / 279 | |
 | AWQ + search | | | 0.0194 | 94.79% | | | 280 / 276 | |
 | AWQ + imatrix | | | 0.0153 | 94.92% | | | 283 / 284 | |
 
@@ -306,9 +307,96 @@ Reading:
   numbers are in the test's output; German Wikipedia and Chinese are the
   hardest texts for every method.
 
+## NPU decode
+
+`tests/models/qwen36_35b_a3b/npu_decode_test.cpp` (labels `npu`, `model`; same
+variables plus the kernel directory): `NpuDecoder` (every matrix in q4nx on
+the NPU, experts through `npu::Q4nxGather`, router and mixers on the CPU)
+against the fp32 CPU `Decoder` over `Q4nxProjections`, the same q4nx weights
+(Q4_K experts unpacked by q4nx's rule, everything else packed with
+`q4nx::PackRows`, router and DeltaNet alpha/beta in fp32 as on the NPU
+path). Teacher forced over the four oracle prompts (301 positions),
+2026-10-27, after the experts' order in the gathers became ascending ids
+(for MTP, below); the first measurements, with experts in order of weight,
+were within the same bounds (logits ≤ 5.9e-3, argmax 301/301, top-1 against
+llama.cpp 263/301).
+
+The NPU rounds every call's input to bf16, so where a layer's 8th and 9th
+experts are nearly tied it can route differently from the CPU, and both
+decodes then carry that on. In a first version of the test, which let both
+route on their own, that happened at position 0 or 1 in three of the four
+prompts (gaps 3.2e-4 to 2.7e-2), so "agree until the first routing
+difference" checked almost nothing. The test now makes the CPU follow the
+NPU's routing (the other experts' router logits drop 64 below the lowest
+chosen one, which leaves the chosen experts' renormalized weights exactly as
+the CPU computes them), compares the logits at every position, and checks
+separately that each routing the CPU would have made differently was a near
+tie in the CPU's own logits: the gap is 1 − exp(l_x − l_y) for the
+lowest-scored expert only the NPU chose and the highest-scored one only the
+CPU's top 8 had.
+
+| Prompt | Tokens | Logits rel. L2 (worst position) | Argmax vs CPU | Routings unlike the CPU's | Largest gap | NPU top-1 vs llama.cpp |
+|---|---|---|---|---|---|---|
+| chat | 17 | 4.3e-03 (6.2e-03) | 17/17 | 12 of 680 | 1.6e-02 | 16/17 |
+| code | 15 | 8.1e-03 (2.1e-02) | 15/15 | 12 of 600 | 2.7e-02 | 14/15 |
+| prose | 39 | 3.2e-03 (4.3e-03) | 39/39 | 24 of 1,560 | 5.2e-03 | 33/39 |
+| long | 230 | 3.7e-03 (6.4e-03) | 228/230 | 134 of 9,200 | 1.0e-02 | 198/230 |
+| all | 301 | | 299/301 | 182 of 12,040 (1.5%) | 2.7e-02 | 261/301 (86.7%) |
+
+Thresholds:
+
+| Check | Pass | Measured | Why |
+|---|---|---|---|
+| Logits rel. L2, per prompt | < 1e-2 | ≤ 8.1e-3 | the 2B's NPU bound; bf16 rounding of each call's input |
+| Argmax vs CPU, all prompts | ≥ 98% | 299/301 | |
+| Largest routing gap | < 5e-2 | 2.7e-2 | a misrouted expert lands far from the top 8 (gaps of order 1); bf16 noise moves router logits by ~1e-2 |
+
+Letting both route on their own (the first version), the NPU and the CPU
+still agreed on top-1 at 294/301 positions; the worst position's logits
+were 4–12% apart, depending on the prompt. Against llama.cpp, top-1 agrees
+at 261–263/301 positions on the NPU and at 260/301 on the CPU over the same
+weights. That matches set (c) above: requantizing to q4nx sets the quality;
+the NPU adds nothing measurable on top.
+
+### MTP speculation
+
+The same test then decodes greedily after each oracle prompt twice:
+plainly (one token per pass after the prompt) and with MTP speculation (a
+draft from the MTP block on the NPU, verified in a two-token pass that reads
+the pair's expert union), both with the prompt in two-token passes. The
+outputs must be identical token for token:
+
+| After | Tokens | Identical | Verify steps | Drafts accepted |
+|---|---|---|---|---|
+| chat | 256 | yes | 145 | 110 (76%) |
+| code | 48 | yes | 24 | 23 (96%) |
+| prose | 48 | yes | 28 | 19 (68%) |
+| long | 48 | yes | 32 | 16 (50%) |
+| all | 400 | yes | 229 | 168 (73%) |
+
+Identical, not merely close: a two-token pass gives each token exactly the
+logits of a one-token pass (checked bit for bit over 3 positions × 248,320
+logits and the final hidden states with a scratch probe), because each
+token weighs the experts only the other token chose 0, those add exact
+zeros, and the experts sum in ascending id order in both. Before the
+experts were sorted by id they summed in order of weight, which differs
+between a token's own call and the union. A bug the probe found on the way:
+the mixer output's buffer view covered only the first 1.5 slots, enough for
+Qwen3.5-2B's 2,048-wide mixers but not for this model's 4,096; the second
+token's upper half never reached the device.
+
+Determinism: `q4nx_moe_chain_test` (label `npu`) runs one layer's calls as
+the decoder wires them (input and output projections, then the two gathers
+and the next input projection, re-pointed between submissions) over five
+selections: one token with 9 experts (twice), and two tokens with unions of
+9, 13 and 17 experts, each token weighing about a third of them 0. 20,000
+runs; every byte each selection writes is identical to its first run.
+`q4nx_moe_gather_test` checks the same gathers against the CPU (worst
+relative error 4.8e-4 to 7.9e-4).
+
 ## GGUF load
 
-`tests/models/qwen36/gguf_load_test.cpp` (label `model`): ReadConfig gives
+`tests/models/qwen36_35b_a3b/gguf_load_test.cpp` (label `model`): ReadConfig gives
 the shape in [README.md](README.md) (40 + 1 layers, 10 full-attention, 16/32
 DeltaNet heads, 256/8 experts of width 512, shared expert 512, untied head),
 and every tensor dequantizes to finite values (753 tensors, 35.5 B values,
