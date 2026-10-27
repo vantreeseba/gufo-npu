@@ -12,6 +12,7 @@
 #include <thread>
 #include <vector>
 
+#include "core/cpus.hpp"
 #include "core/gguf.hpp"
 #include "core/q4nx.hpp"
 #include "core/quant.hpp"
@@ -329,8 +330,7 @@ private:
   bool lm_head_;
   bool experts_;
   mutable std::vector<float> out_;
-  mutable gufo_npu::SpinPool pool_{
-      std::max<std::size_t>(std::thread::hardware_concurrency() / 2, 1) - 1};
+  mutable gufo_npu::SpinPool pool_{gufo_npu::HalfCpuWorkers()};
 };
 
 std::size_t Argmax(const float* x, std::size_t n) {

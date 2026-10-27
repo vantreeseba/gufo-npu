@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "core/cpus.hpp"
 #include "core/quant.hpp"
 #include "core/thread_pool.hpp"
 #include "core/vec.hpp"
@@ -57,9 +58,9 @@ struct Mixer::Scratch {
                                    // sum
   int rope_position = -1;          // the position rope_cos/sin hold
   std::vector<float> rope_cos, rope_sin;
-  // DeltaNet heads run in parallel; a job is tens of microseconds.
-  SpinPool pool{std::min<std::size_t>(
-      7, std::max<std::size_t>(std::thread::hardware_concurrency(), 1) - 1)};
+  // DeltaNet heads run in parallel; a job is tens of microseconds. At most
+  // 7 workers, within half the usable CPUs (cpus.hpp).
+  SpinPool pool{std::min<std::size_t>(7, HalfCpuWorkers())};
 };
 
 Mixer::Mixer(const gguf::File& file)

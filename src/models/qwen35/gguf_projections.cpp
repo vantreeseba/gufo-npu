@@ -10,6 +10,7 @@
 #include <immintrin.h>
 #endif
 
+#include "core/cpus.hpp"
 #include "core/quant.hpp"
 #include "core/thread_pool.hpp"
 #include "core/vec.hpp"
@@ -114,12 +115,10 @@ struct GgufProjections::Layer {
   const TensorInfo* down_exps = nullptr;
 };
 
-// Half the hardware threads (memory bandwidth, not cores, bounds these
-// products): every Run waits for every worker, so a pool that oversubscribes
-// the CPU pays a scheduler time slice per call.
+// Half the usable CPUs (cpus.hpp; memory bandwidth, not cores, bounds these
+// products), leaving the other half to the mixers' pool.
 struct GgufProjections::Pool {
-  SpinPool pool{
-      std::max<std::size_t>(std::thread::hardware_concurrency() / 2, 1) - 1};
+  SpinPool pool{HalfCpuWorkers()};
 };
 
 GgufProjections::GgufProjections(const gguf::File& file, Precision precision)
