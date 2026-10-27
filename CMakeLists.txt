@@ -36,10 +36,19 @@ configure_file(src/core/build_info.hpp.in
 # CPU-only core: no XRT, safe for hosted CI and unit tests.
 add_library(gufo_npu_core STATIC
   src/core/diagnose.cpp
+  src/core/gguf.cpp
+  src/core/quant.cpp
 )
 target_include_directories(gufo_npu_core PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
   "${CMAKE_CURRENT_BINARY_DIR}/generated")
+
+# Qwen3.5 / Qwen3.6 model code (CPU reference).
+add_library(gufo_npu_qwen35 STATIC
+  src/models/qwen35/config.cpp
+  src/models/qwen35/reference.cpp
+)
+target_link_libraries(gufo_npu_qwen35 PUBLIC gufo_npu_core)
 
 # NPU runtime: XRT when enabled, otherwise a stub that reports it is absent.
 if(GUFO_NPU_ENABLE_XRT)
