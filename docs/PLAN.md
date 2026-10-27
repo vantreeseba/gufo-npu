@@ -158,8 +158,11 @@ routing and experts. Est. ~1.1 GB read per token, ~45–50 tok/s NPU ceiling.
   flow, 3.2 µs per layer).
   - 414 µs per layer chained (39.6 GB/s), against 948 µs for one call per
     expert matrix. Correct to 4.9e-4.
-  - ELF and instruction-buffer runs can't share a runlist, so every decode
-    call moves to the instruction-buffer flow.
+  - ELF and instruction-buffer runs can't share a runlist, so an MoE model
+    runs every decode call in the instruction-buffer flow
+    (`npu::Flow::kInstructionBuffer`). Dense models stay on the ELF flow,
+    which is ~2% faster on Qwen3.5-2B decode (39.1 vs 38.2 tok/s, same
+    output).
   - The router runs on the CPU in fp32: a second sync per layer, so ~81
     submissions per token.
   - Projection: ~48 ms per token (~21 tok/s, FLM 16.5), ~26 tok/s with MTP.

@@ -62,7 +62,8 @@ Compiling NPU kernels needs no NPU; running them does. Run NPU work with
 - Runs from an instruction ELF (`xrt::module`) and runs given their
   instruction stream as a BO (`.insts.bin`, the path for patching DDR
   offsets per call, as the MoE gathers do) cannot share a runlist
-  (`ERT_CMD_STATE_NEW`). A runtime-sequence wait costs ~4.5 µs, so group DMA
+  (`ERT_CMD_STATE_NEW`). A `GemvRuntime` uses one of the two
+  (`npu::Flow`): MoE models the instruction buffers, dense models the ELFs. A runtime-sequence wait costs ~4.5 µs, so group DMA
   tasks and await only the last of each group per channel
   (docs/research/NPU-MOE.md).
 - In a runtime sequence, waiting on a DMA task (`wait=True`, a task group's
