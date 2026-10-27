@@ -292,6 +292,46 @@ ranking that gave every source the same say (a token's best frequency in
 any of them) reached only 51.7% on the English prompt: 20 Wikipedia
 languages crowded out common English chat tokens.
 
+### Compact q4nx scales
+
+A q4nx block (32 rows x 256 inputs) carried a bf16 scale and a bf16 minimum
+per row and 32 inputs: 5120 bytes, 5 bits per weight. It now carries a uint8
+sub-scale and an int8 sub-minimum per row and 32 inputs and a bf16 d and dmin
+per row (w = dmin * mn + d * sc * code): 4736 bytes, 4.625 bits per weight,
+7.5% less to stream. Q4_K maps onto it code for code (its 6-bit scales and
+minima are the sub-values; d and dmin round to bf16, where before each d * sc
+did). The kernel weights each group's dot product and token sum by the
+integer sub-values (exact in bf16) and multiplies the two totals by d and
+dmin once per 256 inputs, on hi + lo halves. Same binaries otherwise, old and
+new interleaved, warm, 2026-10-27.
+
+`gufo-npu bench gemv`, mean µs for one token (two runs):
+
+| Stage | MB before → after | 5120-byte blocks | 4736-byte blocks | Change |
+|---|---|---|---|---|
+| DeltaNet in (qkv + z) | 10.5 → 9.7 | 280.7, 274.0 | 265.6, 261.2 | −5% |
+| Attention in (q + k + v) | 6.6 → 6.1 | 204.3, 204.6 | 201.0, 203.9 | −1% |
+| Mixer out (ssm_out) | 2.6 → 2.4 | 123.0, 128.4 | 121.8, 126.1 | −1% |
+| FFN in (gate + up) | 15.7 → 14.5 | 372.2, 370.1 | 356.8, 352.9 | −4% |
+| FFN down | 7.9 → 7.3 | 222.6, 222.3 | 212.2, 214.0 | −4% |
+| LM head | 318.5 → 294.6 | 5,820.9, 5,773.2 | 5,360.3, 5,361.0 | −7.5% |
+
+The LM head stays at 55 GB/s, so its time drops with its bytes; the small
+GEMVs keep their fixed per-call cost.
+
+`gufo-npu generate --device npu`, three runs each:
+
+| Prompt | 5120-byte blocks | 4736-byte blocks |
+|---|---|---|
+| Sky, `--draft none` | 37.15, 36.96, 36.90 tok/s | **38.99, 38.55, 39.08** |
+| Fibonacci, `--draft mtp` | 61.06, 60.78, 60.60 | **63.65, 63.00, 63.41** |
+| Sky, `--draft mtp` | 52.73, 52.56, 52.83 | 53.39, 53.66, 53.42 |
+
+A no-draft token now takes 25.7 ms instead of 26.9 ms. The rounding of d
+instead of d * sc moves the weights slightly, so the greedy replies differ
+a little: the sky reply runs to 95 tokens instead of 87, with 61% of its
+drafts accepted instead of 65%, which eats most of that prompt's gain.
+
 ### NPU power mode
 
 `xrt-smi configure --pmode <mode>` (needs CAP_SYS_ADMIN; the box runs

@@ -12,9 +12,16 @@
 namespace gufo_npu::q4nx {
 namespace {
 
-constexpr std::size_t kGroups = kKTile / kGroup;           // per block row
-constexpr std::size_t kScaleBytes = kGroups * kMTile * 2;  // scales or minima
-constexpr std::size_t kQ4KBytes = 144;                     // block_q4_K
+constexpr std::size_t kGroups = kKTile / kGroup;  // per block row
+// Byte offsets in a block (see q4nx.hpp).
+constexpr std::size_t kD = 0;
+constexpr std::size_t kDmin = kD + kMTile * 2;
+constexpr std::size_t kSc = kDmin + kMTile * 2;
+constexpr std::size_t kMn = kSc + kGroups * kMTile;
+constexpr std::size_t kCodes = kMn + kGroups * kMTile;
+static_assert(kCodes + kMTile * kKTile / 2 == kBlockBytes);
+static_assert(kCodes % 64 == 0, "the kernel loads codes 64 bytes at a time");
+constexpr std::size_t kQ4KBytes = 144;  // block_q4_K
 
 void CheckShape(std::size_t rows, std::size_t dim) {
   if (rows == 0 || dim == 0 || dim % kKTile != 0) {
@@ -60,18 +67,44 @@ std::size_t CodeIndex(std::size_t m, std::size_t k) {
   return (((m / 16) * kGroups + k / 32) * 32 + k % 32) * 16 + m % 16;
 }
 
-void SetParams(std::uint8_t* block, std::size_t m, std::size_t g,
-               std::uint16_t scale, std::uint16_t min) {
-  StoreU16(block + (g * kMTile + m) * 2, scale);
-  StoreU16(block + kScaleBytes + (g * kMTile + m) * 2, min);
+// Row m's super-scale and super-minimum (bf16 bits).
+void SetSuper(std::uint8_t* block, std::size_t m, std::uint16_t d,
+              std::uint16_t dmin) {
+  StoreU16(block + kD + m * 2, d);
+  StoreU16(block + kDmin + m * 2, dmin);
+}
+
+void SetSub(std::uint8_t* block, std::size_t m, std::size_t g, std::uint8_t sc,
+            std::int8_t mn) {
+  block[kSc + g * kMTile + m] = sc;
+  block[kMn + g * kMTile + m] = static_cast<std::uint8_t>(mn);
+}
+
+// Group g's step (d * sc) and minimum (dmin * mn) for row m, exact in fp32.
+void Params(const std::uint8_t* block, std::size_t m, std::size_t g,
+            float* step, float* min) {
+  const float d = quant::Bf16ToFloat(LoadU16(block + kD + m * 2));
+  const float dmin = quant::Bf16ToFloat(LoadU16(block + kDmin + m * 2));
+  *step = d * static_cast<float>(block[kSc + g * kMTile + m]);
+  *min = dmin * static_cast<float>(
+                    static_cast<std::int8_t>(block[kMn + g * kMTile + m]));
 }
 
 void SetCode(std::uint8_t* block, std::size_t m, std::size_t k,
              std::uint8_t code) {
   const std::size_t i = CodeIndex(m, k);
-  std::uint8_t& byte = block[2 * kScaleBytes + i / 2];
+  std::uint8_t& byte = block[kCodes + i / 2];
   byte = (i % 2 == 0) ? static_cast<std::uint8_t>((byte & 0xF0) | code)
                       : static_cast<std::uint8_t>((byte & 0x0F) | (code << 4));
+}
+
+// The smallest bf16 at or above x (x >= 0).
+std::uint16_t Bf16AtLeast(float x) {
+  std::uint16_t bits = quant::FloatToBf16(x);
+  if (quant::Bf16ToFloat(bits) < x) {
+    ++bits;
+  }
+  return bits;
 }
 
 // One Q4_K super-block (256 in-features of out-feature m) into a q4nx block.
@@ -80,12 +113,12 @@ void PackQ4KSuper(const std::uint8_t* src, std::uint8_t* block, std::size_t m) {
   const float dmin = quant::HalfToFloat(LoadU16(src + 2));
   const std::uint8_t* scales = src + 4;
   const std::uint8_t* qs = src + 16;
+  SetSuper(block, m, quant::FloatToBf16(d), quant::FloatToBf16(dmin));
   for (std::size_t g = 0; g < kGroups; ++g) {
     std::uint8_t sc;
     std::uint8_t mn;
-    quant::ScaleMinK4(g, scales, &sc, &mn);
-    SetParams(block, m, g, quant::FloatToBf16(d * sc),
-              quant::FloatToBf16(-dmin * mn));
+    quant::ScaleMinK4(g, scales, &sc, &mn);  // 6 bits each
+    SetSub(block, m, g, sc, static_cast<std::int8_t>(-mn));
     // Sub-blocks pair up: 2p in the low nibbles of qs[32p..], 2p+1 high.
     const std::uint8_t* q = qs + (g / 2) * 32;
     const int shift = (g % 2) * 4;
@@ -95,20 +128,47 @@ void PackQ4KSuper(const std::uint8_t* src, std::uint8_t* block, std::size_t m) {
   }
 }
 
-// Min/max fit of 32 weights.
-void PackGroup(const float* w, std::uint8_t* block, std::size_t m,
-               std::size_t g) {
-  const auto [lo_it, hi_it] = std::minmax_element(w, w + kGroup);
-  const std::uint16_t min_bits = quant::FloatToBf16(*lo_it);
-  const std::uint16_t scale_bits =
-      quant::FloatToBf16((*hi_it - *lo_it) / 15.0f);
-  SetParams(block, m, g, scale_bits, min_bits);
-  const float min = quant::Bf16ToFloat(min_bits);
-  const float scale = quant::Bf16ToFloat(scale_bits);
-  for (std::size_t l = 0; l < kGroup; ++l) {
-    float code = scale > 0 ? std::nearbyint((w[l] - min) / scale) : 0.0f;
-    code = std::clamp(code, 0.0f, 15.0f);
-    SetCode(block, m, g * kGroup + l, static_cast<std::uint8_t>(code));
+// Row m of a block from its kKTile fp32 weights: per group a min/max fit,
+// with the minimum rounded down onto dmin's grid (int8) and the step rounded
+// up onto d's (uint8), so every weight is within the group's 16 levels.
+void PackRowBlock(const float* w, std::uint8_t* block, std::size_t m) {
+  float lo[kGroups];
+  float hi[kGroups];
+  float max_abs_min = 0;
+  for (std::size_t g = 0; g < kGroups; ++g) {
+    const auto [lo_it, hi_it] =
+        std::minmax_element(w + g * kGroup, w + (g + 1) * kGroup);
+    lo[g] = *lo_it;
+    hi[g] = *hi_it;
+    max_abs_min = std::max(max_abs_min, std::abs(lo[g]));
+  }
+  const std::uint16_t dmin_bits = Bf16AtLeast(max_abs_min / 127.0f);
+  const float dmin = quant::Bf16ToFloat(dmin_bits);
+  std::int8_t mn[kGroups];
+  float need[kGroups];  // the step each group needs from its minimum
+  float max_need = 0;
+  for (std::size_t g = 0; g < kGroups; ++g) {
+    const float q = dmin > 0 ? std::floor(lo[g] / dmin) : 0.0f;
+    mn[g] = static_cast<std::int8_t>(std::clamp(q, -127.0f, 127.0f));
+    need[g] = (hi[g] - dmin * static_cast<float>(mn[g])) / 15.0f;
+    max_need = std::max(max_need, need[g]);
+  }
+  const std::uint16_t d_bits = Bf16AtLeast(max_need / 255.0f);
+  const float d = quant::Bf16ToFloat(d_bits);
+  SetSuper(block, m, d_bits, dmin_bits);
+  for (std::size_t g = 0; g < kGroups; ++g) {
+    const float sc = d > 0 ? std::ceil(need[g] / d) : 0.0f;
+    SetSub(block, m, g, static_cast<std::uint8_t>(std::clamp(sc, 0.0f, 255.0f)),
+           mn[g]);
+    float step;
+    float min;
+    Params(block, m, g, &step, &min);
+    for (std::size_t l = 0; l < kGroup; ++l) {
+      float code =
+          step > 0 ? std::nearbyint((w[g * kGroup + l] - min) / step) : 0.0f;
+      code = std::clamp(code, 0.0f, 15.0f);
+      SetCode(block, m, g * kGroup + l, static_cast<std::uint8_t>(code));
+    }
   }
 }
 
@@ -134,9 +194,7 @@ void PackTiles(Matrix& out, RowFn&& row_fn) {
             PackQ4KSuper(q4k + kb * kQ4KBytes, block, m);
             continue;
           }
-          for (std::size_t g = 0; g < kGroups; ++g) {
-            PackGroup(row.data() + kb * kKTile + g * kGroup, block, m, g);
-          }
+          PackRowBlock(row.data() + kb * kKTile, block, m);
         }
       }
     }
@@ -223,15 +281,13 @@ std::vector<float> Unpack(const Matrix& matrix) {
           float* row =
               w.data() + (tile * kMTile + m) * matrix.dim + kb * kKTile;
           for (std::size_t k = 0; k < kKTile; ++k) {
-            const std::size_t g = k / kGroup;
-            const float scale =
-                quant::Bf16ToFloat(LoadU16(block + (g * kMTile + m) * 2));
-            const float min = quant::Bf16ToFloat(
-                LoadU16(block + kScaleBytes + (g * kMTile + m) * 2));
+            float step;
+            float min;
+            Params(block, m, k / kGroup, &step, &min);
             const std::size_t i = CodeIndex(m, k);
-            const std::uint8_t byte = block[2 * kScaleBytes + i / 2];
+            const std::uint8_t byte = block[kCodes + i / 2];
             const int code = (i % 2 == 0) ? (byte & 0xF) : (byte >> 4);
-            row[k] = min + scale * static_cast<float>(code);
+            row[k] = min + step * static_cast<float>(code);
           }
         }
       }
@@ -255,7 +311,7 @@ void Gemv(const Matrix& matrix, const float* x, float* y) {
       double acc[kMTile] = {};
       for (std::size_t kb = 0; kb < k_blocks; ++kb) {
         const std::uint8_t* block = Block(matrix, tile, kb);
-        const std::uint8_t* codes = block + 2 * kScaleBytes;
+        const std::uint8_t* codes = block + kCodes;
         const float* xk = x + kb * kKTile;
         for (std::size_t g = 0; g < kGroups; ++g) {
           // Codes of group g: [m / 16][g][l][m % 16], two per byte.
@@ -272,11 +328,10 @@ void Gemv(const Matrix& matrix, const float* x, float* y) {
             }
             for (std::size_t i = 0; i < 16; ++i) {
               const std::size_t m = half * 16 + i;
-              const float scale =
-                  quant::Bf16ToFloat(LoadU16(block + (g * kMTile + m) * 2));
-              const float min = quant::Bf16ToFloat(
-                  LoadU16(block + kScaleBytes + (g * kMTile + m) * 2));
-              acc[m] += scale * dot[i] + min * sums[kb * kGroups + g];
+              float step;
+              float min;
+              Params(block, m, g, &step, &min);
+              acc[m] += step * dot[i] + min * sums[kb * kGroups + g];
             }
           }
         }

@@ -51,7 +51,10 @@ from aie.utils import config
 from aie.utils.compile.utils import compile_mlir_module
 
 M_TILE, K_TILE, GROUP = 32, 256, 32
-BLOCK_BYTES = M_TILE * K_TILE * 5 // 8  # 4-bit codes + bf16 scale and min per 32
+# 4-bit codes, a uint8 sub-scale and int8 sub-minimum per row and 32 inputs,
+# and a bf16 super-scale and super-minimum per row: 4.625 bits per weight.
+BLOCK_BYTES = M_TILE * K_TILE // 2 + M_TILE * K_TILE // GROUP * 2 + M_TILE * 4
+assert BLOCK_BYTES == 4736
 COLS, ROWS = 8, 4
 OUT_PER_ROUND = COLS * ROWS * M_TILE
 MAX_DIM = 6144
@@ -219,8 +222,9 @@ def gemv_program(dev, dim, n_out, prologue, epilogue, y_stride, tokens):
         body(x, w_in, y_out, k_zero, k_block, k_store, y_acc, sums, rtp)
         x_in.release(1)
 
-    words_per_col = n_out * dim * 5 // 8 // 4 // (rounds * COLS)
-    w_l3_ty = np.ndarray[(n_out * dim * 5 // 8 // 4,), np.dtype[np.uint32]]
+    w_words = n_out // M_TILE * (dim // K_TILE) * BLOCK_BYTES // 4
+    words_per_col = w_words // (rounds * COLS)
+    w_l3_ty = np.ndarray[(w_words,), np.dtype[np.uint32]]
     if epilogue == "swiglu":
         # Token t's compact bf16 values at t * y_stride words; the padding of
         # each core's output (24 of every 32 words) goes past both tokens.

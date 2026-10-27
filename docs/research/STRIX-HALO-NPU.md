@@ -120,6 +120,8 @@ HTTP range requests). "Inferred" marks conclusions not read directly.
 `PrefillAttention` (head dim 256 GQA), `LMHead` (fused RMS norm),
 `DecodeLayer` (fusion template). IRON's Gemma q4nx uses 32×256 blocks with
 bf16 scale and minimum per 32 values (5 bits/weight), not FLM's Qwen layout.
+gufo-npu's q4nx keeps the 32×256 blocks with 8-bit sub-scales and minima and
+a bf16 d/dmin per row (4.625 bits/weight; `src/core/q4nx.hpp`).
 **No MoE/router/top-k and no Gated DeltaNet / SSM kernels exist** in IRON or
 mlir-aie: both are new work.
 

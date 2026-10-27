@@ -34,16 +34,26 @@ and inputs in the input/output stages it is built for, against a
 double-precision reference over the same packed weights and the same bf16
 operand; then all of them again chained in one runlist. Pass: relative L2
 error < 1e-2, and the resnorm residual (H + D) within 1e-6 of its scale.
-2026-10-27, on the NPU (same results alone and chained):
+2026-10-27, on the NPU, one token (same results alone and chained), with
+5120-byte blocks (bf16 scale and minimum per 32) and with the compact
+4736-byte blocks (uint8/int8 per 32, bf16 d and dmin per row):
 
-| Sequence | Relative error | Residual |
-|---|---|---|
-| q4nx_gemv_k2048_n2048_plain_store | 5.9e-6 | |
-| q4nx_gemv_k2048_n5120_resnorm_store | 5.4e-6 | ✓ |
-| q4nx_gemv_k2048_n8192_resnorm_store | 6.4e-6 | ✓ |
-| q4nx_gemv_k2048_n12288_resnorm_swiglu | 1.1e-5 | ✓ |
-| q4nx_gemv_k6144_n2048_act_store | 5.9e-6 | |
-| q4nx_gemv_k2048_n248832_resnorm_store | 5.6e-6 | ✓ |
+| Sequence | 5120-byte blocks | 4736-byte blocks | Residual |
+|---|---|---|---|
+| q4nx_gemv_k2048_n2048_plain_store | 5.9e-6 | 9.6e-6 | |
+| q4nx_gemv_k4096_n2048_plain_store | 5.7e-6 | 1.1e-5 | |
+| q4nx_gemv_k2048_n5120_resnorm_store | 5.4e-6 | 9.3e-6 | ✓ |
+| q4nx_gemv_k2048_n8192_resnorm_store | 5.1e-6 | 7.9e-6 | ✓ |
+| q4nx_gemv_k2048_n12288_resnorm_swiglu | 1.7e-3 | 1.6e-3 | ✓ |
+| q4nx_gemv_k6144_n2048_act_store | 6.6e-6 | 9.7e-6 | |
+| q4nx_gemv_k2048_n248832_resnorm_store | 5.4e-6 | 9.3e-6 | ✓ |
+
+- The compact blocks add one more hi + lo rounding (the per-256 totals
+  before d and dmin multiply them): ~1.7x the error, still ~1e-5.
+- SwiGLU writes bf16 and the test compares against unrounded values, so its
+  error is the bf16 rounding (~2^-9 / sqrt(3)).
+- The 2-token n8192 case reads 6.1e-5 in both formats (a few outputs near
+  zero in that random draw).
 
 - The GEMV carries its dot products and token sums in two bf16 halves and
   writes fp32; with single bf16 (IRON's q4nx_accumulate) the same test gave
@@ -51,10 +61,13 @@ error < 1e-2, and the resnorm residual (H + D) within 1e-6 of its scale.
 - SwiGLU computes sigmoid from MLIR-AIE's exp2 polynomial and a Newton
   reciprocal. The `vtanh` instruction (aie::tanh) passes |x| <= 0.5 through
   unchanged and gave 1.1e-2.
-- `q4nx_test` (hosted CI) checks the packing: Q4_K codes carry over
-  unchanged, requantized weights stay within half a 4-bit step, fused stacks
+- `q4nx_test` (hosted CI) checks the packing: Q4_K codes, sub-scales and
+  sub-minima carry over unchanged (only d and dmin round to bf16),
+  requantized weights stay within half their step (the group's range / 15,
+  widened by the int8 minimum's grid and rounded up onto d's), fused stacks
   equal their parts, row orders (SwiGLU) apply, and the CPU q4nx GEMV matches
-  the reference.
+  the reference. Requantizing N(0, 0.02) weights: relative RMS error 0.0787
+  (0.0783 with 5120-byte blocks).
 
 ## NPU decode, teacher-forced
 
@@ -71,9 +84,20 @@ per prompt. 2026-10-27:
 | code | 15 | 15/15 | 5.4e-3 | 15/15 |
 | prose | 39 | 39/39 | 4.3e-3 | 33/39 |
 
-- The NPU adds no top-1 changes over its own weights (73/73). The logits gap
-  is mostly the bf16 rounding of each GEMV's input (and the bf16 norm
-  weights).
+With the compact 4736-byte blocks (same day, same test):
+
+| Prompt | Tokens | NPU vs q4nx CPU: argmax | Logits rel err | NPU argmax vs HF |
+|---|---|---|---|---|
+| chat | 19 | 19/19 | 7.1e-3 | 17/19 |
+| code | 15 | 15/15 | 5.0e-3 | 15/15 |
+| prose | 39 | 38/39 | 4.5e-3 | 31/39 |
+
+- The NPU adds no top-1 changes over its own weights with 5120-byte blocks
+  (73/73) and one with 4736-byte blocks (72/73, a near tie in prose). The
+  logits gap is mostly the bf16 rounding of each GEMV's input (and the bf16
+  norm weights). Against HF the two formats score 64/73 and 63/73: d and
+  dmin now round to bf16 instead of each d * sc, which moves a few near
+  ties either way.
 - Against HF, q4nx on the CPU and the GGUF reference agree on the same
   positions as the NPU here, except 2 prose positions where the GGUF weights
   do better: requantizing the 5–8-bit tensors costs 2 of 73. A longer quality

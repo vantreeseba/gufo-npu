@@ -52,7 +52,8 @@ int CheckQ4KExact() {
   if (!packed.exact || packed.padded_rows != q4nx::kOutPerRound) {
     return Fail("Q4_K pack: exact flag or padding");
   }
-  if (packed.bytes.size() != packed.padded_rows * kDim * 5 / 8) {
+  if (packed.bytes.size() != packed.padded_rows / q4nx::kMTile *
+                                 (kDim / q4nx::kKTile) * q4nx::kBlockBytes) {
     return Fail("Q4_K pack: byte count");
   }
   const auto w = q4nx::Unpack(packed);
@@ -60,9 +61,9 @@ int CheckQ4KExact() {
   quant::Dequantize(GgmlType::kQ4_K, data.data(), ref.data(), ref.size());
   for (std::size_t r = 0; r < kRows; ++r) {
     for (std::size_t k = 0; k < kDim; ++k) {
-      // Codes match; scale = d*sc and min = -dmin*m each move by at most half
-      // a bf16 ulp (2^-8 relative: bf16 keeps 8 significant bits), so the
-      // weight moves by at most 2^-8 * (15 * scale + |min|).
+      // Codes, sub-scales and sub-minima match; d and dmin each move by at
+      // most half a bf16 ulp (2^-8 relative: bf16 keeps 8 significant bits),
+      // so the weight moves by at most 2^-8 * (15 * scale + |min|).
       const std::uint8_t* blk = data.data() + (r * kDim + k) / 256 * 144;
       std::uint16_t d_bits;
       std::uint16_t dmin_bits;
@@ -108,28 +109,45 @@ int CheckRequant() {
   const auto u = q4nx::Unpack(packed);
   double err2 = 0;
   double ref2 = 0;
+  constexpr std::size_t kGroups = q4nx::kKTile / q4nx::kGroup;
+  constexpr float kUp = 1.0f + 1.0f / 128;  // bf16 rounded up: <= 2^-7 above
   for (std::size_t r = 0; r < kRows; ++r) {
-    for (std::size_t g = 0; g < kDim / q4nx::kGroup; ++g) {
-      const float* src = w.data() + r * kDim + g * q4nx::kGroup;
-      float lo = src[0];
-      float hi = src[0];
-      for (std::size_t l = 0; l < q4nx::kGroup; ++l) {
-        lo = std::fmin(lo, src[l]);
-        hi = std::fmax(hi, src[l]);
+    for (std::size_t kb = 0; kb < kDim / q4nx::kKTile; ++kb) {
+      const float* src = w.data() + r * kDim + kb * q4nx::kKTile;
+      float lo[kGroups];
+      float hi[kGroups];
+      float max_abs_min = 0;
+      for (std::size_t g = 0; g < kGroups; ++g) {
+        lo[g] = *std::min_element(src + g * q4nx::kGroup,
+                                  src + (g + 1) * q4nx::kGroup);
+        hi[g] = *std::max_element(src + g * q4nx::kGroup,
+                                  src + (g + 1) * q4nx::kGroup);
+        max_abs_min = std::fmax(max_abs_min, std::fabs(lo[g]));
       }
-      // Within half a step, plus the bf16 rounding of min and scale.
-      const float step = (hi - lo) / 15.0f;
-      const float bound = 0.5f * step * 1.05f + std::ldexp(std::fabs(lo), -7);
-      for (std::size_t l = 0; l < q4nx::kGroup; ++l) {
-        const std::size_t i = r * kDim + g * q4nx::kGroup + l;
-        const double e = u[i] - w[i];
-        if (std::fabs(e) > bound) {
-          std::fprintf(stderr, "FAIL: requant [%zu]: %g vs %g (bound %g)\n", i,
-                       u[i], w[i], bound);
-          return 1;
+      // A group's minimum sits up to dmin below its own, so it needs a step
+      // of up to (hi - lo + dmin) / 15, which its uint8 sub-scale rounds up
+      // by at most d. Every weight is within half its step.
+      const float dmin = max_abs_min / 127.0f * kUp;
+      float max_need = 0;
+      for (std::size_t g = 0; g < kGroups; ++g) {
+        max_need = std::fmax(max_need, (hi[g] - lo[g] + dmin) / 15.0f);
+      }
+      const float d = max_need / 255.0f * kUp;
+      for (std::size_t g = 0; g < kGroups; ++g) {
+        const float bound =
+            0.5f * ((hi[g] - lo[g] + dmin) / 15.0f + d) * 1.0001f + 1e-9f;
+        for (std::size_t l = 0; l < q4nx::kGroup; ++l) {
+          const std::size_t i =
+              r * kDim + kb * q4nx::kKTile + g * q4nx::kGroup + l;
+          const double e = u[i] - w[i];
+          if (std::fabs(e) > bound) {
+            std::fprintf(stderr, "FAIL: requant [%zu]: %g vs %g (bound %g)\n",
+                         i, u[i], w[i], bound);
+            return 1;
+          }
+          err2 += e * e;
+          ref2 += static_cast<double>(w[i]) * w[i];
         }
-        err2 += e * e;
-        ref2 += static_cast<double>(w[i]) * w[i];
       }
     }
   }

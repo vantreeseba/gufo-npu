@@ -14,14 +14,16 @@
 // norm weight; act tokens sit back to back as bf16 instead (MAX_DIM apart).
 // Each output object carries GEMV_TOKENS * M_TILE values, token-major.
 //
-// The block layout is IRON's q4nx.h. The accumulation is adapted from its
-// q4nx_accumulate, keeping more precision: each block's dot product and each
-// per-32 token sum are carried as two bf16 halves (hi + lo) instead of one,
-// and the output stays fp32. Geometry arrives as -D flags.
+// The block (q4nx_block below, src/core/q4nx.hpp) holds 4-bit codes, an 8-bit
+// sub-scale and sub-minimum per row and 32 inputs, and a bf16 super-scale and
+// super-minimum per row: w = dmin * mn + d * sc * code. The accumulation is
+// adapted from IRON's q4nx_accumulate (flm_gemma4/q4nx.h), keeping more
+// precision: each block's dot product and each per-32 token sum are carried
+// as two bf16 halves (hi + lo) instead of one, and the output stays fp32.
+// Geometry arrives as -D flags.
 #include "aie_kernels/aie_kernel_utils.h"
 #include "aie_kernels/common/exp2_poly.h"
 #include "aie_kernels/common/zero.h"
-#include "aie_kernels/flm_gemma4/q4nx.h"
 #include "aie_kernels/flm_gemma4/utils.h"
 
 #include <aie_api/aie.hpp>
@@ -33,7 +35,24 @@
 #error "q4nx_gemv.cc needs its geometry -D defined"
 #endif
 
+// One M by N block. Per row: d and dmin (bf16). Per row and 32 inputs,
+// indexed [n / 32][m]: the sub-scale sc (uint8) and sub-minimum mn (int8).
+// Then the codes in strips of 16 rows, each strip column-major.
+template <int M, int N>
+struct q4nx_block {
+  bf16 d[M];
+  bf16 dmin[M];
+  uint8_t sc[M * N / 32];
+  int8_t mn[M * N / 32];
+  uint4 qs[M * N];
+};
+
 using q4nx_block_t = q4nx_block<Q4NX_M_TILE, Q4NX_K_TILE>;
+// The codes take half a byte each in memory (the block is 4736 bytes), though
+// a uint4 array's sizeof counts a byte each; only the offsets matter.
+static_assert(__builtin_offsetof(q4nx_block_t, qs) ==
+                  Q4NX_M_TILE * 4 + Q4NX_M_TILE * Q4NX_K_TILE / 32 * 2,
+              "d, dmin, sc and mn precede the codes");
 
 namespace {
 
@@ -52,7 +71,9 @@ static_assert(TOKENS == 1 || TOKENS == 2, "one or two tokens per call");
 
 // c_t[0:M] += dequantize(A) * B_t[0:N] for T tokens, with the minima folded
 // in through the per-32 sums of each B_t (hi and lo bf16 halves). The codes
-// are widened once and used for every token.
+// are widened once and used for every token. Per 16 rows the integer
+// sub-scales and sub-minima weight each group's dot product and token sum
+// (exact in bf16), and the row's d and dmin multiply the two totals once.
 template <int M, int N, int T>
 void accumulate(const q4nx_block<M, N> *A, const bf16 *const *B,
                 float *const *c, const bf16 *const *sums_hi,
@@ -63,17 +84,26 @@ void accumulate(const q4nx_block<M, N> *A, const bf16 *const *B,
   AIE_LOOP_RANGE(M / pr, M / pr)
   for (int row = 0; row < M; row += pr) {
     aie::accum<accfloat, pr> c_accum[T];
+    aie::accum<accfloat, pr> scaled[T];  // sum over groups of sc * dot
+    aie::accum<accfloat, pr> minned[T];  // sum over groups of mn * token sum
 #pragma clang loop unroll(full)
     for (int t = 0; t < T; t++) {
       c_accum[t].from_vector(aie::load_v<pr>(c[t] + row));
+      scaled[t] = aie::zeros<accfloat, pr>();
+      minned[t] = aie::zeros<accfloat, pr>();
     }
     uint32_t scale_min_offset = row;
 
     AIE_LOOP_RANGE(N / 32, N / 32)
     for (int sub_chunk = 0; sub_chunk < N / 32; sub_chunk++) {
-      aie::vector<bf16, pr> a_scales =
-          aie::load_v<pr>(A->scales + scale_min_offset);
-      aie::vector<bf16, pr> a_mins = aie::load_v<pr>(A->mins + scale_min_offset);
+      aie::accum<accfloat, pr> sc_acc;
+      sc_acc.from_vector(
+          aie::to_float(aie::load_v<pr>(A->sc + scale_min_offset), 0));
+      const aie::vector<bf16, pr> a_sc = sc_acc.template to_vector<bf16>();
+      aie::accum<accfloat, pr> mn_acc;
+      mn_acc.from_vector(
+          aie::to_float(aie::load_v<pr>(A->mn + scale_min_offset), 0));
+      const aie::vector<bf16, pr> a_mn = mn_acc.template to_vector<bf16>();
       scale_min_offset += M;
 
       // 32 columns = 4 uint4 sub-vectors x 8 lanes each, fully unrolled so
@@ -102,19 +132,31 @@ void accumulate(const q4nx_block<M, N> *A, const bf16 *const *B,
                            b_col.get(sv * 8 + cc));
           }
         }
-        // The scale multiply takes bf16 operands, so split the fp32 dot into
-        // hi + lo: the residual error drops from 2^-9 to about 2^-17.
+        // The sub-scale multiply takes bf16 operands, so split the fp32 dot
+        // into hi + lo: the residual error drops from 2^-9 to about 2^-17.
         aie::vector<bf16, pr> dot_hi = dot.template to_vector<bf16>();
         aie::accum<accfloat, pr> rest = aie::sub(dot, dot_hi);
         aie::vector<bf16, pr> dot_lo = rest.template to_vector<bf16>();
-        c_accum[t] = aie::mac(c_accum[t], dot_hi, a_scales);
-        c_accum[t] = aie::mac(c_accum[t], dot_lo, a_scales);
-        c_accum[t] = aie::mac(c_accum[t], a_mins, sums_hi[t][sub_chunk]);
-        c_accum[t] = aie::mac(c_accum[t], a_mins, sums_lo[t][sub_chunk]);
+        scaled[t] = aie::mac(scaled[t], dot_hi, a_sc);
+        scaled[t] = aie::mac(scaled[t], dot_lo, a_sc);
+        minned[t] = aie::mac(minned[t], a_mn, sums_hi[t][sub_chunk]);
+        minned[t] = aie::mac(minned[t], a_mn, sums_lo[t][sub_chunk]);
       }
     }
+    // The row's super-scale and super-minimum, again on hi + lo halves.
+    const aie::vector<bf16, pr> a_d = aie::load_v<pr>(A->d + row);
+    const aie::vector<bf16, pr> a_dmin = aie::load_v<pr>(A->dmin + row);
 #pragma clang loop unroll(full)
     for (int t = 0; t < T; t++) {
+      aie::vector<bf16, pr> hi = scaled[t].template to_vector<bf16>();
+      aie::vector<bf16, pr> lo =
+          aie::sub(scaled[t], hi).template to_vector<bf16>();
+      c_accum[t] = aie::mac(c_accum[t], hi, a_d);
+      c_accum[t] = aie::mac(c_accum[t], lo, a_d);
+      hi = minned[t].template to_vector<bf16>();
+      lo = aie::sub(minned[t], hi).template to_vector<bf16>();
+      c_accum[t] = aie::mac(c_accum[t], hi, a_dmin);
+      c_accum[t] = aie::mac(c_accum[t], lo, a_dmin);
       aie::store_v(c[t] + row, c_accum[t].template to_vector<float>());
     }
   }
