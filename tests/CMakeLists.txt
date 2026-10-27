@@ -1,5 +1,9 @@
 # Tests labelled "npu" need /dev/accel/accel0; everything else runs on hosted
 # CI. NPU tests exit 77 (skip) when the device is missing, which is not a pass.
+# Model tests live with their model (models/<model>/CMakeLists.txt) and carry
+# its label (qwen35_2b, qwen36_35b_a3b), plus "model" when they need weights
+# and "kernels" for NPU op tests. Shared code is tested here and in
+# models/qwen35 (the Qwen3.5 family's CPU code, label qwen35_family).
 
 add_executable(diagnose_test core/diagnose_test.cpp)
 target_link_libraries(diagnose_test PRIVATE gufo_npu_core)
@@ -50,69 +54,6 @@ add_test(NAME tokenizer_test
 set_tests_properties(tokenizer_test PROPERTIES SKIP_RETURN_CODE 77
                      LABELS model)
 
-add_executable(qwen35_gguf_load_test models/qwen35/gguf_load_test.cpp)
-target_link_libraries(qwen35_gguf_load_test PRIVATE gufo_npu_core)
-add_test(NAME qwen35_gguf_load_test COMMAND qwen35_gguf_load_test)
-set_tests_properties(qwen35_gguf_load_test PROPERTIES SKIP_RETURN_CODE 77
-                     LABELS model)
-
-add_executable(qwen35_reference_oracle_test
-               models/qwen35/reference_oracle_test.cpp)
-target_link_libraries(qwen35_reference_oracle_test PRIVATE gufo_npu_qwen35)
-add_test(NAME qwen35_reference_oracle_test COMMAND qwen35_reference_oracle_test)
-set_tests_properties(qwen35_reference_oracle_test PROPERTIES
-                     SKIP_RETURN_CODE 77 LABELS model)
-
-add_executable(qwen35_generate_oracle_test
-               models/qwen35/generate_oracle_test.cpp)
-target_link_libraries(qwen35_generate_oracle_test PRIVATE gufo_npu_qwen35
-                      nlohmann_json)
-add_test(NAME qwen35_generate_oracle_test COMMAND qwen35_generate_oracle_test)
-set_tests_properties(qwen35_generate_oracle_test PROPERTIES
-                     SKIP_RETURN_CODE 77 LABELS model)
-
-add_executable(qwen35_decoder_test models/qwen35/decoder_test.cpp)
-target_link_libraries(qwen35_decoder_test PRIVATE gufo_npu_qwen35_npu)
-add_test(NAME qwen35_decoder_test COMMAND qwen35_decoder_test)
-set_tests_properties(qwen35_decoder_test PROPERTIES SKIP_RETURN_CODE 77
-                     LABELS model)
-
-add_executable(qwen35_config_test models/qwen35/config_test.cpp)
-target_link_libraries(qwen35_config_test PRIVATE gufo_npu_qwen35)
-add_test(NAME qwen35_config_test COMMAND qwen35_config_test)
-
-# Qwen3.6-35B-A3B (arch qwen35moe): GUFO_NPU_QWEN36_MODEL is its GGUF.
-add_executable(qwen36_gguf_load_test models/qwen36/gguf_load_test.cpp)
-target_link_libraries(qwen36_gguf_load_test PRIVATE gufo_npu_qwen35)
-add_test(NAME qwen36_gguf_load_test COMMAND qwen36_gguf_load_test)
-set_tests_properties(qwen36_gguf_load_test PROPERTIES SKIP_RETURN_CODE 77
-                     LABELS model)
-
-add_executable(qwen36_reference_llama_test
-               models/qwen36/reference_llama_test.cpp)
-target_link_libraries(qwen36_reference_llama_test PRIVATE gufo_npu_qwen35)
-add_test(NAME qwen36_reference_llama_test COMMAND qwen36_reference_llama_test)
-set_tests_properties(qwen36_reference_llama_test PROPERTIES
-                     SKIP_RETURN_CODE 77 LABELS model TIMEOUT 3600)
-
-add_executable(qwen36_mtp_test models/qwen36/mtp_test.cpp)
-target_link_libraries(qwen36_mtp_test PRIVATE gufo_npu_qwen35)
-add_test(NAME qwen36_mtp_test COMMAND qwen36_mtp_test)
-set_tests_properties(qwen36_mtp_test PROPERTIES SKIP_RETURN_CODE 77
-                     LABELS model TIMEOUT 3600)
-
-add_executable(qwen36_q4nx_requant_test models/qwen36/q4nx_requant_test.cpp)
-target_link_libraries(qwen36_q4nx_requant_test PRIVATE gufo_npu_qwen35)
-add_test(NAME qwen36_q4nx_requant_test COMMAND qwen36_q4nx_requant_test)
-set_tests_properties(qwen36_q4nx_requant_test PROPERTIES SKIP_RETURN_CODE 77
-                     LABELS model TIMEOUT 7200)
-
-add_executable(qwen36_decoder_test models/qwen36/decoder_test.cpp)
-target_link_libraries(qwen36_decoder_test PRIVATE gufo_npu_qwen35)
-add_test(NAME qwen36_decoder_test COMMAND qwen36_decoder_test)
-set_tests_properties(qwen36_decoder_test PROPERTIES SKIP_RETURN_CODE 77
-                     LABELS model TIMEOUT 3600)
-
 add_test(NAME cli_version COMMAND gufo-npu version)
 set_tests_properties(cli_version PROPERTIES PASS_REGULAR_EXPRESSION
                      "^gufo-npu ${GUFO_NPU_VERSION}")
@@ -122,60 +63,8 @@ if(GUFO_NPU_ENABLE_XRT AND GUFO_NPU_BUILD_KERNELS)
            COMMAND gufo-npu smoke --iters 200
                    --kernels "${CMAKE_BINARY_DIR}/kernels")
   set_tests_properties(npu_smoke PROPERTIES LABELS npu)
-
-  add_executable(qwen35_npu_decode_test models/qwen35/npu_decode_test.cpp)
-  target_link_libraries(qwen35_npu_decode_test PRIVATE gufo_npu_qwen35_npu)
-  add_test(NAME qwen35_npu_decode_test
-           COMMAND qwen35_npu_decode_test "${CMAKE_BINARY_DIR}/kernels")
-  set_tests_properties(qwen35_npu_decode_test PROPERTIES LABELS "npu;model"
-                       SKIP_RETURN_CODE 77)
-
-  add_executable(qwen36_npu_decode_test models/qwen36/npu_decode_test.cpp)
-  target_link_libraries(qwen36_npu_decode_test PRIVATE gufo_npu_qwen35_npu)
-  add_test(NAME qwen36_npu_decode_test
-           COMMAND qwen36_npu_decode_test "${CMAKE_BINARY_DIR}/kernels")
-  set_tests_properties(qwen36_npu_decode_test PROPERTIES LABELS "npu;model"
-                       SKIP_RETURN_CODE 77 TIMEOUT 3600)
-
-  add_executable(q4nx_gemv_test npu/q4nx_gemv_test.cpp)
-  target_link_libraries(q4nx_gemv_test PRIVATE gufo_npu_runtime)
-  add_test(NAME q4nx_gemv_test
-           COMMAND q4nx_gemv_test "${CMAKE_BINARY_DIR}/kernels")
-  set_tests_properties(q4nx_gemv_test PROPERTIES LABELS npu
-                       SKIP_RETURN_CODE 77)
-
-  add_executable(q4nx_moe_gather_test npu/q4nx_moe_gather_test.cpp)
-  target_link_libraries(q4nx_moe_gather_test PRIVATE gufo_npu_runtime)
-  add_test(NAME q4nx_moe_gather_test
-           COMMAND q4nx_moe_gather_test "${CMAKE_BINARY_DIR}/kernels")
-  set_tests_properties(q4nx_moe_gather_test PROPERTIES LABELS npu
-                       SKIP_RETURN_CODE 77)
-
-  add_executable(q4nx_gemv_chain_test npu/q4nx_gemv_chain_test.cpp)
-  target_link_libraries(q4nx_gemv_chain_test PRIVATE gufo_npu_runtime)
-  add_test(NAME q4nx_gemv_chain_test
-           COMMAND q4nx_gemv_chain_test "${CMAKE_BINARY_DIR}/kernels")
-  set_tests_properties(q4nx_gemv_chain_test PROPERTIES LABELS npu
-                       SKIP_RETURN_CODE 77 TIMEOUT 600)
-
-  add_executable(q4nx_moe_chain_test npu/q4nx_moe_chain_test.cpp)
-  target_link_libraries(q4nx_moe_chain_test PRIVATE gufo_npu_runtime)
-  add_test(NAME q4nx_moe_chain_test
-           COMMAND q4nx_moe_chain_test "${CMAKE_BINARY_DIR}/kernels")
-  set_tests_properties(q4nx_moe_chain_test PROPERTIES LABELS npu
-                       SKIP_RETURN_CODE 77 TIMEOUT 600)
-
-  add_executable(qwen35_npu_prefill_test models/qwen35/npu_prefill_test.cpp)
-  target_link_libraries(qwen35_npu_prefill_test PRIVATE gufo_npu_qwen35_npu)
-  add_test(NAME qwen35_npu_prefill_test
-           COMMAND qwen35_npu_prefill_test "${CMAKE_BINARY_DIR}/kernels")
-  set_tests_properties(qwen35_npu_prefill_test PROPERTIES LABELS "npu;model"
-                       SKIP_RETURN_CODE 77)
-
-  add_executable(bfp16_gemm_test npu/bfp16_gemm_test.cpp)
-  target_link_libraries(bfp16_gemm_test PRIVATE gufo_npu_runtime)
-  add_test(NAME bfp16_gemm_test
-           COMMAND bfp16_gemm_test "${CMAKE_BINARY_DIR}/kernels")
-  set_tests_properties(bfp16_gemm_test PROPERTIES LABELS npu
-                       SKIP_RETURN_CODE 77)
 endif()
+
+add_subdirectory(models/qwen35)
+add_subdirectory(models/qwen35_2b)
+add_subdirectory(models/qwen36_35b_a3b)

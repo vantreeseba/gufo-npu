@@ -59,6 +59,21 @@ from aie.iron.device import Tile, from_name
 from aie.utils import config
 from aie.utils.compile.utils import compile_mlir_module
 
+# Shapes, sequence names and outputs: pure data, also read by CMake.
+from q4nx_gemv_variants import (  # noqa: E402
+    EXPERT_FFN,
+    HIDDEN,
+    MAX_DIM,
+    MOE_VARIANTS,
+    OUTPUTS,
+    SLOT,
+    TOKENS,
+    VARIANTS,
+    XCLBIN,
+    sequence_name,
+    sequences,
+)
+
 M_TILE, K_TILE, GROUP = 32, 256, 32
 # 4-bit codes, a uint8 sub-scale and int8 sub-minimum per row and 32 inputs,
 # and a bf16 super-scale and super-minimum per row: 4.625 bits per weight.
@@ -66,10 +81,6 @@ BLOCK_BYTES = M_TILE * K_TILE // 2 + M_TILE * K_TILE // GROUP * 2 + M_TILE * 4
 assert BLOCK_BYTES == 4736
 COLS, ROWS = 8, 4
 OUT_PER_ROUND = COLS * ROWS * M_TILE
-MAX_DIM = 6144
-HIDDEN = 2048  # residual width (resnorm)
-TOKENS = 2  # tokens a call can carry
-SLOT = 2 * HIDDEN  # fp32 per plain/resnorm token slot ([H | D])
 X_FLOATS = TOKENS * SLOT + HIDDEN // 2  # slots, then the bf16 norm weight
 RES_COL = 1  # the column whose cores hand out the residual
 RES_PIECES = HIDDEN // ROWS // M_TILE  # output objects per core for it
@@ -86,7 +97,6 @@ GATHER_GROUP = 3
 # and residual BDs: (UP_DEPTH + 1) * UP_GROUP * 2 + 2 <= 16.
 UP_DEPTH = 1
 UP_GROUP = 3
-EXPERT_FFN = 512  # an MoE expert's width (Qwen3.6-35B-A3B)
 MAX_EXPERTS = MAX_DIM // EXPERT_FFN  # experts a down gather can concatenate
 RTP_SCALES = 7  # first RTP word of the swiglu_scaled scales
 RTP_WORDS = RTP_SCALES + MAX_EXPERTS * TOKENS
@@ -96,7 +106,6 @@ SCALE_SENTINEL = 0x7FA50000
 STACK_SIZE = 8 * 1024
 
 KERNEL_SOURCE = Path(__file__).resolve().parent.parent / "aie" / "q4nx_gemv.cc"
-XCLBIN = "q4nx_gemv"
 
 bf16 = np.dtype[bfloat16]
 # k blocks, rounds, input stage, output stage, residual pieces, core row,
@@ -105,62 +114,6 @@ RTP_TY = np.ndarray[(RTP_WORDS,), np.dtype[np.int32]]
 
 PROLOGUES = {"plain": 0, "resnorm": 1, "act": 2}
 EPILOGUES = {"store": 0, "swiglu": 1, "swiglu_scaled": 2}
-
-# Decode calls of Qwen3.5-2B as (dim, padded rows, input, output, Y token
-# stride): mixer output (into the next resnorm's D slots), the MTP head's
-# eh_proj (into the residual H slots), fused attention
-# input (q + gate, k, v), fused DeltaNet input (qkv + z), fused gate + up with
-# SwiGLU, down (into the next D slots), and the LM head (248320 rows padded to
-# 248832). Each is built for 1 and 2 tokens.
-VARIANTS = [
-    (2048, 2048, "plain", "store", SLOT),
-    (4096, 2048, "plain", "store", SLOT),
-    (2048, 5120, "resnorm", "store", 5120),
-    (2048, 8192, "resnorm", "store", 8192),
-    (2048, 12288, "resnorm", "swiglu", 12288 // 4),
-    (6144, 2048, "act", "store", SLOT),
-    (2048, 248832, "resnorm", "store", 248832),
-    # The MTP draft's LM head over the draft vocabulary.
-    (2048, 32768, "resnorm", "store", 32768),
-    # Qwen3.6-35B-A3B MoE, one expert per call: gate + up and down.
-    (2048, 1024, "resnorm", "swiglu", MAX_DIM // 2),
-    (512, 2048, "act", "store", SLOT),
-    # Qwen3.6-35B-A3B input projections: DeltaNet (qkv + z), attention
-    # (q + gate, k, v). Its mixer outputs (4096 -> 2048) and LM head
-    # (248,320 rows) use the shapes above.
-    (2048, 12288, "resnorm", "store", 12288),
-    (2048, 9216, "resnorm", "store", 9216),
-]
-
-# MoE gathers as (dim, rows, input, output, Y token stride, gather, experts):
-# 9 experts (8 routed and the shared one) per call.
-MOE_VARIANTS = [
-    (2048, 9 * 1024, "resnorm", "swiglu_scaled", MAX_DIM // 2, "rounds", 9),
-    (9 * EXPERT_FFN, 2048, "act", "store", SLOT, "k", 9),
-]
-
-
-def sequence_name(dim, rows, prologue, epilogue, tokens, gather="", experts=0):
-    moe = f"_{gather}{experts}" if gather else ""
-    return f"{XCLBIN}_k{dim}_n{rows}_{prologue}_{epilogue}{moe}_t{tokens}"
-
-
-def _sequences():
-    for variant in VARIANTS + MOE_VARIANTS:
-        dim, rows, prologue, epilogue, y_stride, *moe = variant
-        gather, experts = moe if moe else ("", 0)
-        for tokens in range(1, TOKENS + 1):
-            yield (dim, rows, prologue, epilogue, y_stride, tokens, gather, experts)
-
-
-# build.py checks these: the xclbin, then per variant an instruction ELF and
-# the raw instruction words (the host's instruction-buffer flow).
-OUTPUTS = [f"{XCLBIN}.xclbin"] + [
-    f"{sequence_name(d, n, p, e, t, g, x)}.insts.{suffix}"
-    for d, n, p, e, _, t, g, x in _sequences()
-    for suffix in ("elf", "bin")
-]
-
 
 def _chunk(words):
     """The longest run (at most 1024 words, the BD inner size) dividing words."""
@@ -519,7 +472,7 @@ def compile_to(out_dir: Path, dev: str) -> None:
     device = from_name(dev, n_cols=None)
     iron.set_current_device(device)
     first_cores = None
-    for variant in _sequences():
+    for variant in sequences():
         dim, rows, prologue, epilogue, _, tokens, gather, experts = variant
         name = sequence_name(dim, rows, prologue, epilogue, tokens, gather, experts)
         # IRON reuses any kernel object already in the work dir, even when

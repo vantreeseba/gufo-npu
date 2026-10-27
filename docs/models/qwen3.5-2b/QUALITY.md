@@ -2,7 +2,7 @@
 
 ## CPU reference vs HF transformers
 
-`tests/models/qwen35/reference_oracle_test.cpp` against
+`tests/models/qwen35_2b/reference_oracle_test.cpp` against
 `tools/reference/qwen35_oracle.py` (transformers 5.21.0, torch 2.13.0+cpu,
 fp32, `Qwen/Qwen3.5-2B@15852e8c`). Same token ids on both sides; three
 prompts (chat template, code, prose; 73 tokens). Measured 2026-10-27.
@@ -23,7 +23,7 @@ prompts (chat template, code, prose; 73 tokens). Measured 2026-10-27.
   ids as HF `tokenizers` and decode to the same text (CJK, emoji/ZWJ,
   decomposed Unicode, contractions, code, special tokens inside text).
   Fixtures: `tools/reference/tokenizer_fixtures.py`.
-- `tests/models/qwen35/generate_oracle_test.cpp`: the rendered chat prompt
+- `tests/models/qwen35_2b/generate_oracle_test.cpp`: the rendered chat prompt
   (thinking off) tokenizes to HF's ids, and greedy decoding on the BF16 GGUF
   reproduces HF `generate` for all 25 tokens up to `<|im_end|>`.
 
