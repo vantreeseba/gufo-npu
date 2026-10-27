@@ -529,6 +529,13 @@ std::vector<int> SpeculativeGenerate(NpuDecoder& model,
   const int prefilled =
       prefill ? prefill(prompt, state, draft ? &mtp : nullptr, hidden.data())
               : 0;
+  // The decoder runs at least the last prompt token: its logits start the
+  // output.
+  if (prefilled < 0 || prefilled > n - 1) {
+    throw std::logic_error("generate: prompt prefill ran " +
+                           std::to_string(prefilled) + " of " +
+                           std::to_string(n) + " tokens");
+  }
   for (int p = prefilled; p < n; p += 2) {
     const int count = std::min(2, n - p);
     logits = model.Step(&prompt[p], count, state);
