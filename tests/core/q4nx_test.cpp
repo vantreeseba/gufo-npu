@@ -199,6 +199,31 @@ int CheckPackRows() {
     return Fail("PackRows: fused rows differ from packing each alone");
   }
   std::puts("ok: PackRows stacks segments");
+
+  // SwiGLU order: packed tile t = gate rows 16t.. then up rows 16t...
+  const auto order = q4nx::SwiGluOrder(64);
+  if (order.size() != 128 || order[0] != 0 || order[15] != 15 ||
+      order[16] != 64 || order[31] != 79 || order[32] != 16 ||
+      order[48] != 80) {
+    return Fail("SwiGluOrder");
+  }
+  const auto ordered = q4nx::PackRows(
+      {{GgmlType::kQ4_K, a.data(), 40}, {GgmlType::kBF16, b_bytes, 24}}, kDim,
+      [] {
+        std::vector<std::size_t> o(64);
+        for (std::size_t i = 0; i < 64; ++i) {
+          o[i] = 63 - i;
+        }
+        return o;
+      }());
+  const auto uo = q4nx::Unpack(ordered);
+  for (std::size_t i = 0; i < 64; ++i) {
+    if (!std::equal(uo.begin() + i * kDim, uo.begin() + (i + 1) * kDim,
+                    uf.begin() + (63 - i) * kDim)) {
+      return Fail("PackRows: order not applied");
+    }
+  }
+  std::puts("ok: PackRows row order and SwiGluOrder");
   return 0;
 }
 

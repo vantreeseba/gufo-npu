@@ -12,13 +12,14 @@
 #include <vector>
 
 #include "core/gguf.hpp"
+#include "models/qwen35/decoder.hpp"
+#include "models/qwen35/npu_decoder.hpp"
 #include "models/qwen35/q4nx_projections.hpp"
-#include "models/qwen35/reference.hpp"
 
-// Qwen3.5-2B with its matrix products on the NPU, teacher-forced on the
-// oracle prompts. The NPU run must match the same q4nx weights run on the
-// CPU (kernel error only); agreement with HF and with the GGUF reference is
-// reported (it includes requantization).
+// Qwen3.5-2B decoded on the NPU (NpuDecoder: chained GEMVs with norms,
+// residuals and SwiGLU on the device), teacher-forced on the oracle prompts,
+// against the CPU decoder over the same q4nx weights (kernel error only).
+// Agreement with HF is reported (it includes requantization).
 //   GUFO_NPU_QWEN35_2B_Q4_GGUF  UD-Q4_K_XL GGUF of Qwen3.5-2B
 //   GUFO_NPU_QWEN35_2B_ORACLE   oracle output directory
 // Exits 77 (skip) when either is unset or there is no NPU.
@@ -55,39 +56,8 @@ std::vector<float> ReadFloats(const fs::path& path) {
   return out;
 }
 
-double RelativeL2(const std::vector<float>& a, const std::vector<float>& b) {
-  double diff = 0;
-  double norm = 0;
-  for (std::size_t i = 0; i < a.size(); ++i) {
-    const double d = static_cast<double>(a[i]) - b[i];
-    diff += d * d;
-    norm += static_cast<double>(b[i]) * b[i];
-  }
-  return std::sqrt(diff / std::max(norm, 1e-30));
-}
-
-std::size_t Matches(const std::vector<float>& a, const std::vector<float>& b,
-                    std::size_t vocab) {
-  const std::size_t n = a.size() / vocab;
-  std::size_t same = 0;
-  for (std::size_t t = 0; t < n; ++t) {
-    const auto* pa = &a[t * vocab];
-    const auto* pb = &b[t * vocab];
-    same += (std::max_element(pa, pa + vocab) - pa) ==
-            (std::max_element(pb, pb + vocab) - pb);
-  }
-  return same;
-}
-
-double Agreement(const std::vector<float>& a, const std::vector<float>& b,
-                 std::size_t vocab) {
-  return static_cast<double>(Matches(a, b, vocab)) /
-         static_cast<double>(a.size() / vocab);
-}
-
-double SecondsSince(std::chrono::steady_clock::time_point start) {
-  return std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
-      .count();
+std::size_t Argmax(const float* x, std::size_t n) {
+  return static_cast<std::size_t>(std::max_element(x, x + n) - x);
 }
 
 }  // namespace
@@ -110,16 +80,15 @@ int main(int argc, char** argv) {
     return 77;
   }
   const auto file = gufo_npu::gguf::File::Open(model);
-  const qwen35::Reference reference(*file);
-  const auto vocab = static_cast<std::size_t>(reference.config().vocab);
-
-  auto start = std::chrono::steady_clock::now();
-  const qwen35::Q4nxProjections npu(
-      *file, qwen35::Q4nxProjections::Backend::kNpu, argv[1]);
-  const qwen35::Q4nxProjections cpu(*file,
-                                    qwen35::Q4nxProjections::Backend::kCpu);
-  std::printf("packed and uploaded q4nx weights in %.1f s\n",
-              SecondsSince(start));
+  const auto start = std::chrono::steady_clock::now();
+  qwen35::NpuDecoder npu(*file, argv[1]);
+  std::printf(
+      "packed and uploaded the NPU decoder in %.1f s\n",
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+          .count());
+  const qwen35::Q4nxProjections projections(*file);
+  qwen35::Decoder cpu(*file, projections);
+  const auto vocab = static_cast<std::size_t>(npu.config().vocab);
 
   int failures = 0;
   std::size_t matched = 0;
@@ -133,29 +102,34 @@ int main(int argc, char** argv) {
                    name);
       return 1;
     }
-    auto run = [&](const qwen35::Projections* p) {
-      auto state = reference.NewState();
-      return reference.Forward(ids, state, true, false, p).logits;
-    };
-    start = std::chrono::steady_clock::now();
-    const auto on_npu = run(&npu);
-    const double npu_seconds = SecondsSince(start);
-    const auto on_cpu = run(&cpu);
-    const auto gguf = run(nullptr);
-
-    const double agree = Agreement(on_npu, on_cpu, vocab);
-    matched += Matches(on_npu, on_cpu, vocab);
+    auto npu_state = npu.NewState();
+    auto cpu_state = cpu.NewState();
+    double diff = 0;
+    double norm = 0;
+    std::size_t same = 0;
+    std::size_t same_hf = 0;
+    for (std::size_t t = 0; t < ids.size(); ++t) {
+      const auto& a = npu.Step(ids[t], npu_state);
+      const auto& b = cpu.Step(ids[t], cpu_state);
+      for (std::size_t i = 0; i < vocab; ++i) {
+        const double e = static_cast<double>(a[i]) - b[i];
+        diff += e * e;
+        norm += static_cast<double>(b[i]) * b[i];
+      }
+      const std::size_t top = Argmax(a.data(), vocab);
+      same += top == Argmax(b.data(), vocab);
+      same_hf += top == Argmax(&hf[t * vocab], vocab);
+    }
+    const double err = std::sqrt(diff / norm);
+    matched += same;
     positions += ids.size();
-    const double err = RelativeL2(on_npu, on_cpu);
     const bool ok = err < kMaxLogitError;
     failures += ok ? 0 : 1;
     std::printf(
-        "%s %s: %zu tokens (%.1f s on NPU); vs q4nx on CPU: argmax %.1f%%, "
-        "logits rel err %.2e | argmax vs HF: NPU %.1f%%, q4nx CPU %.1f%%, "
-        "GGUF CPU %.1f%%\n",
-        ok ? "ok  " : "FAIL", name, ids.size(), npu_seconds, 100 * agree, err,
-        100 * Agreement(on_npu, hf, vocab), 100 * Agreement(on_cpu, hf, vocab),
-        100 * Agreement(gguf, hf, vocab));
+        "%s %s: %zu tokens; vs q4nx on CPU: argmax %zu/%zu, logits rel err "
+        "%.2e | NPU argmax vs HF: %zu/%zu\n",
+        ok ? "ok  " : "FAIL", name, ids.size(), same, ids.size(), err, same_hf,
+        ids.size());
   }
   const double total = static_cast<double>(matched) / positions;
   const bool agree_ok = total >= kMinArgmaxAgreement;

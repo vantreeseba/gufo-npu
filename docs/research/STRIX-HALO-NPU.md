@@ -23,6 +23,38 @@ HTTP range requests). "Inferred" marks conclusions not read directly.
   Strix Halo despite half the DRAM bandwidth, so the limit is NPU-side.
 - Our own copy test reaches ~80 GB/s read + write combined
   (`docs/models/qwen3.6-35b-a3b/BENCHMARKS.md`).
+- Measured (2026-10-27, `docs/models/qwen3.5-2b/BENCHMARKS.md`): reads alone
+  stop at ~56 GB/s. They scale ~14 GB/s per column to 4 columns, then
+  flatten; a second shim channel per column changes nothing. A 16 MiB buffer
+  (fits the 32 MB Infinity Cache/MALL) reads no faster than 256 MiB.
+- The MALL is filled only by GPU requests (Chips and Cheese,
+  https://chipsandcheese.com/p/evaluating-the-infinity-cache-in and
+  https://chipsandcheese.com/p/strix-halos-memory-subsystem-tackling); no XRT
+  BO flag routes NPU traffic through it. A GPU-warmed buffer read by the NPU
+  is untested, but the ceiling looks like the NPU's port into the fabric,
+  which cache hits would not widen.
+- Shim BD knobs in mlir-aie v1.4.4: `burst_length` (npu2: 64/128/256/512 B;
+  0 = largest, the default) and `axcache` (default 2, "upsizing in the
+  NoC"). Neither is expected to move the read ceiling; AxCACHE is untested.
+- DMA zero-compression exists on core and memtile DMAs, not the shim, and
+  4-bit weights have few zero bytes: no use for weights.
+
+## On-chip memory
+
+- Core tiles: 64 KB data memory in 8 banks (allocator models 4); a core can
+  also address its west, north and south neighbours (256 KB reach), not
+  memtiles. An ObjectFifo between adjacent cores is shared memory, no DMA.
+- Memtiles: 512 KB each, 16 banks; their DMAs reach the east and west
+  neighbours' memory and locks.
+- Within one loaded design, runtime sequences only rewrite BDs, RTPs and
+  addresses; core and memtile memory should persist across calls of the same
+  hardware context (not documented; needs a canary test across runs and with
+  a second context active). Reloading a design (`load_pdi`) costs milliseconds
+  (4.9 ms measured in arXiv 2512.13282) and resets tiles.
+- Each core column's 4 cores use all 4 southbound stream channels between
+  the core rows and the memtile for their outputs; an extra core-to-shim
+  stream does not route (we send the GEMV's residual down the existing
+  output streams instead).
 
 ## Clocks and power
 

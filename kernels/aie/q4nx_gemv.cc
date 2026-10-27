@@ -2,14 +2,18 @@
 //
 // Each core owns Q4NX_M_TILE out-features per round and streams their q4nx
 // blocks (Q4NX_M_TILE x Q4NX_K_TILE) past the token. The token buffer holds
-// GEMV_MAX_DIM values; the number of k blocks in use arrives at run time, so
-// one core program serves every shape.
+// GEMV_MAX_DIM fp32 values; the number of k blocks in use and the input and
+// output stages arrive at run time, so one core program serves every call:
+//   input:  plain (x in fp32), or resnorm: rms_norm(H + D) * w, with H + D
+//           also written out as the next residual by one column's cores.
+//   output: store (fp32), or swiglu: silu(gate) * up from paired rows.
 //
 // The block layout is IRON's q4nx.h. The accumulation is adapted from its
 // q4nx_accumulate, keeping more precision: each block's dot product and each
 // per-32 token sum are carried as two bf16 halves (hi + lo) instead of one,
 // and the output stays fp32. Geometry arrives as -D flags.
 #include "aie_kernels/aie_kernel_utils.h"
+#include "aie_kernels/common/exp2_poly.h"
 #include "aie_kernels/common/zero.h"
 #include "aie_kernels/flm_gemma4/q4nx.h"
 #include "aie_kernels/flm_gemma4/utils.h"
@@ -18,7 +22,7 @@
 #include <stdint.h>
 
 #if !defined(Q4NX_M_TILE) || !defined(Q4NX_K_TILE) || !defined(Q4NX_GROUP) || \
-    !defined(GEMV_MAX_DIM)
+    !defined(GEMV_MAX_DIM) || !defined(GEMV_RMS_EPS) || !defined(GEMV_HIDDEN)
 #error "q4nx_gemv.cc needs its geometry -D defined"
 #endif
 
@@ -97,23 +101,98 @@ void accumulate(const q4nx_block<M, N> *A, const bf16 *B, float *c,
   }
 }
 
-}  // namespace
+// Input stage modes (RTP word 2).
+constexpr int PROLOGUE_PLAIN = 0;    // x: fp32
+constexpr int PROLOGUE_RESNORM = 1;  // [H fp32 | D fp32 | w bf16]: rms(H + D) w
+// Output stage modes (RTP word 3).
+constexpr int EPILOGUE_STORE = 0;   // y: M_TILE fp32
+constexpr int EPILOGUE_SWIGLU = 1;  // y[m] = silu(acc[m]) acc[m + 16], m < 16
 
-extern "C" {
+constexpr float RMS_EPS = GEMV_RMS_EPS;
+constexpr int HIDDEN = GEMV_HIDDEN;
+static_assert(HIDDEN % (4 * M_TILE) == 0, "four cores hand out the residual");
 
-// Once per token: the per-32 sums of the first k_blocks * K_TILE values of x,
-// which fold every block's minima into one MAC, as hi and lo bf16 halves
-// (sums[0 : MAX_DIM / 32] and sums[MAX_DIM / 32 : MAX_DIM / 16]).
-//
-// Also selects round-to-nearest-even for every float-to-bf16 narrowing that
-// follows. A core powers up in floor mode, which truncates each block's dot
-// products and biases the sum over the k blocks (about 1% relative error at
-// dim 2048); the mode is core-global and sticky.
-void gemv_prep(bfloat16 *x, bfloat16 *sums, int k_blocks) {
-  event0();
-  aie::set_rounding(aie::rounding_mode::conv_even);
+// sigmoid(g) in fp32: 1 / (1 + 2^(-g log2 e)), with MLIR-AIE's exp2
+// polynomial and three Newton steps for the reciprocal. (The vtanh
+// instruction passes |x| <= 0.5 through unchanged, ~1% error on SwiGLU.)
+aie::vector<float, 16> sigmoid(aie::vector<float, 16> g) {
+  aie::vector<float, 16> x =
+      aie::mul(g, -1.4426950409f).template to_vector<float>();
+  x = aie::max(aie::min(x, 80.0f), -80.0f);
+  aie::vector<int32_t, 16> k;
+  const aie::vector<float, 16> p = exp2_poly<16>(x, k);
+  // 2^k as a float: (k + 127) in the exponent field.
+  const aie::vector<float, 16> scale =
+      aie::upshift(aie::add(k, 127), 23).template cast_to<float>();
+  const aie::vector<float, 16> d =
+      aie::add(aie::mul(p, scale).template to_vector<float>(), 1.0f);
+  // 1 / d from the bit-trick estimate.
+  aie::vector<float, 16> rcp =
+      aie::sub(aie::broadcast<int32_t, 16>(0x7EF311C7),
+               d.template cast_to<int32_t>())
+          .template cast_to<float>();
+  for (int it = 0; it < 3; it++) {
+    const aie::vector<float, 16> dr = aie::mul(d, rcp).template to_vector<float>();
+    rcp = aie::mul(rcp, aie::sub(aie::broadcast<float, 16>(2.0f), dr))
+              .template to_vector<float>();
+  }
+  return rcp;
+}
+
+// The fp32 values at `in` to bf16 at `out`, which may be the same buffer:
+// each 16-value chunk is read before its half-size write lands.
+void to_bf16(bfloat16 *out, const float *in, int n) {
+  for (int i = 0; i < n; i += 16) {
+    aie::accum<accfloat, 16> acc;
+    acc.from_vector(aie::load_v<16>(in + i));
+    aie::store_v(out + i, acc.template to_vector<bfloat16>());
+  }
+}
+
+// x = rms(h) * w as bf16 over the start of h's buffer (h is fp32).
+void norm(float *h, const bfloat16 *w, int n) {
+  aie::accum<accfloat, 16> squares = aie::zeros<accfloat, 16>();
+  for (int i = 0; i < n; i += 16) {
+    squares = aie::mac_square(squares, aie::load_v<16>(h + i));
+  }
+  const float mean =
+      aie::reduce_add(squares.template to_vector<float>()) / (float)n;
+  // 1/sqrt in float: AIE2P has no scalar sqrt, so Newton from the bit trick,
+  // three steps (to fp32 precision).
+  const float s = mean + RMS_EPS;
+  float r = __builtin_bit_cast(
+      float, 0x5f3759df - (__builtin_bit_cast(uint32_t, s) >> 1));
+  for (int it = 0; it < 3; it++) {
+    r = r * (1.5f - 0.5f * s * r * r);
+  }
+  bfloat16 *x = (bfloat16 *)h;
+  for (int i = 0; i < n; i += 16) {
+    aie::vector<float, 16> v = aie::load_v<16>(h + i);
+    aie::accum<accfloat, 16> wv;
+    wv.from_vector(aie::load_v<16>(w + i));
+    aie::vector<float, 16> scaled =
+        aie::mul(aie::mul(v, r).template to_vector<float>(),
+                 wv.template to_vector<float>())
+            .template to_vector<float>();
+    aie::accum<accfloat, 16> out;
+    out.from_vector(scaled);
+    aie::store_v(x + i, out.template to_vector<bfloat16>());
+  }
+}
+
+// The rest of the input stage, then the per-32 sums of x (hi and lo bf16
+// halves at sums[0 : MAX_DIM / 32] and sums[MAX_DIM / 32 :]) that fold every
+// block's minima into one MAC. x ends as bf16 at the start of `raw`.
+void prep(float *raw, bfloat16 *sums, int k_blocks, int prologue) {
+  const int n = k_blocks * K_TILE;
+  bfloat16 *x = (bfloat16 *)raw;
+  if (prologue == PROLOGUE_RESNORM) {
+    norm(raw, (const bfloat16 *)(raw + 2 * n), n);
+  } else {
+    to_bf16(x, raw, n);
+  }
   bfloat16 *lo = sums + MAX_DIM / 32;
-  for (int g = 0; g < k_blocks * (K_TILE / 32); g++) {
+  for (int g = 0; g < n / 32; g++) {
     const float sum = aie::reduce_add(
         aie::accum<accfloat, 32>(aie::load_v<32>(x + 32 * g))
             .template to_vector<float>());
@@ -121,6 +200,45 @@ void gemv_prep(bfloat16 *x, bfloat16 *sums, int k_blocks) {
     sums[g] = hi;
     lo[g] = (bfloat16)(sum - (float)hi);
   }
+}
+
+}  // namespace
+
+extern "C" {
+
+// Once per token, first: with PROLOGUE_RESNORM, h = H + D in place over H.
+// Also selects round-to-nearest-even for every float-to-bf16 narrowing that
+// follows: a core powers up in floor mode, which truncates each block's dot
+// products and biases the sum over the k blocks (about 1% relative error at
+// dim 2048); the mode is core-global and sticky.
+void gemv_residual(float *raw, int k_blocks, int prologue) {
+  event0();
+  aie::set_rounding(aie::rounding_mode::conv_even);
+  if (prologue == PROLOGUE_RESNORM) {
+    const int n = k_blocks * K_TILE;
+    for (int i = 0; i < n; i += 16) {
+      aie::accum<accfloat, 16> acc;
+      acc.from_vector(aie::load_v<16>(raw + i));
+      acc = aie::add(acc, aie::load_v<16>(raw + n + i));
+      aie::store_v(raw + i, acc.template to_vector<float>());
+    }
+  }
+  event1();
+}
+
+// On the residual column, between gemv_residual and gemv_prep: M_TILE values
+// of h, piece `piece` of this core's quarter (`row` of 4).
+void gemv_residual_out(float *y, const float *raw, int row, int piece) {
+  event0();
+  copy_vectorized<float, M_TILE>(
+      y, raw + (row * (HIDDEN / 4) + piece * M_TILE));
+  event1();
+}
+
+// Once per token, after gemv_residual: the rest of the input stage.
+void gemv_prep(float *raw, bfloat16 *sums, int k_blocks, int prologue) {
+  event0();
+  prep(raw, sums, k_blocks, prologue);
   event1();
 }
 
@@ -140,10 +258,24 @@ void gemv_block(const q4nx_block_t *w, const bfloat16 *x, float *y_acc,
   event1();
 }
 
-// After each round's k loop: the fp32 sums go out unrounded.
-void gemv_store(float *y, const float *y_acc) {
+// After each round's k loop. EPILOGUE_STORE writes the fp32 sums; with
+// EPILOGUE_SWIGLU the core's rows are 16 gate rows then their 16 up rows,
+// and it writes silu(gate) * up to the first 16 values (the rest are zero).
+void gemv_store(float *y, const float *y_acc, int epilogue) {
   event0();
-  copy_vectorized<float, M_TILE>(y, y_acc);
+  if (epilogue == EPILOGUE_SWIGLU) {
+    static_assert(M_TILE == 32, "SwiGLU pairs 16 gate rows with 16 up rows");
+    aie::vector<float, 16> g = aie::load_v<16>(y_acc);
+    aie::vector<float, 16> u = aie::load_v<16>(y_acc + 16);
+    const aie::vector<float, 16> sig = sigmoid(g);
+    aie::vector<float, 16> out =
+        aie::mul(aie::mul(g, sig).template to_vector<float>(), u)
+            .template to_vector<float>();
+    aie::store_v(y, out);
+    aie::store_v(y + 16, aie::zeros<float, 16>());
+  } else {
+    copy_vectorized<float, M_TILE>(y, y_acc);
+  }
   event1();
 }
 }

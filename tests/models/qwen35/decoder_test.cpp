@@ -54,8 +54,7 @@ int main() {
     return 77;
   }
   const auto file = gufo_npu::gguf::File::Open(model);
-  const qwen35::Q4nxProjections projections(
-      *file, qwen35::Q4nxProjections::Backend::kCpu);
+  const qwen35::Q4nxProjections projections(*file);
   const qwen35::Reference reference(*file);
   qwen35::Decoder decoder(*file, projections);
   const auto vocab = static_cast<std::size_t>(decoder.config().vocab);

@@ -1,25 +1,16 @@
 #include "models/qwen35/q4nx_projections.hpp"
 
-#include <chrono>
-#include <stdexcept>
 #include <string>
 
 #include "core/quant.hpp"
-#include "npu/gemv.hpp"
 
 namespace gufo_npu::qwen35 {
 
-struct Q4nxProjections::Gemv {
-  q4nx::Matrix packed;  // emptied after an NPU upload
-  std::unique_ptr<npu::Q4nxGemv> npu;
-  std::size_t rows = 0;
-};
-
 struct Q4nxProjections::Layer {
-  Gemv in;  // qkv + z, or q + k + v
-  Gemv out;
-  Gemv ffn_in;
-  Gemv down;
+  q4nx::Matrix in;  // qkv + z, or q + k + v
+  q4nx::Matrix out;
+  q4nx::Matrix ffn_in;
+  q4nx::Matrix down;
   std::vector<float> alpha;  // [value heads][hidden]
   std::vector<float> beta;
 };
@@ -38,22 +29,8 @@ q4nx::Segment SegmentOf(const gguf::TensorInfo& t) {
 
 }  // namespace
 
-Q4nxProjections::Q4nxProjections(const gguf::File& file, Backend backend,
-                                 const std::filesystem::path& kernel_dir)
-    : config_(ReadConfig(file)), backend_(backend) {
-  if (backend_ == Backend::kNpu) {
-    runtime_ = std::make_unique<npu::GemvRuntime>(kernel_dir);
-  }
-  auto make = [&](std::vector<q4nx::Segment> segments, std::size_t dim) {
-    Gemv g;
-    g.packed = q4nx::PackRows(segments, dim);
-    g.rows = g.packed.rows;
-    if (backend_ == Backend::kNpu) {
-      g.npu = std::make_unique<npu::Q4nxGemv>(*runtime_, g.packed);
-      g.packed = {};
-    }
-    return g;
-  };
+Q4nxProjections::Q4nxProjections(const gguf::File& file)
+    : config_(ReadConfig(file)) {
   const Config& c = config_;
   const auto hidden = static_cast<std::size_t>(c.hidden);
   for (int il = 0; il < c.layers; ++il) {
@@ -63,46 +40,34 @@ Q4nxProjections::Q4nxProjections(const gguf::File& file, Backend backend,
     };
     auto layer = std::make_unique<Layer>();
     if (c.IsFullAttention(il)) {
-      layer->in =
-          make({SegmentOf(t("attn_q.weight")), SegmentOf(t("attn_k.weight")),
-                SegmentOf(t("attn_v.weight"))},
-               hidden);
+      layer->in = q4nx::PackRows(
+          {SegmentOf(t("attn_q.weight")), SegmentOf(t("attn_k.weight")),
+           SegmentOf(t("attn_v.weight"))},
+          hidden);
       const auto& o = t("attn_output.weight");
-      layer->out = make({SegmentOf(o)}, o.RowElements());
+      layer->out = q4nx::Pack(o.type, o.data, o.Rows(), o.RowElements());
     } else {
-      layer->in = make(
+      layer->in = q4nx::PackRows(
           {SegmentOf(t("attn_qkv.weight")), SegmentOf(t("attn_gate.weight"))},
           hidden);
       layer->alpha = ToFloats(t("ssm_alpha.weight"));
       layer->beta = ToFloats(t("ssm_beta.weight"));
       const auto& o = t("ssm_out.weight");
-      layer->out = make({SegmentOf(o)}, o.RowElements());
+      layer->out = q4nx::Pack(o.type, o.data, o.Rows(), o.RowElements());
     }
-    layer->ffn_in =
-        make({SegmentOf(t("ffn_gate.weight")), SegmentOf(t("ffn_up.weight"))},
-             hidden);
-    layer->down = make({SegmentOf(t("ffn_down.weight"))},
-                       static_cast<std::size_t>(c.ffn));
+    layer->ffn_in = q4nx::PackRows(
+        {SegmentOf(t("ffn_gate.weight")), SegmentOf(t("ffn_up.weight"))},
+        hidden);
+    const auto& down = t("ffn_down.weight");
+    layer->down =
+        q4nx::Pack(down.type, down.data, down.Rows(), down.RowElements());
     layers_.push_back(std::move(layer));
   }
-  lm_head_ = std::make_unique<Gemv>(
-      make({SegmentOf(file.Tensor("token_embd.weight"))}, hidden));
+  const auto& embed = file.Tensor("token_embd.weight");
+  lm_head_ = q4nx::Pack(embed.type, embed.data, embed.Rows(), hidden);
 }
 
 Q4nxProjections::~Q4nxProjections() = default;
-
-void Q4nxProjections::Run(Gemv& gemv, const float* x, float* y) const {
-  const auto start = std::chrono::steady_clock::now();
-  if (gemv.npu) {
-    gemv.npu->Run(x, y);
-  } else {
-    q4nx::Gemv(gemv.packed, x, y);
-  }
-  gemv_seconds_ +=
-      std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
-          .count();
-  ++gemv_calls_;
-}
 
 void Q4nxProjections::Apply(Stage stage, int layer, const float* x, int tokens,
                             float* y) const {
@@ -112,13 +77,13 @@ void Q4nxProjections::Apply(Stage stage, int layer, const float* x, int tokens,
     const float* xt = x + static_cast<std::size_t>(t) * in;
     float* yt = y + static_cast<std::size_t>(t) * out;
     if (stage == Stage::kLmHead) {
-      Run(*lm_head_, xt, yt);
+      q4nx::Gemv(lm_head_, xt, yt);
       continue;
     }
-    Layer& l = *layers_[static_cast<std::size_t>(layer)];
+    const Layer& l = *layers_[static_cast<std::size_t>(layer)];
     switch (stage) {
       case Stage::kLinearIn: {
-        Run(l.in, xt, yt);
+        q4nx::Gemv(l.in, xt, yt);
         // alpha and beta: 16 F32 rows each, after qkv and z.
         const std::size_t heads =
             static_cast<std::size_t>(config_.linear_value_heads);
@@ -135,16 +100,16 @@ void Q4nxProjections::Apply(Stage stage, int layer, const float* x, int tokens,
         break;
       }
       case Stage::kAttentionIn:
-        Run(l.in, xt, yt);
+        q4nx::Gemv(l.in, xt, yt);
         break;
       case Stage::kMixerOut:
-        Run(l.out, xt, yt);
+        q4nx::Gemv(l.out, xt, yt);
         break;
       case Stage::kFfnIn:
-        Run(l.ffn_in, xt, yt);
+        q4nx::Gemv(l.ffn_in, xt, yt);
         break;
       case Stage::kFfnDown:
-        Run(l.down, xt, yt);
+        q4nx::Gemv(l.down, xt, yt);
         break;
       case Stage::kLmHead:
         break;

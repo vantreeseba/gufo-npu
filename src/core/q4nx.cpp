@@ -149,7 +149,8 @@ std::size_t PaddedRows(std::size_t rows) {
   return (rows + kOutPerRound - 1) / kOutPerRound * kOutPerRound;
 }
 
-Matrix PackRows(const std::vector<Segment>& segments, std::size_t dim) {
+Matrix PackRows(const std::vector<Segment>& segments, std::size_t dim,
+                const std::vector<std::size_t>& order) {
   std::size_t rows = 0;
   bool exact = true;
   for (const auto& seg : segments) {
@@ -165,7 +166,11 @@ Matrix PackRows(const std::vector<Segment>& segments, std::size_t dim) {
     starts.push_back(start);
     start += seg.rows;
   }
-  PackTiles(out, [&](std::size_t r, float* row) -> const std::uint8_t* {
+  if (!order.empty() && order.size() != rows) {
+    throw std::invalid_argument("q4nx: row order does not cover every row");
+  }
+  PackTiles(out, [&](std::size_t packed, float* row) -> const std::uint8_t* {
+    const std::size_t r = order.empty() ? packed : order[packed];
     const auto it = std::upper_bound(starts.begin(), starts.end(), r) - 1;
     const auto& seg = segments[static_cast<std::size_t>(it - starts.begin())];
     const std::uint8_t* src =
@@ -177,6 +182,20 @@ Matrix PackRows(const std::vector<Segment>& segments, std::size_t dim) {
     return nullptr;
   });
   return out;
+}
+
+std::vector<std::size_t> SwiGluOrder(std::size_t ffn) {
+  constexpr std::size_t kHalf = kMTile / 2;
+  if (ffn % kHalf != 0) {
+    throw std::invalid_argument("q4nx: SwiGLU width must be a multiple of 16");
+  }
+  std::vector<std::size_t> order(2 * ffn);
+  for (std::size_t n = 0; n < order.size(); ++n) {
+    const std::size_t tile = n / kMTile;
+    const std::size_t m = n % kMTile;
+    order[n] = (m < kHalf ? 0 : ffn) + tile * kHalf + m % kHalf;
+  }
+  return order;
 }
 
 Matrix Pack(gguf::GgmlType type, const std::uint8_t* data, std::size_t rows,

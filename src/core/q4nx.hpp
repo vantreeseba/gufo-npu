@@ -53,7 +53,15 @@ struct Segment {
 // Stacks several weights with the same `dim` into one matrix, rows in order,
 // so projections that share an input run as one GEMV. Exact when every
 // segment is Q4_K.
-Matrix PackRows(const std::vector<Segment>& segments, std::size_t dim);
+// `order`, when given, picks the stacked row for each packed row.
+Matrix PackRows(const std::vector<Segment>& segments, std::size_t dim,
+                const std::vector<std::size_t>& order = {});
+
+// The packed-row order for a [gate (ffn rows) | up (ffn rows)] stack that the
+// GEMV's SwiGLU output stage expects: each kMTile tile holds 16 gate rows,
+// then the same 16 up rows. The output's first 16 of every 32 values are
+// then silu(gate) * up in gate-row order.
+std::vector<std::size_t> SwiGluOrder(std::size_t ffn);
 // Requantizes fp32 weights (row-major `rows` x `dim`).
 Matrix PackFloat(const float* weights, std::size_t rows, std::size_t dim);
 

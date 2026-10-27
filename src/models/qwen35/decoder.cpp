@@ -18,7 +18,7 @@ std::vector<float> ToFloats(const gguf::TensorInfo& t) {
 }
 
 // out = RMS(x) * w over n values (out may alias x). The GGUF norm weights
-// already hold Qwen's +1.
+// already hold Qwen's +1 (except ssm_norm, which has none to add).
 void RmsNorm(const float* x, const float* w, int n, float eps, float* out) {
   float sum = 0;
   for (int i = 0; i < n; ++i) {
@@ -40,12 +40,17 @@ float Softplus(float x) {
   return x > 20.0f ? x : std::log1p(std::exp(x));
 }
 
+void CheckDense(const Config& c) {
+  if (c.experts != 0 || !c.tied_embeddings) {
+    throw std::runtime_error(
+        "qwen35 decoder: dense, tied-embedding models only");
+  }
+}
+
 }  // namespace
 
-struct Decoder::Weights {
+struct Mixer::Weights {
   struct Layer {
-    std::vector<float> attn_norm;
-    std::vector<float> post_attention_norm;
     std::vector<float> conv;  // [channels][kernel]
     std::vector<float> ssm_a;
     std::vector<float> dt_bias;
@@ -53,46 +58,28 @@ struct Decoder::Weights {
     std::vector<float> q_norm;
     std::vector<float> k_norm;
   };
-  const gguf::TensorInfo* embed = nullptr;
-  std::vector<float> output_norm;
   std::vector<Layer> layers;
   std::vector<float> rope_inv_freq;
 };
 
-struct Decoder::Scratch {
-  std::vector<float> h;       // residual stream
-  std::vector<float> normed;  // hidden
-  std::vector<float> in;      // a stage's fused output
-  std::vector<float> mixed;   // mixer input (DeltaNet y or attention ctx)
-  std::vector<float> out;     // hidden-sized projection output
-  std::vector<float> ffn;     // gate | up
-  std::vector<float> act;     // silu(gate) * up
+struct Mixer::Scratch {
   std::vector<float> u;       // conv output
   std::vector<float> query;   // one RoPE'd query head
   std::vector<float> scores;  // attention weights
   std::vector<float> delta;   // DeltaNet rank-1 update
-  std::vector<float> logits;
 };
 
-Decoder::Decoder(const gguf::File& file, const Projections& projections)
+Mixer::Mixer(const gguf::File& file)
     : config_(ReadConfig(file)),
-      projections_(projections),
       weights_(std::make_unique<Weights>()),
       scratch_(std::make_unique<Scratch>()) {
   const Config& c = config_;
-  if (c.experts != 0 || !c.tied_embeddings) {
-    throw std::runtime_error(
-        "qwen35 decoder: dense, tied-embedding models only");
-  }
+  CheckDense(c);
   auto& w = *weights_;
-  w.embed = &file.Tensor("token_embd.weight");
-  w.output_norm = ToFloats(file.Tensor("output_norm.weight"));
   for (int il = 0; il < c.layers; ++il) {
     const std::string p = "blk." + std::to_string(il) + ".";
     auto t = [&](const char* name) { return ToFloats(file.Tensor(p + name)); };
     Weights::Layer layer;
-    layer.attn_norm = t("attn_norm.weight");
-    layer.post_attention_norm = t("post_attention_norm.weight");
     if (c.IsFullAttention(il)) {
       layer.q_norm = t("attn_q_norm.weight");
       layer.k_norm = t("attn_k_norm.weight");
@@ -110,27 +97,17 @@ Decoder::Decoder(const gguf::File& file, const Projections& projections)
         1.0 / std::pow(static_cast<double>(c.rope_theta),
                        2.0 * i / static_cast<double>(c.rope_dim)));
   }
-
   auto& s = *scratch_;
-  s.h.resize(c.hidden);
-  s.normed.resize(c.hidden);
-  s.in.resize(std::max(StageOutputs(c, Stage::kLinearIn, 0),
-                       StageOutputs(c, Stage::kAttentionIn, 3)));
-  s.mixed.resize(std::max(c.LinearValueDim(), c.heads * c.head_dim));
-  s.out.resize(c.hidden);
-  s.ffn.resize(2 * static_cast<std::size_t>(c.ffn));
-  s.act.resize(c.ffn);
   s.u.resize(c.ConvChannels());
   s.query.resize(c.head_dim);
   s.delta.resize(c.linear_head_dim);
-  s.logits.resize(c.vocab);
 }
 
-Decoder::~Decoder() = default;
+Mixer::~Mixer() = default;
 
-Decoder::State Decoder::NewState() const {
+DecodeState Mixer::NewState() const {
   const Config& c = config_;
-  State state;
+  DecodeState state;
   state.layers.resize(c.layers);
   for (int il = 0; il < c.layers; ++il) {
     if (!c.IsFullAttention(il)) {
@@ -145,7 +122,7 @@ Decoder::State Decoder::NewState() const {
   return state;
 }
 
-void Decoder::LinearLayer(int il, State::Layer& st) {
+void Mixer::Linear(int il, const float* in, DecodeState::Layer& st, float* y) {
   const Config& c = config_;
   const auto& lw = weights_->layers[il];
   auto& s = *scratch_;
@@ -156,9 +133,7 @@ void Decoder::LinearLayer(int il, State::Layer& st) {
   const int value_dim = c.LinearValueDim();
   const int channels = c.ConvChannels();
   const int window = c.conv_kernel - 1;
-
-  projections_.Apply(Stage::kLinearIn, il, s.normed.data(), 1, s.in.data());
-  const float* x = s.in.data();
+  const float* x = in;
   const float* z = x + channels;
   const float* alpha = z + value_dim;
   const float* beta = alpha + hv;
@@ -196,7 +171,6 @@ void Decoder::LinearLayer(int il, State::Layer& st) {
     }
   }
 
-  float* y = s.mixed.data();
   float* delta = s.delta.data();
   for (int head = 0; head < hv; ++head) {
     const int kh = head % hk;  // GGUF order: value heads tile key heads
@@ -240,10 +214,10 @@ void Decoder::LinearLayer(int il, State::Layer& st) {
       yh[j] *= Silu(zh[j]);
     }
   }
-  projections_.Apply(Stage::kMixerOut, il, y, 1, s.out.data());
 }
 
-void Decoder::AttentionLayer(int il, int position, State::Layer& st) {
+void Mixer::Attention(int il, float* in, int position, DecodeState::Layer& st,
+                      float* ctx) {
   const Config& c = config_;
   const auto& lw = weights_->layers[il];
   auto& s = *scratch_;
@@ -251,9 +225,7 @@ void Decoder::AttentionLayer(int il, int position, State::Layer& st) {
   const int kv = c.kv_heads * hd;
   const int group = c.heads / c.kv_heads;
   const int half = c.rope_dim / 2;
-
-  projections_.Apply(Stage::kAttentionIn, il, s.normed.data(), 1, s.in.data());
-  float* qg = s.in.data();
+  float* qg = in;
   float* k = qg + 2 * c.heads * hd;
   const float* v = k + kv;
 
@@ -280,7 +252,6 @@ void Decoder::AttentionLayer(int il, int position, State::Layer& st) {
   const int length = position + 1;
   s.scores.resize(length);
   const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
-  float* ctx = s.mixed.data();
   for (int qh = 0; qh < c.heads; ++qh) {
     const float* raw = qg + static_cast<std::size_t>(qh) * 2 * hd;
     RmsNorm(raw, lw.q_norm.data(), hd, c.rms_eps, s.query.data());
@@ -316,11 +287,60 @@ void Decoder::AttentionLayer(int il, int position, State::Layer& st) {
       out[e] *= Sigmoid(gate[e]);
     }
   }
-  projections_.Apply(Stage::kMixerOut, il, ctx, 1, s.out.data());
 }
 
+struct Decoder::Weights {
+  struct Layer {
+    std::vector<float> attn_norm;
+    std::vector<float> post_attention_norm;
+  };
+  const gguf::TensorInfo* embed = nullptr;
+  std::vector<float> output_norm;
+  std::vector<Layer> layers;
+};
+
+struct Decoder::Scratch {
+  std::vector<float> h;       // residual stream
+  std::vector<float> normed;  // hidden
+  std::vector<float> in;      // a stage's fused output
+  std::vector<float> mixed;   // mixer output (DeltaNet y or attention ctx)
+  std::vector<float> out;     // hidden-sized projection output
+  std::vector<float> ffn;     // gate | up
+  std::vector<float> act;     // silu(gate) * up
+  std::vector<float> logits;
+};
+
+Decoder::Decoder(const gguf::File& file, const Projections& projections)
+    : mixer_(file),
+      projections_(projections),
+      weights_(std::make_unique<Weights>()),
+      scratch_(std::make_unique<Scratch>()) {
+  const Config& c = mixer_.config();
+  auto& w = *weights_;
+  w.embed = &file.Tensor("token_embd.weight");
+  w.output_norm = ToFloats(file.Tensor("output_norm.weight"));
+  for (int il = 0; il < c.layers; ++il) {
+    const std::string p = "blk." + std::to_string(il) + ".";
+    w.layers.push_back(
+        {ToFloats(file.Tensor(p + "attn_norm.weight")),
+         ToFloats(file.Tensor(p + "post_attention_norm.weight"))});
+  }
+  auto& s = *scratch_;
+  s.h.resize(c.hidden);
+  s.normed.resize(c.hidden);
+  s.in.resize(std::max(StageOutputs(c, Stage::kLinearIn, 0),
+                       StageOutputs(c, Stage::kAttentionIn, 3)));
+  s.mixed.resize(std::max(c.LinearValueDim(), c.heads * c.head_dim));
+  s.out.resize(c.hidden);
+  s.ffn.resize(2 * static_cast<std::size_t>(c.ffn));
+  s.act.resize(c.ffn);
+  s.logits.resize(c.vocab);
+}
+
+Decoder::~Decoder() = default;
+
 const std::vector<float>& Decoder::Step(int token, State& state) {
-  const Config& c = config_;
+  const Config& c = mixer_.config();
   auto& w = *weights_;
   auto& s = *scratch_;
   const int d = c.hidden;
@@ -336,10 +356,15 @@ const std::vector<float>& Decoder::Step(int token, State& state) {
     const auto& lw = w.layers[il];
     RmsNorm(s.h.data(), lw.attn_norm.data(), d, c.rms_eps, s.normed.data());
     if (c.IsFullAttention(il)) {
-      AttentionLayer(il, state.position, state.layers[il]);
+      projections_.Apply(Stage::kAttentionIn, il, s.normed.data(), 1,
+                         s.in.data());
+      mixer_.Attention(il, s.in.data(), state.position, state.layers[il],
+                       s.mixed.data());
     } else {
-      LinearLayer(il, state.layers[il]);
+      projections_.Apply(Stage::kLinearIn, il, s.normed.data(), 1, s.in.data());
+      mixer_.Linear(il, s.in.data(), state.layers[il], s.mixed.data());
     }
+    projections_.Apply(Stage::kMixerOut, il, s.mixed.data(), 1, s.out.data());
     for (int i = 0; i < d; ++i) {
       s.h[i] += s.out[i];
     }

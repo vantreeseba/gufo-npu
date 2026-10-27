@@ -79,8 +79,9 @@ else()
   target_link_libraries(gufo_npu_runtime PUBLIC gufo_npu_core)
 endif()
 
-# Qwen3.5 projections on q4nx weights (NPU, or the same weights on the CPU).
-add_library(gufo_npu_qwen35_npu STATIC src/models/qwen35/q4nx_projections.cpp)
+# Qwen3.5 decode on the NPU, and the same q4nx weights on the CPU for tests.
+add_library(gufo_npu_qwen35_npu STATIC src/models/qwen35/npu_decoder.cpp
+                                       src/models/qwen35/q4nx_projections.cpp)
 target_link_libraries(gufo_npu_qwen35_npu PUBLIC gufo_npu_qwen35
                       gufo_npu_runtime)
 

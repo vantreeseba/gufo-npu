@@ -43,9 +43,22 @@ table is the mean of both (6 requests per row).
 | Read 256 MiB only, 2 shim channels per column | 55.9 GB/s | 56.4 GB/s |
 | Read only, 1 channel per column (one-off probe) | 55.5 GB/s | 55.9 GB/s |
 
-The copy's 79 GB/s is ~40 GB/s each way at once. Reads alone stop at ~56 GB/s
-however many channels issue them, so **56 GB/s is the decode ceiling**:
-decode only reads weights.
+Read-only by column count (one channel per column, one-off probe; the 16 MiB
+column has the ~62 µs dispatch taken out):
+
+| Columns | 256 MiB | 16 MiB (fits the 32 MB Infinity Cache) |
+|---|---|---|
+| 1 | 13.8 GB/s | 13.6 GB/s |
+| 2 | 27.1 GB/s | 27.0 GB/s |
+| 4 | 49.0 GB/s | 50.7 GB/s |
+| 8 | 55.9 GB/s | 58.4 GB/s |
+
+The copy's 79 GB/s is ~40 GB/s each way at once. Reads scale ~14 GB/s per
+column up to 4 columns, then stop at ~56 GB/s however many channels issue
+them: a shared limit on the NPU's side of the fabric, not per column and not
+DRAM. A hot 16 MiB buffer reads no faster, so NPU reads are not served from
+the Infinity Cache (which only GPU traffic fills). **56 GB/s is the decode
+ceiling**: decode only reads weights.
 
 ## NPU q4nx GEMV
 
@@ -78,26 +91,31 @@ Measured 2026-10-27.
 
 `gufo-npu generate --device npu --model Qwen3.5-2B-UD-Q4_K_XL.gguf --prompt
 "Name three primary colors, briefly." --max-tokens 128` (19 prompt tokens,
-stops after 64): every matrix product on the NPU (97 GEMVs per token), the
-rest in the fp32 decoder on the CPU. Three runs in a row, 2026-10-27:
+stops after 64). Three runs in a row per row, 2026-10-27:
 
 | Path | Decode tok/s | ms per token | TTFT (19 tokens) |
 |---|---|---|---|
 | CPU reference (GGUF weights) | 5.55 | 180 | 1.83 s |
-| NPU projections + CPU reference math | 22.4 | 44.8 | 0.85 s |
-| **NPU projections + fp32 decoder** | **32.5** (32.45, 32.52, 32.69) | **30.7** | 0.59 s |
+| NPU GEMVs + CPU reference math (97 submissions/token) | 22.4 | 44.8 | 0.85 s |
+| NPU GEMVs + fp32 CPU decoder (97 submissions/token) | 32.5 | 30.7 | 0.59 s |
+| **NpuDecoder: chained, norms/residual/SwiGLU on the NPU (25 submissions/token)** | **35.5** (35.56, 35.41, 35.40) | **28.2** | 0.54 s |
 | FLM (Lemonade), 35-token prompt | 28.5 | 35.1 | 0.60 s |
 
 - FLM's number comes from its server (`tools/bench/openai_bench.py`, 256
   generated tokens); ours from the CLI with a 64-token reply. Both are warm
   and short-context; a like-for-like run waits for `gufo-npu serve`
   (Phase 5).
-- Of the 30.7 ms: ~28.4 ms in GEMV calls (~21.4 ms streaming 1.2 GB at
-  56 GB/s, ~7 ms fixed cost: ~62 µs per call from submit to completion,
-  measured on the smoke kernel; polling instead of waiting saves ~3 µs,
-  buffer syncs ~0.3 µs), ~2.3 ms in the decoder's CPU math. The LM head alone
-  is 5.7 ms.
-- A runlist dispatch costs ~20 µs, so chaining a layer's GEMVs (which needs
-  the norms, residuals, SwiGLU, DeltaNet and attention on the NPU) is worth
-  up to ~4 ms per token. The streaming floor is ~21.4 ms (~47 tok/s).
+- NpuDecoder: every RMS norm before a projection, every residual add and
+  SwiGLU run inside the GEMV (input and output stages), and each GEMV writes
+  into the next one's input buffer, so out → gate+up → down → next layer's
+  in is one runlist. The CPU runs only the DeltaNet/attention mixers and the
+  16+16 alpha/beta rows.
+- Of the 28.2 ms: ~26.1 ms waiting on the NPU, ~2.1 ms CPU. Streaming 1.2 GB
+  at 56 GB/s is ~21.4 ms; the rest is ~62 µs per submission (25), ~20 µs per
+  chained call (72) and ~20 µs of ramp-up and drain inside each call (token
+  broadcast, input stage, first and last blocks).
+- Remaining levers: one instruction sequence per chain (no per-call runlist
+  cost), the mixers on the NPU (one submission per token, no CPU), and
+  speculative decoding with the MTP head (a few tokens per weight read; a
+  4-token GEMV costs about the same as one).
 - Prompts run token by token through the decode path (prefill is Phase 4).
