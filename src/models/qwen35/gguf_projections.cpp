@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -119,6 +120,7 @@ struct GgufProjections::Layer {
 // products), leaving the other half to the mixers' pool.
 struct GgufProjections::Pool {
   SpinPool pool{HalfCpuWorkers()};
+  std::mutex run;  // SpinPool::Run is not reentrant
 };
 
 GgufProjections::GgufProjections(const gguf::File& file, Precision precision)
@@ -273,6 +275,7 @@ void GgufProjections::MatMul(const std::vector<Rows>& parts, const float* x,
     first_job.push_back(first_job.back() + (part.rows + kChunk - 1) / kChunk);
   }
   const bool exact = precision_ == Precision::kDouble;
+  const std::lock_guard<std::mutex> lock(pool_->run);
   pool_->pool.Run(first_job.back(), [&](std::size_t job) {
     std::size_t p = 0;
     std::size_t offset = 0;

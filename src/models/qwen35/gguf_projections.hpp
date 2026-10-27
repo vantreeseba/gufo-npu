@@ -11,7 +11,9 @@
 // memory-mapped GGUF: each weight row is dequantized when it is used and
 // nothing is unpacked ahead, so a 35B MoE costs no memory beyond the file's
 // page cache. Rows are spread over a persistent thread pool. Checks every
-// projection tensor's shape when constructed.
+// projection tensor's shape when constructed. Apply and ApplyExpert may be
+// called from several threads; their products then run one at a time on the
+// shared pool.
 namespace gufo_npu::qwen35 {
 
 class GgufProjections : public Projections {

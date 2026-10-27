@@ -14,6 +14,9 @@
 // accumulate in double. It is the numerical oracle for the NPU path.
 // Math and tensor layout: docs/models/qwen3.5-2b/REFERENCE.md and, for the
 // MoE FFN, docs/models/qwen3.6-35b-a3b/README.md.
+// The const methods may run on several threads with separate States; the
+// GGUF matrix products then take turns on one thread pool, and a
+// caller-supplied Projections must be safe to share.
 namespace gufo_npu::qwen35 {
 
 // Per-sequence state: conv windows, DeltaNet states and the KV cache.
