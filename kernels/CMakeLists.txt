@@ -15,6 +15,8 @@ set(q4nx_gemv_OUTPUTS
   q4nx_gemv.xclbin
   q4nx_gemv_k2048_n2048_plain_store_t1.insts.elf
   q4nx_gemv_k2048_n2048_plain_store_t2.insts.elf
+  q4nx_gemv_k4096_n2048_plain_store_t1.insts.elf
+  q4nx_gemv_k4096_n2048_plain_store_t2.insts.elf
   q4nx_gemv_k2048_n5120_resnorm_store_t1.insts.elf
   q4nx_gemv_k2048_n5120_resnorm_store_t2.insts.elf
   q4nx_gemv_k2048_n8192_resnorm_store_t1.insts.elf

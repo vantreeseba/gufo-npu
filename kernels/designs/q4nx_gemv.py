@@ -76,12 +76,14 @@ PROLOGUES = {"plain": 0, "resnorm": 1, "act": 2}
 EPILOGUES = {"store": 0, "swiglu": 1}
 
 # Decode calls of Qwen3.5-2B as (dim, padded rows, input, output, Y token
-# stride): mixer output (into the next resnorm's D slots), fused attention
+# stride): mixer output (into the next resnorm's D slots), the MTP head's
+# eh_proj (into the residual H slots), fused attention
 # input (q + gate, k, v), fused DeltaNet input (qkv + z), fused gate + up with
 # SwiGLU, down (into the next D slots), and the LM head (248320 rows padded to
 # 248832). Each is built for 1 and 2 tokens.
 VARIANTS = [
     (2048, 2048, "plain", "store", SLOT),
+    (4096, 2048, "plain", "store", SLOT),
     (2048, 5120, "resnorm", "store", 5120),
     (2048, 8192, "resnorm", "store", 8192),
     (2048, 12288, "resnorm", "swiglu", 12288 // 4),

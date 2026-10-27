@@ -76,7 +76,7 @@ Mixer::Mixer(const gguf::File& file)
   const Config& c = config_;
   CheckDense(c);
   auto& w = *weights_;
-  for (int il = 0; il < c.layers; ++il) {
+  for (int il = 0; il < c.layers + c.mtp_layers; ++il) {
     const std::string p = "blk." + std::to_string(il) + ".";
     auto t = [&](const char* name) { return ToFloats(file.Tensor(p + name)); };
     Weights::Layer layer;
@@ -108,8 +108,8 @@ Mixer::~Mixer() = default;
 DecodeState Mixer::NewState() const {
   const Config& c = config_;
   DecodeState state;
-  state.layers.resize(c.layers);
-  for (int il = 0; il < c.layers; ++il) {
+  state.layers.resize(c.layers + c.mtp_layers);
+  for (int il = 0; il < c.layers + c.mtp_layers; ++il) {
     if (!c.IsFullAttention(il)) {
       state.layers[il].conv.assign(
           static_cast<std::size_t>(c.conv_kernel - 1) * c.ConvChannels(), 0.0f);
@@ -122,7 +122,8 @@ DecodeState Mixer::NewState() const {
   return state;
 }
 
-void Mixer::Linear(int il, const float* in, DecodeState::Layer& st, float* y) {
+void Mixer::Linear(int il, const float* in, DecodeState::Layer& st, float* y,
+                   float* ssm_out) {
   const Config& c = config_;
   const auto& lw = weights_->layers[il];
   auto& s = *scratch_;
@@ -180,31 +181,34 @@ void Mixer::Linear(int il, const float* in, DecodeState::Layer& st, float* y) {
     const float b = Sigmoid(beta[head]);
     const float decay =
         std::exp(lw.ssm_a[head] * Softplus(alpha[head] + lw.dt_bias[head]));
-    float* sm = &st.ssm[static_cast<std::size_t>(head) * dk * dk];
+    const std::size_t head_offset = static_cast<std::size_t>(head) * dk * dk;
+    float* sm = &st.ssm[head_offset];
+    // The updated state: in place, or into ssm_out.
+    float* dst = ssm_out != nullptr ? ssm_out + head_offset : sm;
     float* yh = y + head * dk;
 
-    // S is [i (key)][j (value)]. Pass 1: decay S and retrieve S^T k.
+    // S is [i (key)][j (value)]. Pass 1: retrieve (decay S)^T k.
     std::fill_n(delta, dk, 0.0f);
     for (int i = 0; i < dk; ++i) {
-      float* row = sm + static_cast<std::size_t>(i) * dk;
-      const float ki = kvec[i];
+      const float* row = sm + static_cast<std::size_t>(i) * dk;
+      const float ki = kvec[i] * decay;
       for (int j = 0; j < dk; ++j) {
-        row[j] *= decay;
         delta[j] += row[j] * ki;
       }
     }
     for (int j = 0; j < dk; ++j) {
       delta[j] = b * (vh[j] - delta[j]);
     }
-    // Pass 2: rank-1 update S += k delta^T, and read out S^T q.
+    // Pass 2: S' = decay S + k delta^T, and read out S'^T q.
     std::fill_n(yh, dk, 0.0f);
     for (int i = 0; i < dk; ++i) {
-      float* row = sm + static_cast<std::size_t>(i) * dk;
+      const float* row = sm + static_cast<std::size_t>(i) * dk;
+      float* out = dst + static_cast<std::size_t>(i) * dk;
       const float ki = kvec[i];
       const float qi = qh[i];
       for (int j = 0; j < dk; ++j) {
-        row[j] += ki * delta[j];
-        yh[j] += row[j] * qi;
+        out[j] = row[j] * decay + ki * delta[j];
+        yh[j] += out[j] * qi;
       }
     }
     // Gated RMSNorm: RMS(o) * w * silu(z).
@@ -249,7 +253,9 @@ void Mixer::Attention(int il, float* in, int position, DecodeState::Layer& st,
   st.keys.insert(st.keys.end(), k, k + kv);
   st.values.insert(st.values.end(), v, v + kv);
 
-  const int length = position + 1;
+  // Every cached position (equals position + 1 for the decoder layers; the
+  // MTP layer's cache can start later).
+  const int length = static_cast<int>(st.keys.size() / kv);
   s.scores.resize(length);
   const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
   for (int qh = 0; qh < c.heads; ++qh) {

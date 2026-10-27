@@ -139,6 +139,28 @@ A second token costs 0–10% per call: verifying one draft token per step
 reads the weights once. Single-token decode after the change: 35.27, 35.41,
 35.05 tok/s (35.5 before; the token buffer grew from 24 to 36 KB).
 
+### MTP speculative decoding (step 2)
+
+`gufo-npu generate --device npu` now drafts with the model's MTP head
+(`--draft mtp`, the default) and verifies each draft in a 2-token pass: the
+output is the main model's greedy output, byte for byte (checked against
+`--draft none` here and in `qwen35_npu_decode_test`). The prompt also runs
+two tokens per pass. Warm runs, 2026-10-27:
+
+| Prompt | `--draft none` | `--draft mtp` | Drafts accepted | Steps / tokens |
+|---|---|---|---|---|
+| "Explain in a few sentences why the sky is blue." | 34.8 tok/s | **43.8** (43.78, 43.97, 43.61) | 72% | 50 / 87 |
+| "Write a Python function that returns the n-th Fibonacci number…" | 34.1 tok/s | **47.6** (47.41, 47.61, 47.75) | 93% | 122 / 237 |
+
+- A step is one 2-token verify pass (~29.5 ms, 25 submissions) plus an MTP
+  draft (~7.5 ms: eh_proj and the MTP block in 2 submissions, then the
+  shared LM head at 5.8 ms). The draft's LM head is the largest fixed cost
+  left; a draft-only vocabulary subset would cut it.
+- Acceptance measured offline (`gufo-npu bench mtp`, draft vs the greedy
+  token two positions ahead): 72.4% on the first prompt with the CPU and NPU
+  heads alike. RoPE position and whether h goes through output_norm first
+  make no difference (a constant RoPE shift cancels in attention).
+
 ### NPU power mode
 
 `xrt-smi configure --pmode <mode>` (needs CAP_SYS_ADMIN; the box runs

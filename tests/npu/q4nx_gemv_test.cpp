@@ -37,6 +37,7 @@ struct Variant {
 // Must match VARIANTS in kernels/designs/q4nx_gemv.py (rows before padding).
 constexpr Variant kVariants[] = {
     {2048, 2048, Prologue::kPlain, Epilogue::kStore},
+    {4096, 2048, Prologue::kPlain, Epilogue::kStore},
     {2048, 5120, Prologue::kResNorm, Epilogue::kStore},
     {2048, 8192, Prologue::kResNorm, Epilogue::kStore},
     {2048, 12288, Prologue::kResNorm, Epilogue::kSwiGlu},

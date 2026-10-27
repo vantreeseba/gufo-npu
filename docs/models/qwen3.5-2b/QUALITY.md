@@ -79,6 +79,14 @@ per prompt. 2026-10-27:
   do better: requantizing the 5–8-bit tensors costs 2 of 73. A longer quality
   run decides whether an 8-bit kernel variant is needed.
 
+## Speculative decoding
+
+`qwen35_npu_decode_test` also decodes 48 tokens from the chat prompt with
+and without MTP speculation and requires identical tokens (2026-10-27:
+identical; 28 steps, 19 drafts accepted). A rejected draft rolls back the
+DeltaNet state (the draft's update goes to a spare buffer), the conv window
+and the attention caches.
+
 ## Fast decoder vs reference
 
 `qwen35_decoder_test` (label `model`; needs `GUFO_NPU_QWEN35_2B_Q4_GGUF` and

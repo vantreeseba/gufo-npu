@@ -12,7 +12,7 @@
 // are tested against it.
 namespace gufo_npu::qwen35 {
 
-// Per-sequence state of a decode.
+// Per-sequence state of a decode (decoder layers, then MTP layers).
 struct DecodeState {
   int position = 0;
   struct Layer {
@@ -20,6 +20,10 @@ struct DecodeState {
     std::vector<float> ssm;     // [value heads][key dim i][value dim j]
     std::vector<float> keys;    // [position][kv_heads * head_dim]
     std::vector<float> values;  // [position][kv_heads * head_dim]
+    // A speculative token's DeltaNet state and the conv window before it,
+    // kept until the token is accepted or rolled back (NpuDecoder).
+    std::vector<float> ssm_spec;
+    std::vector<float> conv_saved;
   };
   std::vector<Layer> layers;
 };
@@ -38,8 +42,12 @@ public:
   DecodeState NewState() const;
 
   // `in` is the layer's kLinearIn output [qkv | z | alpha | beta]; writes
-  // the value_dim inputs of ssm_out to `y`.
-  void Linear(int layer, const float* in, DecodeState::Layer& state, float* y);
+  // the value_dim inputs of ssm_out to `y`. The DeltaNet state is updated in
+  // place, or, with `ssm_out`, written there and left unchanged in `state`
+  // (a speculative token that may be rolled back). The conv window always
+  // advances in place.
+  void Linear(int layer, const float* in, DecodeState::Layer& state, float* y,
+              float* ssm_out = nullptr);
   // `in` is the layer's kAttentionIn output [q and gate | k | v] (k is
   // normalized and rotated in place); writes the heads * head_dim inputs of
   // attn_output to `ctx`.

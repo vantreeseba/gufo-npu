@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -15,7 +16,12 @@
 // layer's mixer output to the next layer's input projection (out, gate + up,
 // down, next in) run as one chain. The CPU runs the token mixers (Gated
 // DeltaNet, attention) and the DeltaNet alpha/beta rows: 25 NPU submissions
-// per token.
+// per step.
+//
+// A step takes one or two tokens; the weights are read once for both. The
+// second token of a pair can be a speculative draft: Resolve() keeps it or
+// rolls the state back to just after the first. The MTP head drafts the
+// token after next on the NPU as well (two submissions per draft).
 namespace gufo_npu::qwen35 {
 
 class NpuDecoder {
@@ -30,8 +36,29 @@ public:
   DecodeState NewState() const;
 
   // Runs `token` at state.position, advances the state and returns the
-  // logits (vocab values, valid until the next Step).
+  // logits (vocab values, valid until the next call).
   const std::vector<float>& Step(int token, DecodeState& state);
+
+  // Runs `count` (1 or 2) tokens from state.position in one pass. Returns the
+  // logits of token t at t * vocab. With count 2 the second token stays
+  // speculative until Resolve().
+  const float* Step(const int* tokens, int count, DecodeState& state);
+  // After a 2-token Step: keep the second token, or roll the state back to
+  // just after the first.
+  void Resolve(DecodeState& state, bool keep_second);
+
+  // The final residual (before output_norm) of token t of the last Step:
+  // the MTP head's input.
+  const float* hidden(int t = 0) const;
+
+  // MTP draft: for each of `count` (1 or 2) positions p = position + i, the
+  // pair (hidden[i], tokens[i]), where hidden[i] is the main model's final
+  // residual at p - 1 and tokens[i] the token at p. Appends to the MTP
+  // layer's cache in `state` (an MtpState) and returns the logits for the
+  // position after the last.
+  const float* Draft(const float* const* hidden, const int* tokens, int count,
+                     int position, DecodeState& state);
+  DecodeState NewMtpState() const;
 
   // Wall time inside NPU submissions since construction, and their count.
   double npu_seconds() const;
@@ -41,5 +68,26 @@ private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
+
+struct SpeculativeStats {
+  int prompt_tokens = 0;
+  int generated_tokens = 0;
+  int steps = 0;     // verify passes
+  int accepted = 0;  // drafts kept
+  double prefill_seconds = 0;
+  double decode_seconds = 0;
+};
+
+// Greedy decoding with MTP speculation: each step verifies one MTP draft in a
+// 2-token pass and keeps it when the main model agrees, so the output is the
+// main model's greedy output. The prompt runs two tokens per pass. With
+// `draft` false, every step decodes one token (no MTP). `on_token` sees each
+// generated id (including a stop id) as it is produced.
+std::vector<int> SpeculativeGenerate(NpuDecoder& model,
+                                     const std::vector<int>& prompt,
+                                     int max_tokens,
+                                     const std::vector<int>& stop, bool draft,
+                                     const std::function<void(int)>& on_token,
+                                     SpeculativeStats* stats = nullptr);
 
 }  // namespace gufo_npu::qwen35

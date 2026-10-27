@@ -131,6 +131,29 @@ int main(int argc, char** argv) {
         ok ? "ok  " : "FAIL", name, ids.size(), same, ids.size(), err, same_hf,
         ids.size());
   }
+  // Speculative decoding (MTP draft, 2-token verify) must give exactly the
+  // plain greedy output.
+  {
+    const auto prompt = ReadIds(fs::path(oracle) / "chat.ids.json");
+    const std::vector<int> stop;  // none: always max_tokens
+    constexpr int kTokens = 48;
+    qwen35::SpeculativeStats plain_stats;
+    qwen35::SpeculativeStats spec_stats;
+    const auto plain = qwen35::SpeculativeGenerate(npu, prompt, kTokens, stop,
+                                                   false, {}, &plain_stats);
+    const auto spec = qwen35::SpeculativeGenerate(npu, prompt, kTokens, stop,
+                                                  true, {}, &spec_stats);
+    const bool same = plain == spec;
+    failures += same ? 0 : 1;
+    std::printf(
+        "%s speculative decode: %zu tokens %s plain greedy; %d steps, %d "
+        "drafts accepted (%.0f%%)\n",
+        same ? "ok  " : "FAIL", spec.size(),
+        same ? "identical to" : "DIFFER from", spec_stats.steps,
+        spec_stats.accepted,
+        spec_stats.steps ? 100.0 * spec_stats.accepted / spec_stats.steps
+                         : 0.0);
+  }
   const double total = static_cast<double>(matched) / positions;
   const bool agree_ok = total >= kMinArgmaxAgreement;
   std::printf("%s argmax NPU vs q4nx on CPU: %zu/%zu (%.1f%%, need %.0f%%)\n",
