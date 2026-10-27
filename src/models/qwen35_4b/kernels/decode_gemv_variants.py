@@ -1,14 +1,7 @@
-#!/usr/bin/env python3
-"""Qwen3.5-4B's NPU program shapes: pure data, no aie imports.
-
-decode_gemv.py compiles VARIANTS into one xclbin (NAME.xclbin) and one
-instruction ELF per variant and token count; prefill_gemm.py compiles
-PREFILL_SHAPES likewise (PREFILL_NAME.xclbin). CMake reads the output lists
-from `variants.py --outputs decode|prefill` at configure time. The host side
-mirrors the geometry in src/models/qwen35_4b/npu/gemv.hpp.
+"""Qwen3.5-4B's decode GEMV shapes (decode_gemv.py): pure data, no IRON
+imports, so kernels/build.py --list-outputs can read OUTPUTS at configure
+time. The host mirrors the geometry in src/models/qwen35_4b/npu/gemv.hpp.
 """
-
-import sys
 
 NAME = "qwen35_4b_decode"
 HIDDEN = 2560  # residual width (resnorm)
@@ -60,40 +53,3 @@ def sequences():
 OUTPUTS = [f"{NAME}.xclbin"] + [
     f"{sequence_name(d, n, p, e, t)}.insts.elf" for d, n, _, p, e, _, t in sequences()
 ]
-
-# Prefill GEMM (prefill_gemm.py): prompt tokens per call, and the
-# projections as (K, N): DeltaNet input (qkv + z), attention input (q + gate,
-# k, v), mixer output (ssm_out / attn_output), gate + up, down, and the MTP
-# head's eh_proj.
-PREFILL_NAME = "qwen35_4b_prefill"
-PREFILL_CHUNKS = [256, 512, 1024]
-PREFILL_SHAPES = [
-    (HIDDEN, 12288),
-    (HIDDEN, 10240),
-    (4096, HIDDEN),
-    (HIDDEN, 2 * FFN),
-    (FFN, HIDDEN),
-    (2 * HIDDEN, HIDDEN),
-]
-
-
-def prefill_sequence_name(m, k, n) -> str:
-    """Matches npu::Bfp16GemmSequence with PREFILL_NAME as the prefix."""
-    return f"{PREFILL_NAME}_m{m}_k{k}_n{n}"
-
-
-def prefill_sequences():
-    for m in PREFILL_CHUNKS:
-        for k, n in PREFILL_SHAPES:
-            yield m, k, n
-
-
-PREFILL_OUTPUTS = [f"{PREFILL_NAME}.xclbin"] + [
-    f"{prefill_sequence_name(m, k, n)}.insts.elf" for m, k, n in prefill_sequences()
-]
-
-if __name__ == "__main__":
-    lists = {"decode": OUTPUTS, "prefill": PREFILL_OUTPUTS}
-    if len(sys.argv) != 3 or sys.argv[1] != "--outputs" or sys.argv[2] not in lists:
-        raise SystemExit("usage: variants.py --outputs decode|prefill")
-    print(";".join(lists[sys.argv[2]]))

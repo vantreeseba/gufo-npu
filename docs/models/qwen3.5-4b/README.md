@@ -70,11 +70,11 @@ speculation.
 
 ## Code
 
-- `src/models/qwen35_4b/kernels/`: `variants.py` (shapes, pure data),
-  `decode_gemv.py` + `aie/decode_gemv.cc` (the decode GEMV, copied from the
-  2B's with the 4B's geometry, xclbin `qwen35_4b_decode`) and
-  `prefill_gemm.py` (the prefill GEMM, xclbin `qwen35_4b_prefill`), installed
-  under `<kernels>/qwen35_4b/`.
+- `src/models/qwen35_4b/kernels/`: `decode_gemv.py` + `aie/decode_gemv.cc`
+  (the decode GEMV, copied from the 2B's with the 4B's geometry, xclbin
+  `qwen35_4b_decode`) and `prefill_gemm.py` (the prefill GEMM, xclbin
+  `qwen35_4b_prefill`), each with its pure-data `*_variants.py`, registered
+  with `gufo_npu_add_kernel(... MODEL qwen35_4b)`.
 - `src/models/qwen35_4b/npu/gemv.hpp`: the host's copy of the geometry.
 - `src/models/qwen35_4b/npu_decoder.*`, `npu_prefill.*`: the 2B's host
   wiring with the 4B's constants and programs.

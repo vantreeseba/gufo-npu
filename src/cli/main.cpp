@@ -1,9 +1,11 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -20,6 +22,7 @@
 #include "core/quant.hpp"
 #include "core/tokenizer.hpp"
 #include "models/qwen35/chat.hpp"
+#include "models/qwen35/config.hpp"
 #include "models/qwen35/generate.hpp"
 #include "models/qwen35/mtp.hpp"
 #include "models/qwen35/npu_decoder.hpp"
@@ -48,7 +51,7 @@ constexpr char kUsage[] =
     "  bench bandwidth [--iters N] [--kernels DIR]\n"
     "                           NPU DDR bandwidth: copy, and read only\n"
     "  bench gemv --model GGUF [--iters N] [--kernels DIR]\n"
-    "                           q4nx GEMV on real Qwen3.5-2B decode shapes\n"
+    "                           q4nx GEMV on the model's decode shapes\n"
     "  bench mtp --model GGUF --prompt TEXT [--tokens N] [--kernels DIR]\n"
     "                           MTP draft acceptance on a greedy NPU decode\n"
     "  bench prefill --model GGUF [--tokens 35,125,1024] [--runs N]\n"
@@ -218,6 +221,87 @@ int BenchBandwidth(const std::vector<std::string_view>& args) {
   return 0;
 }
 
+// One MoE layer's FFN as the decoder runs it: layer 0's first 8 routed
+// experts and its shared expert, the gate + up gather then the down gather
+// in one submission, for 1 and 2 tokens.
+void BenchMoeFfn(const gufo_npu::gguf::File& file,
+                 gufo_npu::npu::GemvRuntime& runtime, int iterations) {
+  namespace q4nx = gufo_npu::q4nx;
+  namespace npu = gufo_npu::npu;
+  const auto ffn = npu::kExpertFfn;
+  const auto hidden = npu::kGemvHidden;
+  const npu::ExpertArena arena{npu::kGatherExperts};
+  npu::Buffer arena_buf(runtime, arena.bytes());
+  auto rows = [&](const char* name, std::size_t first, std::size_t count) {
+    const auto& t = file.Tensor(name);
+    return q4nx::Segment{
+        t.type,
+        t.data + first * gufo_npu::quant::RowBytes(t.type, t.RowElements()),
+        count};
+  };
+  for (std::size_t e = 0; e < npu::kGatherExperts; ++e) {
+    const bool shared = e + 1 == npu::kGatherExperts;
+    const auto up = q4nx::PackRows(
+        shared ? std::vector<q4nx::Segment>{rows("blk.0.ffn_gate_shexp.weight",
+                                                 0, ffn),
+                                            rows("blk.0.ffn_up_shexp.weight", 0,
+                                                 ffn)}
+               : std::vector<q4nx::Segment>{rows("blk.0.ffn_gate_exps.weight",
+                                                 e * ffn, ffn),
+                                            rows("blk.0.ffn_up_exps.weight",
+                                                 e * ffn, ffn)},
+        hidden, q4nx::SwiGluOrder(ffn));
+    const auto down = q4nx::PackRows(
+        {shared ? rows("blk.0.ffn_down_shexp.weight", 0, hidden)
+                : rows("blk.0.ffn_down_exps.weight", e * hidden, hidden)},
+        ffn);
+    std::memcpy(arena_buf.as<std::uint8_t>() + arena.UpOffset(e),
+                up.bytes.data(), up.bytes.size());
+    std::memcpy(arena_buf.as<std::uint8_t>() + arena.DownOffset(e),
+                down.bytes.data(), down.bytes.size());
+  }
+  arena_buf.ToDevice();
+  npu::Buffer x(runtime, npu::kGemvInputBytes);
+  std::fill_n(x.as<float>(), x.size() / sizeof(float), 1.0f);
+  x.ToDevice();
+  npu::Buffer y(runtime, npu::kGemvResidualBytes);
+  npu::Buffer r(runtime, npu::kGemvResidualBytes);
+  int ids[npu::kGatherExperts];
+  float scales[npu::kGatherExperts * npu::kGemvTokens];
+  for (std::size_t i = 0; i < npu::kGatherExperts; ++i) {
+    ids[i] = static_cast<int>(i);
+  }
+  std::fill_n(scales, npu::kGatherExperts * npu::kGemvTokens, 0.5f);
+  double mean_us[2];
+  for (std::size_t tokens = 1; tokens <= npu::kGemvTokens; ++tokens) {
+    npu::Q4nxGather gate_up(runtime, npu::Q4nxGather::Kind::kGateUp, arena,
+                            tokens);
+    npu::Q4nxGather down(runtime, npu::Q4nxGather::Kind::kDown, arena, tokens);
+    npu::Buffer mid(runtime, gate_up.y_bytes());
+    gate_up.Select(ids, scales);
+    down.Select(ids);
+    npu::Chain chain(runtime);
+    chain.Add(gate_up, x, arena_buf, mid, r);
+    chain.Add(down, mid, arena_buf, y, r);
+    double total = 0;
+    for (int i = -20; i < iterations; ++i) {  // 20 warm-up runs
+      const auto start = std::chrono::steady_clock::now();
+      chain.Run();
+      if (i >= 0) {
+        total += std::chrono::duration<double, std::micro>(
+                     std::chrono::steady_clock::now() - start)
+                     .count();
+      }
+    }
+    mean_us[tokens - 1] = total / std::max(iterations, 1);
+  }
+  const double mb = static_cast<double>(arena.bytes()) / 1e6;
+  std::printf("%-22s %6zu %7zu %8.1f %10.1f %10.1f %8.1f %8.2fx\n",
+              "MoE FFN (9 experts)", hidden, npu::kGatherExperts * 2 * ffn, mb,
+              mean_us[0], mean_us[1], mb * 1e6 / mean_us[0] / 1e3,
+              mean_us[1] / mean_us[0]);
+}
+
 int BenchGemv(const std::vector<std::string_view>& args) {
   int iterations = 200;
   std::optional<std::string> kernels;
@@ -241,39 +325,72 @@ int BenchGemv(const std::vector<std::string_view>& args) {
   }
   namespace q4nx = gufo_npu::q4nx;
   namespace quant = gufo_npu::quant;
+  namespace npu = gufo_npu::npu;
   const auto file = gufo_npu::gguf::File::Open(model);
-  gufo_npu::npu::GemvRuntime runtime(KernelDir(kernels));
+  const bool moe = gufo_npu::qwen35::ReadConfig(*file).IsMoe();
+  // The decoder's flow: MoE models need the instruction-buffer flow.
+  npu::GemvRuntime runtime(
+      KernelDir(kernels),
+      moe ? npu::Flow::kInstructionBuffer : npu::Flow::kElf);
 
-  using gufo_npu::npu::Epilogue;
-  using gufo_npu::npu::Prologue;
+  using npu::Epilogue;
+  using npu::Prologue;
   struct Case {
     const char* label;
     std::vector<const char*> tensors;  // stacked in order
     Prologue prologue;
     Epilogue epilogue;
   };
-  // One stack per decode call of Qwen3.5-2B (layer 0 DeltaNet, layer 3 full
-  // attention), in the input/output stages the decoder runs it with.
-  const Case cases[] = {
-      {"DeltaNet in (qkv+z)",
-       {"blk.0.attn_qkv.weight", "blk.0.attn_gate.weight"},
-       Prologue::kResNorm,
-       Epilogue::kStore},
-      {"attention in (q+k+v)",
-       {"blk.3.attn_q.weight", "blk.3.attn_k.weight", "blk.3.attn_v.weight"},
-       Prologue::kResNorm,
-       Epilogue::kStore},
-      {"mixer out (ssm_out)",
-       {"blk.0.ssm_out.weight"},
-       Prologue::kPlain,
-       Epilogue::kStore},
-      {"ffn in (gate+up)",
-       {"blk.0.ffn_gate.weight", "blk.0.ffn_up.weight"},
-       Prologue::kResNorm,
-       Epilogue::kSwiGlu},
-      {"ffn down", {"blk.0.ffn_down.weight"}, Prologue::kAct, Epilogue::kStore},
-      {"LM head", {"token_embd.weight"}, Prologue::kResNorm, Epilogue::kStore},
-  };
+  // One stack per decode call (layer 0 DeltaNet, layer 3 full attention), in
+  // the input/output stages the decoder runs it with: Qwen3.5-2B, or the
+  // dense calls of an MoE model (its experts follow below).
+  const std::vector<Case> cases =
+      moe ? std::vector<Case>{
+                {"DeltaNet in (qkv+z)",
+                 {"blk.0.attn_qkv.weight", "blk.0.attn_gate.weight"},
+                 Prologue::kResNorm,
+                 Epilogue::kStore},
+                {"attention in (q+k+v)",
+                 {"blk.3.attn_q.weight", "blk.3.attn_k.weight",
+                  "blk.3.attn_v.weight"},
+                 Prologue::kResNorm,
+                 Epilogue::kStore},
+                {"mixer out (ssm_out)",
+                 {"blk.0.ssm_out.weight"},
+                 Prologue::kPlain,
+                 Epilogue::kStore},
+                {"LM head",
+                 {"output.weight"},
+                 Prologue::kResNorm,
+                 Epilogue::kStore},
+            }
+          : std::vector<Case>{
+                {"DeltaNet in (qkv+z)",
+                 {"blk.0.attn_qkv.weight", "blk.0.attn_gate.weight"},
+                 Prologue::kResNorm,
+                 Epilogue::kStore},
+                {"attention in (q+k+v)",
+                 {"blk.3.attn_q.weight", "blk.3.attn_k.weight",
+                  "blk.3.attn_v.weight"},
+                 Prologue::kResNorm,
+                 Epilogue::kStore},
+                {"mixer out (ssm_out)",
+                 {"blk.0.ssm_out.weight"},
+                 Prologue::kPlain,
+                 Epilogue::kStore},
+                {"ffn in (gate+up)",
+                 {"blk.0.ffn_gate.weight", "blk.0.ffn_up.weight"},
+                 Prologue::kResNorm,
+                 Epilogue::kSwiGlu},
+                {"ffn down",
+                 {"blk.0.ffn_down.weight"},
+                 Prologue::kAct,
+                 Epilogue::kStore},
+                {"LM head",
+                 {"token_embd.weight"},
+                 Prologue::kResNorm,
+                 Epilogue::kStore},
+            };
   std::printf("%-22s %6s %7s %8s %10s %10s %8s %9s\n", "stage", "dim", "rows",
               "MB", "1 tok us", "2 tok us", "GB/s(1)", "2 vs 1");
   for (const auto& c : cases) {
@@ -284,9 +401,9 @@ int BenchGemv(const std::vector<std::string_view>& args) {
     }
     const std::size_t dim = file->Tensor(c.tensors[0]).RowElements();
     const auto packed = q4nx::PackRows(segments, dim);
-    namespace npu = gufo_npu::npu;
     npu::Q4nxGemv gemv(runtime, packed, c.prologue, c.epilogue);
-    // Unit inputs: timing only (tests/npu/q4nx_gemv_test.cpp checks values).
+    // Unit inputs: timing only (tests/models/qwen35_2b/q4nx_gemv_test.cpp
+    // checks values).
     npu::Buffer x(runtime, std::max<std::size_t>(npu::kGemvInputBytes,
                                                  4 * dim * sizeof(float)));
     std::fill_n(x.as<float>(), x.size() / sizeof(float), 1.0f);
@@ -303,6 +420,9 @@ int BenchGemv(const std::vector<std::string_view>& args) {
     std::printf("%-22s %6zu %7zu %8.1f %10.1f %10.1f %8.1f %8.2fx\n", c.label,
                 dim, packed.rows, mb, mean_us[0], mean_us[1],
                 mb * 1e6 / mean_us[0] / 1e3, mean_us[1] / mean_us[0]);
+  }
+  if (moe) {
+    BenchMoeFfn(*file, runtime, iterations);
   }
   return 0;
 }
@@ -336,6 +456,11 @@ int BenchMtp(const std::vector<std::string_view>& args) {
   }
   namespace qwen35 = gufo_npu::qwen35;
   const auto file = gufo_npu::gguf::File::Open(model);
+  if (qwen35::ReadConfig(*file).IsMoe()) {
+    std::fprintf(stderr,
+                 "bench mtp: MoE models have no MTP head on the NPU yet\n");
+    return 1;
+  }
   const gufo_npu::Tokenizer tokenizer(*file);
   auto seq = tokenizer.Encode(qwen35::RenderChat({{"user", prompt}}, false));
   const std::size_t prompt_len = seq.size();
@@ -455,6 +580,10 @@ int BenchPrefill(const std::vector<std::string_view>& args) {
   }
   namespace qwen35 = gufo_npu::qwen35;
   const auto file = gufo_npu::gguf::File::Open(model);
+  if (qwen35::ReadConfig(*file).IsMoe()) {
+    std::fprintf(stderr, "bench prefill: MoE models have no NPU prefill yet\n");
+    return 1;
+  }
   const gufo_npu::Tokenizer tokenizer(*file);
   const int longest = *std::max_element(lengths.begin(), lengths.end());
   std::string text = "Here is some background text.";
@@ -614,18 +743,32 @@ int Generate(const std::vector<std::string_view>& args) {
     return 0;
   }
   if (device == "npu") {
+    const auto load_start = std::chrono::steady_clock::now();
     qwen35::NpuDecoder npu(*file, KernelDir(kernels));
-    qwen35::NpuPrefill prefill(*file, KernelDir(kernels));
+    // MoE models have no NPU prefill or MTP head yet: their prompt goes
+    // through the decoder and they decode without drafting.
+    std::optional<qwen35::NpuPrefill> prefill;
+    if (!npu.config().IsMoe()) {
+      prefill.emplace(*file, KernelDir(kernels));
+    }
+    const double load_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      load_start)
+            .count();
+    const bool speculate = draft == "mtp" && npu.can_draft();
     qwen35::SpeculativeStats stats;
-    qwen35::SpeculativeGenerate(npu, ids, max_tokens, stop, draft == "mtp",
-                                print, &stats, qwen35::PrefillPrompt(prefill));
-    const auto& pp = prefill.profile();
-    std::fprintf(stderr,
-                 "\n[prefill: %ld NPU GEMMs, %.3f s in them, %.3f s syncing "
-                 "buffers; CPU %.3f s DeltaNet, %.3f s attention, %.3f s "
-                 "other]",
-                 pp.gemms, pp.gemm_seconds, pp.sync_seconds,
-                 pp.deltanet_seconds, pp.attention_seconds, pp.other_seconds);
+    qwen35::SpeculativeGenerate(
+        npu, ids, max_tokens, stop, speculate, print, &stats,
+        prefill ? qwen35::PrefillPrompt(*prefill) : qwen35::PromptPrefill{});
+    if (prefill) {
+      const auto& pp = prefill->profile();
+      std::fprintf(stderr,
+                   "\n[prefill: %ld NPU GEMMs, %.3f s in them, %.3f s syncing "
+                   "buffers; CPU %.3f s DeltaNet, %.3f s attention, %.3f s "
+                   "other]",
+                   pp.gemms, pp.gemm_seconds, pp.sync_seconds,
+                   pp.deltanet_seconds, pp.attention_seconds, pp.other_seconds);
+    }
     std::fprintf(stderr,
                  "\n[%d prompt tokens in %.2f s; %d generated in %.2f s, "
                  "%.2f tok/s; NPU, %s]\n",
@@ -634,13 +777,17 @@ int Generate(const std::vector<std::string_view>& args) {
                  stats.decode_seconds > 0
                      ? stats.generated_tokens / stats.decode_seconds
                      : 0.0,
-                 draft == "mtp" ? "MTP draft" : "no draft");
+                 speculate        ? "MTP draft"
+                 : draft == "mtp" ? "no draft (no NPU MTP head here)"
+                                  : "no draft");
     std::fprintf(stderr,
                  "[%d decode steps, %d drafts accepted (%.0f%%); %ld NPU "
-                 "submissions, %.2f s waiting on them; %.2f s in CPU mixers]\n",
+                 "submissions, %.2f s waiting on them; %.2f s in CPU mixers, "
+                 "%.2f s routing; loaded in %.1f s]\n",
                  stats.steps, stats.accepted,
                  stats.steps ? 100.0 * stats.accepted / stats.steps : 0.0,
-                 npu.submissions(), npu.npu_seconds(), npu.cpu_seconds());
+                 npu.submissions(), npu.npu_seconds(), npu.cpu_seconds(),
+                 npu.router_seconds(), load_seconds);
     return 0;
   }
 

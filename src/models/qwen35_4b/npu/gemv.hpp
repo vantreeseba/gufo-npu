@@ -7,12 +7,11 @@
 
 // Qwen3.5-4B's decode GEMV (src/models/qwen35_4b/kernels): its own NPU
 // program, built with the 4B's geometry. These constants must match
-// kernels/variants.py.
+// kernels/decode_gemv_variants.py.
 namespace gufo_npu::qwen35_4b::npu {
 
-// The kernel subdirectory (under the kernel directory) holding its xclbin and
-// instruction sequences.
-inline constexpr char kKernelSubdir[] = "qwen35_4b";
+// The decode GEMV program (kernels/decode_gemv.py): its xclbin and the
+// prefix of its instruction sequences, in the kernel directory.
 inline constexpr char kDecodeName[] = "qwen35_4b_decode";
 // The prefill GEMM program (kernels/prefill_gemm.py).
 inline constexpr char kPrefillName[] = "qwen35_4b_prefill";

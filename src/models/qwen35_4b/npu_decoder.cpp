@@ -178,7 +178,7 @@ struct NpuDecoder::Impl {
   Impl(const gguf::File& file, const std::filesystem::path& kernel_dir)
       : config(RequireDenseTied(ReadConfig(file), "qwen35_4b NpuDecoder")),
         mixer(file),
-        runtime(kernel_dir / npu::kKernelSubdir, npu::DecodeDesign()) {
+        runtime(kernel_dir, gufo_npu::npu::Flow::kElf, npu::DecodeDesign()) {
     const Config& c = config;
     if (static_cast<std::size_t>(c.hidden) != npu::kHidden ||
         static_cast<std::size_t>(c.ffn) > npu::kMaxDim) {

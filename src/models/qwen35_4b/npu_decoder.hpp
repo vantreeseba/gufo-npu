@@ -8,7 +8,7 @@
 #include "core/gguf.hpp"
 #include "models/qwen35/config.hpp"
 #include "models/qwen35/decoder.hpp"
-#include "models/qwen35/npu_decoder.hpp"
+#include "models/qwen35/generate.hpp"
 
 // Qwen3.5-4B decode on the NPU, on the 4B's own decode GEMV program
 // (src/models/qwen35_4b/kernels; hidden 2560). Copied from
@@ -39,7 +39,7 @@ using qwen35::SpeculativeStats;
 class NpuDecoder {
 public:
   // Keeps pointers into `file`, which must outlive it. Loads the 4B's
-  // program from kernel_dir / npu::kKernelSubdir.
+  // decode program (npu::kDecodeName) from kernel_dir.
   NpuDecoder(const gguf::File& file, const std::filesystem::path& kernel_dir);
   ~NpuDecoder();
   NpuDecoder(const NpuDecoder&) = delete;

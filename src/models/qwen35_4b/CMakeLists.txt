@@ -6,7 +6,4 @@ add_library(gufo_npu_qwen35_4b STATIC npu_decoder.cpp npu_prefill.cpp)
 target_link_libraries(gufo_npu_qwen35_4b PUBLIC gufo_npu_qwen35_npu)
 set_source_files_properties(npu_decoder.cpp npu_prefill.cpp PROPERTIES
   COMPILE_OPTIONS "-march=x86-64-v3;-O3")
-
-if(GUFO_NPU_BUILD_KERNELS)
-  add_subdirectory(kernels)
-endif()
+# Its NPU programs (kernels/) are registered from kernels/CMakeLists.txt.

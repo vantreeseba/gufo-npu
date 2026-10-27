@@ -9,10 +9,13 @@
 #include <stdexcept>
 #include <string>
 
+#include "core/cpus.hpp"
 #include "core/q4nx.hpp"
 #include "core/quant.hpp"
+#include "core/thread_pool.hpp"
 #include "core/vec.hpp"
 #include "models/qwen35/draft_vocab.hpp"
+#include "models/qwen35/moe.hpp"
 #include "npu/gemv.hpp"
 
 namespace gufo_npu::qwen35 {
@@ -21,10 +24,43 @@ namespace {
 using npu::Buffer;
 using npu::Chain;
 using npu::Epilogue;
+using npu::ExpertArena;
 using npu::Prologue;
+using npu::Q4nxGather;
 using npu::Q4nxGemv;
 using vec::Dot;
 using vec::RmsNorm;
+
+double SecondsSince(std::chrono::steady_clock::time_point start) {
+  return std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+      .count();
+}
+
+// `rows` rows of `t` from row `first` (an expert of a stacked 3D tensor).
+q4nx::Segment RowsOf(const gguf::TensorInfo& t, std::size_t first,
+                     std::size_t rows) {
+  return {t.type, t.data + first * quant::RowBytes(t.type, t.RowElements()),
+          rows};
+}
+
+// The shapes the NPU path supports; throws otherwise.
+Config CheckShapes(Config c) {
+  if (static_cast<std::size_t>(c.hidden) != npu::kGemvHidden) {
+    throw std::runtime_error("npu decoder: hidden size must be " +
+                             std::to_string(npu::kGemvHidden));
+  }
+  if (c.IsMoe() &&
+      (static_cast<std::size_t>(c.experts_used) + 1 != npu::kGatherExperts ||
+       static_cast<std::size_t>(c.expert_ffn) != npu::kExpertFfn ||
+       static_cast<std::size_t>(c.shared_expert_ffn) != npu::kExpertFfn)) {
+    throw std::runtime_error("npu decoder: MoE layers need " +
+                             std::to_string(npu::kGatherExperts - 1) +
+                             " routed experts and a shared expert of width " +
+                             std::to_string(npu::kExpertFfn) +
+                             " (the gather design)");
+  }
+  return c;
+}
 
 std::vector<float> ToFloats(const gguf::TensorInfo& t) {
   std::vector<float> out(t.num_elements);
@@ -65,22 +101,40 @@ void SetNormWeight(Buffer& region, const gguf::TensorInfo& t) {
 }  // namespace
 
 struct NpuDecoder::Impl {
-  // One transformer block's GEMVs and the regions between them.
+  // One transformer block's GEMVs and the regions between them. ffn_x is the
+  // FFN's resnorm input (H: the residual, D: the mixer output) and ffn_y its
+  // SwiGLU output, dense or MoE.
   struct Block {
     bool attention = false;
-    std::unique_ptr<Q4nxGemv> in, out, ffn, down;
+    std::unique_ptr<Q4nxGemv> in, out, ffn, down;  // ffn, down: dense
     std::unique_ptr<Buffer> in_x, in_y, out_x, ffn_x, ffn_y;
     std::deque<Buffer> views;      // sub-buffers wired between calls (stable)
     std::vector<float> attn_norm;  // fp32, for alpha/beta on the CPU
     std::vector<float> alpha, beta;
-    // out, ffn, down, then the next block's in (or the LM head), per token
-    // count.
+    // MoE: the routed experts and then the shared one in one arena, their
+    // gathers, and for the CPU router post_attention_norm and the router
+    // rows (experts, then the shared expert's gate) in fp32.
+    std::unique_ptr<Buffer> arena;
+    std::unique_ptr<Q4nxGather> gate_up, gather_down;
+    std::vector<float> post_norm;
+    std::vector<float> router;
+    std::vector<int> chosen;  // the last step's experts
+    // Per token count. Dense: out, ffn, down, then the next block's in (or
+    // the LM head). MoE: mixer_out runs out alone; after routing, chain runs
+    // the two gathers, then the next block's in.
     std::unique_ptr<Chain> chain[kMaxTokens];
+    std::unique_ptr<Chain> mixer_out[kMaxTokens];
   };
 
   Config config;
   Mixer mixer;
   npu::GemvRuntime runtime;
+  int max_tokens = kMaxTokens;  // per Step
+  // MoE routing (router rows, then experts_used ids and weights).
+  SpinPool pool{std::min<std::size_t>(7, HalfCpuWorkers())};
+  std::vector<float> router_logits, mid;
+  std::vector<float> route_weights;
+  double router_seconds = 0;
   const gguf::TensorInfo* embed = nullptr;
   std::vector<Block> layers;
   std::unique_ptr<Q4nxGemv> lm;
@@ -133,27 +187,89 @@ struct NpuDecoder::Impl {
                                       Epilogue::kStore);
     b.out = std::make_unique<Q4nxGemv>(runtime, PackOne(*out_t),
                                        Prologue::kPlain, Epilogue::kStore);
-    b.ffn = std::make_unique<Q4nxGemv>(
-        runtime,
-        q4nx::PackRows(
-            {SegmentOf(t("ffn_gate.weight")), SegmentOf(t("ffn_up.weight"))},
-            hidden, q4nx::SwiGluOrder(c.ffn)),
-        Prologue::kResNorm, Epilogue::kSwiGlu);
-    b.down = std::make_unique<Q4nxGemv>(runtime, PackOne(t("ffn_down.weight")),
-                                        Prologue::kAct, Epilogue::kStore);
+    std::size_t ffn_y_bytes = 0;
+    if (c.IsMoe()) {
+      MakeExperts(b, file, p);
+      ffn_y_bytes = b.gate_up->y_bytes();
+    } else {
+      b.ffn = std::make_unique<Q4nxGemv>(
+          runtime,
+          q4nx::PackRows(
+              {SegmentOf(t("ffn_gate.weight")), SegmentOf(t("ffn_up.weight"))},
+              hidden, q4nx::SwiGluOrder(c.ffn)),
+          Prologue::kResNorm, Epilogue::kSwiGlu);
+      b.down =
+          std::make_unique<Q4nxGemv>(runtime, PackOne(t("ffn_down.weight")),
+                                     Prologue::kAct, Epilogue::kStore);
+      ffn_y_bytes = b.ffn->y_bytes();
+    }
     b.in_x = std::make_unique<Buffer>(runtime, npu::kGemvInputBytes);
     b.in_y = std::make_unique<Buffer>(runtime, b.in->y_bytes());
     b.out_x = std::make_unique<Buffer>(runtime, npu::kGemvInputBytes);
     b.ffn_x = std::make_unique<Buffer>(runtime, npu::kGemvInputBytes);
-    b.ffn_y = std::make_unique<Buffer>(runtime, b.ffn->y_bytes());
+    b.ffn_y = std::make_unique<Buffer>(runtime, ffn_y_bytes);
     SetNormWeight(*b.in_x, t("attn_norm.weight"));
     SetNormWeight(*b.ffn_x, t("post_attention_norm.weight"));
     b.attn_norm = ToFloats(t("attn_norm.weight"));
     return b;
   }
 
+  // An MoE block's expert arena (every routed expert, then the shared one)
+  // and gathers, and the router for the CPU.
+  void MakeExperts(Block& b, const gguf::File& file, const std::string& p) {
+    const Config& c = config;
+    const auto hidden = static_cast<std::size_t>(c.hidden);
+    const auto ef = static_cast<std::size_t>(c.expert_ffn);
+    auto t = [&](const char* name) -> const gguf::TensorInfo& {
+      return file.Tensor(p + name);
+    };
+    const ExpertArena arena{static_cast<std::size_t>(c.experts) + 1};
+    b.arena = std::make_unique<Buffer>(runtime, arena.bytes());
+    auto* base = b.arena->as<std::uint8_t>();
+    const auto order = q4nx::SwiGluOrder(ef);
+    auto put = [&](std::size_t e, const q4nx::Matrix& up,
+                   const q4nx::Matrix& down) {
+      if (up.bytes.size() != ExpertArena::kUpBytes ||
+          down.bytes.size() != ExpertArena::kDownBytes) {
+        throw std::logic_error("npu decoder: expert packs to the wrong size");
+      }
+      std::memcpy(base + arena.UpOffset(e), up.bytes.data(), up.bytes.size());
+      std::memcpy(base + arena.DownOffset(e), down.bytes.data(),
+                  down.bytes.size());
+    };
+    const auto& gate = t("ffn_gate_exps.weight");
+    const auto& up = t("ffn_up_exps.weight");
+    const auto& down = t("ffn_down_exps.weight");
+    for (std::size_t e = 0; e < static_cast<std::size_t>(c.experts); ++e) {
+      put(e,
+          q4nx::PackRows({RowsOf(gate, e * ef, ef), RowsOf(up, e * ef, ef)},
+                         hidden, order),
+          q4nx::PackRows({RowsOf(down, e * hidden, hidden)}, ef));
+    }
+    put(static_cast<std::size_t>(c.experts),
+        q4nx::PackRows({SegmentOf(t("ffn_gate_shexp.weight")),
+                        SegmentOf(t("ffn_up_shexp.weight"))},
+                       hidden, order),
+        PackOne(t("ffn_down_shexp.weight")));
+    b.arena->ToDevice();
+    b.gate_up =
+        std::make_unique<Q4nxGather>(runtime, Q4nxGather::Kind::kGateUp, arena);
+    b.gather_down =
+        std::make_unique<Q4nxGather>(runtime, Q4nxGather::Kind::kDown, arena);
+    b.post_norm = ToFloats(t("post_attention_norm.weight"));
+    b.router = ToFloats(t("ffn_gate_inp.weight"));
+    const auto shared_gate = ToFloats(t("ffn_gate_inp_shexp.weight"));
+    if (b.router.size() != static_cast<std::size_t>(c.experts) * hidden ||
+        shared_gate.size() != hidden) {
+      throw std::runtime_error("npu decoder: unexpected router shape in " + p);
+    }
+    b.router.insert(b.router.end(), shared_gate.begin(), shared_gate.end());
+    b.chosen.assign(c.experts_used, 0);
+  }
+
   // b's chain for `tokens`: out -> ffn_x.D, ffn (residual -> next.H) ->
-  // ffn_y, down -> next.D, then `next` with its own buffers.
+  // ffn_y, down -> next.D, then `next` with its own buffers. MoE: out alone
+  // in mixer_out, and the gathers in place of ffn and down.
   void WireBlock(Block& b, Buffer& next_x, int tokens, Q4nxGemv& next,
                  Buffer& next_y, Buffer& next_r) {
     Buffer& ffn_d = b.views.emplace_back(b.ffn_x->Sub(kD, kSlottedBytes));
@@ -161,29 +277,40 @@ struct NpuDecoder::Impl {
     Buffer& next_d = b.views.emplace_back(next_x.Sub(kD, kSlottedBytes));
     auto& chain = b.chain[tokens - 1];
     chain = std::make_unique<Chain>(runtime);
-    chain->Add(*b.out, *b.out_x, ffn_d, *scratch, tokens);
-    chain->Add(*b.ffn, *b.ffn_x, *b.ffn_y, next_h, tokens);
-    chain->Add(*b.down, *b.ffn_y, next_d, *scratch, tokens);
+    if (b.gate_up) {
+      auto& out = b.mixer_out[tokens - 1];
+      out = std::make_unique<Chain>(runtime);
+      out->Add(*b.out, *b.out_x, ffn_d, *scratch, tokens);
+      chain->Add(*b.gate_up, *b.ffn_x, *b.arena, *b.ffn_y, next_h);
+      chain->Add(*b.gather_down, *b.ffn_y, *b.arena, next_d, *scratch);
+    } else {
+      chain->Add(*b.out, *b.out_x, ffn_d, *scratch, tokens);
+      chain->Add(*b.ffn, *b.ffn_x, *b.ffn_y, next_h, tokens);
+      chain->Add(*b.down, *b.ffn_y, next_d, *scratch, tokens);
+    }
     chain->Add(next, next_x, next_y, next_r, tokens);
   }
 
   Impl(const gguf::File& file, const std::filesystem::path& kernel_dir)
-      : config(RequireDenseTied(ReadConfig(file), "qwen35 NpuDecoder")),
+      : config(CheckShapes(ReadConfig(file))),
         mixer(file),
-        runtime(kernel_dir) {
+        // The gathers rewrite their instruction streams per call. Dense
+        // models keep the ELF flow, ~2% faster on Qwen3.5-2B decode.
+        runtime(kernel_dir, config.IsMoe() ? npu::Flow::kInstructionBuffer
+                                           : npu::Flow::kElf),
+        // MoE gathers are built for one token per call.
+        max_tokens(config.IsMoe() ? 1 : kMaxTokens) {
     const Config& c = config;
-    if (static_cast<std::size_t>(c.hidden) != npu::kGemvHidden) {
-      throw std::runtime_error("npu decoder: hidden size must be " +
-                               std::to_string(npu::kGemvHidden));
-    }
     const auto hidden = static_cast<std::size_t>(c.hidden);
     embed = &file.Tensor("token_embd.weight");
     scratch = std::make_unique<Buffer>(runtime, npu::kGemvResidualBytes);
     for (int il = 0; il < c.layers; ++il) {
       layers.push_back(MakeBlock(file, il));
     }
+    const auto& head =
+        c.tied_embeddings ? *embed : file.Tensor("output.weight");
     lm = std::make_unique<Q4nxGemv>(
-        runtime, q4nx::Pack(embed->type, embed->data, embed->Rows(), hidden),
+        runtime, q4nx::Pack(head.type, head.data, head.Rows(), hidden),
         Prologue::kResNorm, Epilogue::kStore);
     lm_x = std::make_unique<Buffer>(runtime, npu::kGemvInputBytes);
     lm_y = std::make_unique<Buffer>(runtime, lm->y_bytes());
@@ -193,7 +320,7 @@ struct NpuDecoder::Impl {
 
     // Wiring. in_l: residual -> ffn_x.H. out_l: -> ffn_x.D. ffn_l: residual
     // -> next.H. down_l: -> next.D. Layer 0's D stays zero.
-    for (int tokens = 1; tokens <= kMaxTokens; ++tokens) {
+    for (int tokens = 1; tokens <= max_tokens; ++tokens) {
       Block& l0 = layers[0];
       first[tokens - 1] = std::make_unique<Chain>(runtime);
       first[tokens - 1]->Add(
@@ -211,7 +338,8 @@ struct NpuDecoder::Impl {
       }
     }
 
-    if (c.mtp_layers > 0) {
+    // MoE models: no MTP head on the NPU yet (its block is an MoE block too).
+    if (HasMtpLayer(file, c) && !c.IsMoe()) {
       has_mtp = true;
       const std::string p = "blk." + std::to_string(c.layers) + ".";
       enorm = ToFloats(file.Tensor(p + "nextn.enorm.weight"));
@@ -254,10 +382,53 @@ struct NpuDecoder::Impl {
 
     in.resize(kMaxTokens * std::max(StageOutputs(c, Stage::kLinearIn, 0),
                                     StageOutputs(c, Stage::kAttentionIn, 3)));
+    if (c.IsMoe()) {
+      router_logits.resize(static_cast<std::size_t>(c.experts) + 1);
+      route_weights.resize(c.experts_used);
+      mid.resize(hidden);
+    }
     normed.resize(hidden);
     logits.resize(static_cast<std::size_t>(kMaxTokens) * c.vocab);
     one_logits.resize(c.vocab);
     final_hidden.resize(kMaxTokens * hidden);
+  }
+
+  // MoE block b, one token: the router in fp32 on the residual after the
+  // mixer (ffn_x: H + D) as the CPU decoder routes, then the gathers pointed
+  // at the chosen experts and the shared one.
+  void RouteExperts(Block& b) {
+    const auto start = std::chrono::steady_clock::now();
+    const Config& c = config;
+    const int d = c.hidden;
+    Buffer hd = b.ffn_x->Sub(0, kSlotBytes);
+    hd.FromDevice();
+    const float* h = hd.as<float>();
+    for (int i = 0; i < d; ++i) {
+      mid[i] = h[i] + h[d + i];
+    }
+    RmsNorm(mid.data(), b.post_norm.data(), d, c.rms_eps, normed.data());
+    // Router rows, then the shared expert's gate, in chunks across the pool.
+    constexpr std::size_t kRows = 32;
+    const std::size_t rows = router_logits.size();
+    pool.Run((rows + kRows - 1) / kRows, [&](std::size_t job) {
+      const std::size_t end = std::min(rows, (job + 1) * kRows);
+      for (std::size_t r = job * kRows; r < end; ++r) {
+        router_logits[r] = Dot(b.router.data() + r * d, normed.data(), d);
+      }
+    });
+    Route(router_logits.data(), c.experts, c.experts_used, b.chosen.data(),
+          route_weights.data());
+    int ids[npu::kGatherExperts];
+    float scales[npu::kGatherExperts];
+    for (int i = 0; i < c.experts_used; ++i) {
+      ids[i] = b.chosen[i];
+      scales[i] = route_weights[i];
+    }
+    ids[c.experts_used] = c.experts;  // the shared expert's arena slot
+    scales[c.experts_used] = SharedExpertScale(router_logits[c.experts]);
+    b.gate_up->Select(ids, scales);
+    b.gather_down->Select(ids);
+    router_seconds += SecondsSince(start);
   }
 
   void Submit(Chain& chain) {
@@ -358,6 +529,26 @@ double NpuDecoder::cpu_seconds() const {
   return impl_->cpu_seconds;
 }
 
+int NpuDecoder::step_tokens() const {
+  return impl_->max_tokens;
+}
+
+bool NpuDecoder::can_draft() const {
+  return impl_->has_mtp;
+}
+
+const int* NpuDecoder::experts(int layer) const {
+  const auto& chosen = impl_->layers.at(static_cast<std::size_t>(layer)).chosen;
+  if (chosen.empty()) {
+    throw std::logic_error("npu decoder: not an MoE layer");
+  }
+  return chosen.data();
+}
+
+double NpuDecoder::router_seconds() const {
+  return impl_->router_seconds;
+}
+
 const float* NpuDecoder::hidden(int t) const {
   return impl_->final_hidden.data() +
          static_cast<std::size_t>(t) * impl_->config.hidden;
@@ -375,8 +566,10 @@ const float* NpuDecoder::Step(const int* tokens, int count,
   Impl& m = *impl_;
   const Config& c = m.config;
   const int d = c.hidden;
-  if (count < 1 || count > kMaxTokens) {
-    throw std::invalid_argument("npu decoder: 1 or 2 tokens per step");
+  if (count < 1 || count > m.max_tokens) {
+    throw std::invalid_argument("npu decoder: 1 to " +
+                                std::to_string(m.max_tokens) +
+                                " tokens per step for this model");
   }
   {
     Buffer h = m.layers[0].in_x->Sub(kH, kSlottedBytes);
@@ -393,9 +586,13 @@ const float* NpuDecoder::Step(const int* tokens, int count,
   }
   m.Submit(*m.first[count - 1]);
   for (int il = 0; il < c.layers; ++il) {
-    m.Mix(m.layers[il], il, count, state.position, state.layers[il],
-          count == 2);
-    m.Submit(*m.layers[il].chain[count - 1]);
+    auto& layer = m.layers[il];
+    m.Mix(layer, il, count, state.position, state.layers[il], count == 2);
+    if (layer.gate_up) {
+      m.Submit(*layer.mixer_out[count - 1]);
+      m.RouteExperts(layer);
+    }
+    m.Submit(*layer.chain[count - 1]);
   }
   state.position += count;
 
@@ -485,11 +682,6 @@ int Argmax(const float* logits, int vocab) {
   return static_cast<int>(std::max_element(logits, logits + vocab) - logits);
 }
 
-double SecondsSince(std::chrono::steady_clock::time_point start) {
-  return std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
-      .count();
-}
-
 }  // namespace
 
 std::vector<int> SpeculativeGenerate(NpuDecoder& model,
@@ -501,6 +693,11 @@ std::vector<int> SpeculativeGenerate(NpuDecoder& model,
                                      const PromptPrefill& prefill) {
   if (prompt.empty()) {
     throw std::invalid_argument("generate: empty prompt");
+  }
+  if (draft && !model.can_draft()) {
+    throw std::invalid_argument(
+        "generate: this model has no MTP head on the NPU; decode without a "
+        "draft");
   }
   const Config& c = model.config();
   const int vocab = c.vocab;
@@ -522,10 +719,11 @@ std::vector<int> SpeculativeGenerate(NpuDecoder& model,
     return !is_stop(id) && static_cast<int>(out.size()) < max_tokens;
   };
 
-  // Prompt, two tokens per pass (both kept). hidden[p]: final residual after
-  // the token at p, for the MTP cache.
+  // Prompt, step_tokens() tokens per pass (all kept). hidden[p]: final
+  // residual after the token at p, for the MTP cache.
   auto start = std::chrono::steady_clock::now();
   const int n = static_cast<int>(prompt.size());
+  const int per_pass = model.step_tokens();
   std::vector<float> hidden(static_cast<std::size_t>(n) * d);
   const float* logits = nullptr;
   const int prefilled =
@@ -538,8 +736,8 @@ std::vector<int> SpeculativeGenerate(NpuDecoder& model,
                            std::to_string(prefilled) + " of " +
                            std::to_string(n) + " tokens");
   }
-  for (int p = prefilled; p < n; p += 2) {
-    const int count = std::min(2, n - p);
+  for (int p = prefilled; p < n; p += per_pass) {
+    const int count = std::min(per_pass, n - p);
     logits = model.Step(&prompt[p], count, state);
     if (count == 2) {
       model.Resolve(state, true);

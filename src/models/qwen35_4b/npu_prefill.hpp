@@ -6,7 +6,7 @@
 #include "core/gguf.hpp"
 #include "models/qwen35/config.hpp"
 #include "models/qwen35/decoder.hpp"
-#include "models/qwen35/npu_decoder.hpp"
+#include "models/qwen35/generate.hpp"
 #include "models/qwen35_4b/npu_decoder.hpp"
 
 // Qwen3.5-4B prompt processing (prefill) on the NPU, on the 4B's own GEMM
@@ -31,7 +31,7 @@ using qwen35::PromptPrefill;
 class NpuPrefill {
 public:
   // Keeps pointers into `file`, which must outlive it. Loads the 4B's
-  // prefill program from kernel_dir / npu::kKernelSubdir.
+  // prefill program (npu::kPrefillName) from kernel_dir.
   NpuPrefill(const gguf::File& file, const std::filesystem::path& kernel_dir);
   ~NpuPrefill();
   NpuPrefill(const NpuPrefill&) = delete;

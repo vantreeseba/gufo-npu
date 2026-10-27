@@ -2,7 +2,7 @@
 x, for one or two tokens per weight read (two verify a speculative draft).
 
 Copied from kernels/designs/q4nx_gemv.py (Qwen3.5-2B) and built with the 4B's
-geometry (variants.py: hidden 2560, longest input 9216) into its own xclbin,
+geometry (decode_gemv_variants.py: hidden 2560, longest input 9216) into its own xclbin,
 so changes here cannot reach the 2B's NPU program. Differences: the geometry,
 a smaller core stack (the 4B's token buffer is 46 KB), and partial last
 rounds: a hidden-sized output (2560 rows = 2.5 rounds of 1024) runs its last
@@ -41,12 +41,9 @@ Adapted from IRON's iron.operators.flm.lm_head design (Apache-2.0).
 Runtime arguments: X, W (q4nx bytes as uint32), Y (fp32), R (fp32).
 """
 
-import argparse
 import filecmp
-import importlib.util
 from pathlib import Path
 import shutil
-import sys
 
 import numpy as np
 from ml_dtypes import bfloat16
@@ -63,14 +60,8 @@ from aie.utils.compile.utils import compile_mlir_module
 HERE = Path(__file__).resolve().parent
 
 
-def _load_variants():
-    spec = importlib.util.spec_from_file_location("qwen35_4b_variants", HERE / "variants.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+import decode_gemv_variants as V  # noqa: E402 (sibling; build.py puts it on the path)
 
-
-V = _load_variants()
 
 M_TILE, K_TILE, GROUP = 32, 256, 32
 # 4-bit codes, a uint8 sub-scale and int8 sub-minimum per row and 32 inputs,
@@ -437,22 +428,3 @@ def compile_to(out_dir: Path, dev: str) -> None:
             ):
                 raise RuntimeError(f"{name}: core program differs between shapes")
 
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Compile the Qwen3.5-4B decode GEMV.")
-    parser.add_argument("--dev", default="npu2", choices=["npu2"])
-    parser.add_argument("--out", type=Path, required=True)
-    args = parser.parse_args()
-    args.out.mkdir(parents=True, exist_ok=True)
-    compile_to(args.out, args.dev)
-    for output in OUTPUTS:
-        if not (args.out / output).is_file():
-            print(f"FAIL: did not produce {args.out / output}", file=sys.stderr)
-            return 1
-    print(f"compiled {XCLBIN} -> {args.out}")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.dont_write_bytecode = True
-    raise SystemExit(main())

@@ -40,8 +40,8 @@ struct Variant {
   Epilogue epilogue;
 };
 
-// Must match VARIANTS in src/models/qwen35_4b/kernels/variants.py (rows
-// before padding).
+// Must match VARIANTS in src/models/qwen35_4b/kernels/decode_gemv_variants.py
+// (rows before padding).
 constexpr Variant kVariants[] = {
     {4096, 2560, Prologue::kPlain, Epilogue::kStore},
     {5120, 2560, Prologue::kPlain, Epilogue::kStore},
@@ -274,8 +274,7 @@ int main(int argc, char** argv) {
   }
   std::mt19937 rng(1234);
   // Every variant runs in the one hardware context.
-  npu::GemvRuntime runtime(std::filesystem::path(argv[1]) / geo::kKernelSubdir,
-                           geo::DecodeDesign());
+  npu::GemvRuntime runtime(argv[1], npu::Flow::kElf, geo::DecodeDesign());
   std::vector<std::vector<Case>> groups;
   for (const auto& v : kVariants) {
     groups.push_back(Build(runtime, v, rng));

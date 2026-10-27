@@ -1,5 +1,5 @@
 """Qwen3.5-4B's prefill GEMM, a copy of kernels/designs/bfp16_gemm.py (the
-2B's) built with the 4B's shapes (variants.py) into its own xclbin
+2B's) built with the 4B's shapes (prefill_gemm_variants.py) into its own xclbin
 (qwen35_4b_prefill). The core program is the same; only the names and the
 instruction sequences differ.
 
@@ -24,12 +24,9 @@ Runtime arguments: A (bf16, M x K row-major), B (packed bfp16), C (bf16,
 M x N row-major).
 """
 
-import argparse
 import filecmp
-import importlib.util
 from pathlib import Path
 import shutil
-import sys
 
 import aie.iron as iron
 from aie.iron.device import from_name
@@ -41,10 +38,7 @@ from aie.utils.compile.utils import (
 )
 from iron.operators.flm.gemm import design as flm
 
-HERE = Path(__file__).resolve().parent
-_spec = importlib.util.spec_from_file_location("qwen35_4b_variants", HERE / "variants.py")
-V = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(V)
+import prefill_gemm_variants as V  # noqa: E402 (sibling; build.py puts it on the path)
 
 XCLBIN = V.PREFILL_NAME
 TILE_N = 64
@@ -58,7 +52,7 @@ CHUNKS = V.PREFILL_CHUNKS
 SHAPES = V.PREFILL_SHAPES
 sequence_name = V.prefill_sequence_name
 _sequences = V.prefill_sequences
-OUTPUTS = V.PREFILL_OUTPUTS
+OUTPUTS = V.OUTPUTS
 
 
 def _kernel(tile_ma):
@@ -148,22 +142,3 @@ def compile_to(out_dir: Path, dev: str) -> None:
             ):
                 raise RuntimeError(f"{name}: core program differs between shapes")
 
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Compile the Qwen3.5-4B prefill GEMM.")
-    parser.add_argument("--dev", default="npu2", choices=["npu2"])
-    parser.add_argument("--out", type=Path, required=True)
-    args = parser.parse_args()
-    args.out.mkdir(parents=True, exist_ok=True)
-    compile_to(args.out, args.dev)
-    for output in OUTPUTS:
-        if not (args.out / output).is_file():
-            print(f"FAIL: did not produce {args.out / output}", file=sys.stderr)
-            return 1
-    print(f"compiled {XCLBIN} -> {args.out}")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.dont_write_bytecode = True
-    raise SystemExit(main())

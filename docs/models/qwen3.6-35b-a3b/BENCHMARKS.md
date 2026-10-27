@@ -5,11 +5,72 @@ xdna-driver 2.26, NPU runtime power control `auto`.
 
 ## Targets
 
-| | FastFlowLM (measured below) | MVP target | Ceiling |
-|---|---|---|---|
-| Decode, 1k context | 16.9 tok/s | ≥ 22 tok/s | ~33 tok/s (56 GB/s NPU read ÷ 1.69 GB per token with every matrix in q4nx) |
-| Prefill, 2k | ~178 tok/s | ≥ 400 tok/s | |
-| TTFT, 35-token prompt | 3.48 s | < 1 s | |
+| | FastFlowLM (measured below) | gufo-npu NPU (below) | MVP target | Ceiling |
+|---|---|---|---|---|
+| Decode, 1k context | 16.9 tok/s | 19.8 tok/s | ≥ 22 tok/s | ~33 tok/s (56 GB/s NPU read ÷ 1.69 GB per token with every matrix in q4nx) |
+| Prefill, 2k | ~178 tok/s | ~20 tok/s (no prefill yet: one token per pass) | ≥ 400 tok/s | |
+| TTFT, 35-token prompt | 3.48 s | 1.4 s (24 tokens) | < 1 s | |
+
+## NPU decode
+
+`generate --device npu` (`NpuDecoder`): every matrix in q4nx on the NPU
+(1.69 GB read per token), each layer's 256 experts and its shared expert in
+one device arena read through two gathers (`npu::Q4nxGather`), the mixers
+and the router on the CPU, instruction-buffer flow. Per layer: the mixer's
+output projection (one submission), routing on the CPU, then the gate + up
+and down gathers chained with the next layer's input projection (a second
+submission): 81 submissions per token. One token per pass, prompt included;
+no MTP yet.
+
+Sweep, 2026-10-27: release build, greedy, `--draft none`, 128
+tokens at most, three runs each after a warm-up run, short and ~1k prompts
+interleaved, the GGUF in page cache. Each run loads the model anew.
+
+| Prompt | Run 1 | Run 2 | Run 3 | Prompt time |
+|---|---|---|---|---|
+| Sky (24 tokens), decode | 18.59 tok/s | 20.17 | 20.30 | 1.31–1.48 s |
+| Lighthouse story ×4 + question (942 tokens), decode | 19.79 tok/s | 19.75 | 19.85 | 47.4–49.1 s |
+
+- Against FLM on the same box: decode **19.8–20.3 tok/s against 16.9–17.1**
+  (+17–19%), TTFT 1.4 s against 3.49 s for short prompts. Long prompts are
+  far slower than FLM's (48 s against 8.75 s at ~1k tokens), since they run
+  one token per pass at decode speed; that needs the MoE prefill.
+- Against the CPU decoder (23.0 tok/s, below): 12–14% slower; the NPU path
+  reads 1.69 GB per token where the CPU reads the GGUF's 2.75 GB, but the
+  NPU reads at most ~56 GB/s.
+- Run 1 of the short prompt (18.6) was slower than runs 2 and 3; other CPU
+  jobs were running on the box during the sweep.
+- Output: the short reply is the same text in every run (one hash), and
+  reads correctly ("The sky appears blue because of a phenomenon called
+  Rayleigh scattering…").
+
+Where a token's ~49.5 ms go (short prompt, run 3: 121 steps): waiting on
+the NPU 45.6 ms (including ~81 submission round trips), CPU mixers 3.0 ms,
+routing 1.9 ms (router dot products ~34 µs per layer on a 7-worker pool,
+patching both gathers ~10 µs per layer). At ~1k context the mixers take
+3.8 ms per step (attention over the cache).
+
+`gufo-npu bench gemv` on the GGUF (calls one at a time, so each includes a
+submission's ~60–75 µs; mean µs over 200 warm calls, two runs agree within
+3%):
+
+| Stage | Rows | MB | 1 token µs | 2 tokens µs | GB/s (1) | Per token |
+|---|---|---|---|---|---|---|
+| DeltaNet in (qkv + z) | 12,288 | 14.5 | 359 | 372 | 40.5 | × 30 |
+| Attention in (q + gate, k, v) | 9,216 | 10.9 | 290 | 305 | 37.6 | × 10 |
+| Mixer out (ssm_out, attn_output) | 2,048 | 4.8 | 173 | 181 | 28.0 | × 40 |
+| MoE FFN (gate + up and down gathers, 9 experts) | 9,216 | 16.4 | 464 | 481 | 35.3 | × 40 |
+| LM head (output) | 248,320 | 294.6 | 5,361 | 5,382 | 55.0 | × 1 |
+
+Summed per token that is ~44.5 ms, close to the 45.6 ms measured in the
+decoder (chained calls skip some of each call's fixed cost; the CPU work
+between submissions adds it back). The gathers and the small mixer output
+projection run well below the 56 GB/s read ceiling: per-call fixed cost.
+
+Memory: device buffers 18.9 GiB (the 40 expert arenas, 467 MB each, are
+18.7 GB; the dense matrices ~1 GB), anonymous memory ~0.6 GB, and up to
+~20 GB of the memory-mapped GGUF in page cache while loading. Loading
+(packing every matrix to q4nx, Q4_K experts code for code) takes 19.8–24 s.
 
 ## FastFlowLM baseline
 

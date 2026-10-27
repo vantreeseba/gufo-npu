@@ -11,17 +11,21 @@ namespace {
 }  // namespace
 
 std::string Q4nxGemvSequence(std::size_t dim, std::size_t padded_rows, Prologue,
-                             Epilogue, std::size_t, const std::string& design) {
+                             Epilogue, std::size_t tokens,
+                             const std::string& design) {
   return design + "_k" + std::to_string(dim) + "_n" +
-         std::to_string(padded_rows);
+         std::to_string(padded_rows) + "_t" + std::to_string(tokens);
 }
 
 struct GemvRuntime::Impl {};
-GemvRuntime::GemvRuntime(const std::filesystem::path&, GemvDesign design)
+GemvRuntime::GemvRuntime(const std::filesystem::path&, Flow, GemvDesign design)
     : design_(std::move(design)) {
   NoXrt();
 }
 GemvRuntime::~GemvRuntime() = default;
+Flow GemvRuntime::flow() const {
+  return Flow::kElf;
+}
 
 struct Buffer::Impl {};
 Buffer::Buffer(GemvRuntime&, std::size_t) {
@@ -61,12 +65,26 @@ std::size_t Q4nxGemv::y_bytes() const {
   return 0;
 }
 
+struct Q4nxGather::Impl {};
+Q4nxGather::Q4nxGather(GemvRuntime&, Kind, const ExpertArena&, std::size_t) {
+  NoXrt();
+}
+Q4nxGather::~Q4nxGather() = default;
+void Q4nxGather::Select(const int*, const float*) {}
+std::size_t Q4nxGather::y_bytes() const {
+  return 0;
+}
+std::size_t Q4nxGather::tokens() const {
+  return 0;
+}
+
 struct Chain::Impl {};
 Chain::Chain(GemvRuntime&) {
   NoXrt();
 }
 Chain::~Chain() = default;
 void Chain::Add(Q4nxGemv&, Buffer&, Buffer&, Buffer&, std::size_t) {}
+void Chain::Add(Q4nxGather&, Buffer&, Buffer&, Buffer&, Buffer&) {}
 void Chain::Run() {}
 
 }  // namespace gufo_npu::npu

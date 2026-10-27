@@ -519,8 +519,7 @@ struct NpuPrefill::Impl {
   }
 
   Impl(const gguf::File& file, const std::filesystem::path& kernel_dir)
-      : config(ReadConfig(file)),
-        runtime(kernel_dir / npu::kKernelSubdir, npu::kPrefillName) {
+      : config(ReadConfig(file)), runtime(kernel_dir, npu::kPrefillName) {
     const Config& cfg = config;
     if (cfg.experts != 0 || !cfg.tied_embeddings) {
       throw std::runtime_error(

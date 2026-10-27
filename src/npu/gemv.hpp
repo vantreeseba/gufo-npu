@@ -12,7 +12,8 @@
 // output stage, 1 or 2 tokens). A Q4nxGemv keeps one matrix resident on the
 // device; its calls read and write device Buffers, so the output of one call
 // can be the input region of the next and a Chain can run them back to back.
-// A two-token call reads the weights once for both tokens.
+// A two-token call reads the weights once for both tokens. A Q4nxGather runs
+// MoE experts chosen per call from an ExpertArena.
 namespace gufo_npu::npu {
 
 // The longest input, in values.
@@ -74,16 +75,24 @@ std::string Q4nxGemvSequence(std::size_t dim, std::size_t padded_rows,
                              std::size_t tokens,
                              const std::string& design = "q4nx_gemv");
 
+// How a runtime's calls reach the NPU. kElf runs each variant's instruction
+// ELF. kInstructionBuffer passes the variant's instruction words in a host
+// buffer, which the host can rewrite between calls; Q4nxGather needs it.
+// Runs of the two flows cannot share a Chain, so one runtime uses one.
+enum class Flow { kElf, kInstructionBuffer };
+
 class GemvRuntime {
 public:
-  // Loads <design.name>.xclbin from `kernel_dir`. Throws when it is missing
-  // or the NPU cannot be opened.
+  // Loads <design.name>.xclbin from `kernel_dir` (the default design is
+  // q4nx_gemv, Qwen3.5-2B's). Throws when it is missing or the NPU cannot be
+  // opened.
   explicit GemvRuntime(const std::filesystem::path& kernel_dir,
-                       GemvDesign design = {});
+                       Flow flow = Flow::kElf, GemvDesign design = {});
   ~GemvRuntime();
   GemvRuntime(const GemvRuntime&) = delete;
   GemvRuntime& operator=(const GemvRuntime&) = delete;
 
+  Flow flow() const;
   const GemvDesign& design() const { return design_; }
 
   struct Impl;
@@ -175,6 +184,67 @@ private:
   Epilogue epilogue_ = Epilogue::kStore;
 };
 
+// Experts in a gather call (8 routed and the shared one) and an expert's
+// FFN width: kernels/designs/q4nx_gemv.py MOE_VARIANTS.
+inline constexpr std::size_t kGatherExperts = 9;
+inline constexpr std::size_t kExpertFfn = 512;
+
+// One MoE layer's experts, packed for Q4nxGather in one device buffer:
+// expert e's gate + up (2 * kExpertFfn rows in q4nx::SwiGluOrder, kGemvHidden
+// inputs) at UpOffset(e), its down (kGemvHidden rows, kExpertFfn inputs) at
+// DownOffset(e).
+struct ExpertArena {
+  // q4nx bytes of one expert's gate + up and of its down.
+  static constexpr std::size_t kUpBytes = 2 * kExpertFfn / q4nx::kMTile *
+                                          (kGemvHidden / q4nx::kKTile) *
+                                          q4nx::kBlockBytes;
+  static constexpr std::size_t kDownBytes = kGemvHidden / q4nx::kMTile *
+                                            (kExpertFfn / q4nx::kKTile) *
+                                            q4nx::kBlockBytes;
+
+  std::size_t experts = 0;
+
+  std::size_t UpOffset(std::size_t e) const { return e * kUpBytes; }
+  std::size_t DownOffset(std::size_t e) const {
+    return experts * kUpBytes + e * kDownBytes;
+  }
+  std::size_t bytes() const { return experts * (kUpBytes + kDownBytes); }
+};
+
+// A call over kGatherExperts experts of an ExpertArena chosen per call: the
+// weight addresses (and scales) are rewritten in the call's own instruction
+// stream by Select(). Needs a runtime with Flow::kInstructionBuffer.
+//   kGateUp  resnorm input (as a Q4nxGemv's) -> per chosen expert i,
+//            silu(gate) * up * scale as compact bf16, expert i's kExpertFfn
+//            values at i * kExpertFfn; the residual like any resnorm call.
+//   kDown    that output (act input) -> the sum over the chosen experts of
+//            down x, as a store of kGemvHidden fp32 per token (slotted).
+class Q4nxGather {
+public:
+  enum class Kind { kGateUp, kDown };
+
+  Q4nxGather(GemvRuntime& runtime, Kind kind, const ExpertArena& arena,
+             std::size_t tokens = 1);
+  ~Q4nxGather();
+  Q4nxGather(const Q4nxGather&) = delete;
+  Q4nxGather& operator=(const Q4nxGather&) = delete;
+
+  // Points the call at arena experts ids[0..kGatherExperts); for kGateUp,
+  // scales[i * tokens + t] scales expert i's output for token t. Takes
+  // effect at the next run of a chain holding this call.
+  void Select(const int* ids, const float* scales = nullptr);
+
+  // Bytes the y buffer must span.
+  std::size_t y_bytes() const;
+  std::size_t tokens() const;
+
+  struct Impl;
+  Impl& impl() { return *impl_; }
+
+private:
+  std::unique_ptr<Impl> impl_;
+};
+
 // Calls submitted together and run back to back (an XRT runlist).
 class Chain {
 public:
@@ -186,6 +256,9 @@ public:
   // The buffers must outlive the chain.
   void Add(Q4nxGemv& gemv, Buffer& x, Buffer& y, Buffer& residual,
            std::size_t tokens = 1);
+  // A gather over the experts in `arena` (an ExpertArena's bytes).
+  void Add(Q4nxGather& gather, Buffer& x, Buffer& arena, Buffer& y,
+           Buffer& residual);
   // Runs every call in order and waits for the last.
   void Run();
 
