@@ -55,8 +55,11 @@ public:
 
   // Runs `count` (1 or 2) tokens from state.position in one pass. Returns the
   // logits of token t at t * vocab. With count 2 the second token stays
-  // speculative until Resolve().
-  const float* Step(const int* tokens, int count, DecodeState& state);
+  // speculative until Resolve(). Without `logits` (prompt passes whose
+  // logits nobody reads) the LM head is skipped and it returns nullptr;
+  // hidden() is set either way.
+  const float* Step(const int* tokens, int count, DecodeState& state,
+                    bool logits = true);
   // After a 2-token Step: keep the second token, or roll the state back to
   // just after the first.
   void Resolve(DecodeState& state, bool keep_second);

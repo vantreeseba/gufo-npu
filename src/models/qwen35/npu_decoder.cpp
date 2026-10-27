@@ -125,6 +125,10 @@ struct NpuDecoder::Impl {
     std::unique_ptr<Chain> chain[kMaxTokens];
     std::unique_ptr<Chain> mixer_out[kMaxTokens];
     std::vector<std::unique_ptr<Chain>> moe[kMaxTokens];
+    // The last block's chains without the LM head after them (prompt
+    // passes whose logits nobody reads); the residual stays in lm_x.
+    std::unique_ptr<Chain> bare_chain[kMaxTokens];
+    std::vector<std::unique_ptr<Chain>> bare_moe[kMaxTokens];
   };
 
   // MoE gathers per token count and expert count (n - kGatherExperts): one
@@ -280,44 +284,54 @@ struct NpuDecoder::Impl {
   // b's chain for `tokens`: out -> ffn_x.D, ffn (residual -> next.H) ->
   // ffn_y, down -> next.D, then `next` with its own buffers. MoE: out alone
   // in mixer_out, and the gathers in place of ffn and down.
+  // With `bare`, the chains go to bare_chain / bare_moe and stop before
+  // `next` (which must still be given: its input region gets the residual).
   void WireBlock(Block& b, Buffer& next_x, int tokens, Q4nxGemv& next,
-                 Buffer& next_y, Buffer& next_r) {
+                 Buffer& next_y, Buffer& next_r, bool bare = false) {
     Buffer& ffn_d = b.views.emplace_back(b.ffn_x->Sub(kD, kSlottedBytes));
     Buffer& next_h = b.views.emplace_back(next_x.Sub(kH, kSlottedBytes));
     Buffer& next_d = b.views.emplace_back(next_x.Sub(kD, kSlottedBytes));
-    auto& chain = b.chain[tokens - 1];
+    auto& chain = bare ? b.bare_chain[tokens - 1] : b.chain[tokens - 1];
     chain = std::make_unique<Chain>(runtime);
     if (b.arena) {
       chain.reset();
-      auto& out = b.mixer_out[tokens - 1];
-      out = std::make_unique<Chain>(runtime);
-      out->Add(*b.out, *b.out_x, ffn_d, *scratch, tokens);
-      auto& chains = b.moe[tokens - 1];
+      if (!bare) {
+        auto& out = b.mixer_out[tokens - 1];
+        out = std::make_unique<Chain>(runtime);
+        out->Add(*b.out, *b.out_x, ffn_d, *scratch, tokens);
+      }
+      auto& chains = bare ? b.bare_moe[tokens - 1] : b.moe[tokens - 1];
       chains.clear();
       for (auto& g : gathers[tokens - 1]) {
         auto& moe = chains.emplace_back(std::make_unique<Chain>(runtime));
         moe->Add(*g.gate_up, *b.ffn_x, *b.arena, *b.ffn_y, next_h);
         moe->Add(*g.down, *b.ffn_y, *b.arena, next_d, *scratch);
-        moe->Add(next, next_x, next_y, next_r, tokens);
+        if (!bare) {
+          moe->Add(next, next_x, next_y, next_r, tokens);
+        }
       }
       return;
     }
     chain->Add(*b.out, *b.out_x, ffn_d, *scratch, tokens);
     chain->Add(*b.ffn, *b.ffn_x, *b.ffn_y, next_h, tokens);
     chain->Add(*b.down, *b.ffn_y, next_d, *scratch, tokens);
-    chain->Add(next, next_x, next_y, next_r, tokens);
+    if (!bare) {
+      chain->Add(next, next_x, next_y, next_r, tokens);
+    }
   }
 
   // Runs block b's FFN for `count` tokens and the call chained after it (the
   // next block's input projection, or an LM head): the chain, or for MoE the
   // mixer's output projection, routing, then the gathers.
-  void SubmitFfn(Block& b, int count) {
+  // With `bare`, the last block's chains without the LM head.
+  void SubmitFfn(Block& b, int count, bool bare = false) {
     if (!b.arena) {
-      Submit(*b.chain[count - 1]);
+      Submit(bare ? *b.bare_chain[count - 1] : *b.chain[count - 1]);
       return;
     }
     Submit(*b.mixer_out[count - 1]);
-    Submit(*b.moe[count - 1][RouteExperts(b, count)]);
+    const std::size_t n = RouteExperts(b, count);
+    Submit(bare ? *b.bare_moe[count - 1][n] : *b.moe[count - 1][n]);
   }
 
   Impl(const gguf::File& file, const std::filesystem::path& kernel_dir)
@@ -377,6 +391,7 @@ struct NpuDecoder::Impl {
         Block& l = layers[il];
         if (il + 1 == c.layers) {
           WireBlock(l, *lm_x, tokens, *lm, *lm_y, *lm_r);
+          WireBlock(l, *lm_x, tokens, *lm, *lm_y, *lm_r, true);
         } else {
           Block& n = layers[il + 1];
           Buffer& n_res = n.views.emplace_back(n.ffn_x->Sub(kH, kSlottedBytes));
@@ -629,8 +644,8 @@ const std::vector<float>& NpuDecoder::Step(int token, DecodeState& state) {
   return impl_->one_logits;
 }
 
-const float* NpuDecoder::Step(const int* tokens, int count,
-                              DecodeState& state) {
+const float* NpuDecoder::Step(const int* tokens, int count, DecodeState& state,
+                              bool logits) {
   Impl& m = *impl_;
   const Config& c = m.config;
   const int d = c.hidden;
@@ -654,10 +669,23 @@ const float* NpuDecoder::Step(const int* tokens, int count,
   for (int il = 0; il < c.layers; ++il) {
     auto& layer = m.layers[il];
     m.Mix(layer, il, count, state.position, state.layers[il], count == 2);
-    m.SubmitFfn(layer, count);
+    m.SubmitFfn(layer, count, !logits && il + 1 == c.layers);
   }
   state.position += count;
 
+  if (!logits) {
+    // The final residual H + D from the LM head's input region, the same
+    // fp32 sum its input stage writes to lm_r.
+    m.lm_x->FromDevice();
+    for (int t = 0; t < count; ++t) {
+      const float* slot = m.lm_x->as<float>() + t * npu::kGemvSlot;
+      float* out = m.final_hidden.data() + static_cast<std::size_t>(t) * d;
+      for (int i = 0; i < d; ++i) {
+        out[i] = slot[i] + slot[npu::kGemvHidden + i];
+      }
+    }
+    return nullptr;
+  }
   m.lm_y->FromDevice();
   m.lm_r->FromDevice();
   for (int t = 0; t < count; ++t) {
@@ -799,14 +827,18 @@ std::vector<int> SpeculativeGenerate(NpuDecoder& model,
   }
   for (int p = prefilled; p < n; p += 2) {
     const int count = std::min(2, n - p);
-    logits = model.Step(&prompt[p], count, state);
+    // Only the last pass's logits are read: the others skip the LM head.
+    const bool last = p + count == n;
+    logits = model.Step(&prompt[p], count, state, last);
     if (count == 2) {
       model.Resolve(state, true);
     }
     for (int t = 0; t < count; ++t) {
       std::copy_n(model.hidden(t), d, hidden.data() + (p + t) * d);
     }
-    logits += static_cast<std::size_t>(count - 1) * vocab;
+    if (last) {
+      logits += static_cast<std::size_t>(count - 1) * vocab;
+    }
   }
   int y1 = Argmax(logits, vocab);
   int y2 = -1;
