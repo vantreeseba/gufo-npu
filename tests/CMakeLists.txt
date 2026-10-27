@@ -136,4 +136,11 @@ if(GUFO_NPU_ENABLE_XRT AND GUFO_NPU_BUILD_KERNELS)
            COMMAND q4nx_gemv_chain_test "${CMAKE_BINARY_DIR}/kernels")
   set_tests_properties(q4nx_gemv_chain_test PROPERTIES LABELS npu
                        SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+  add_executable(q4nx_moe_chain_test npu/q4nx_moe_chain_test.cpp)
+  target_link_libraries(q4nx_moe_chain_test PRIVATE gufo_npu_runtime)
+  add_test(NAME q4nx_moe_chain_test
+           COMMAND q4nx_moe_chain_test "${CMAKE_BINARY_DIR}/kernels")
+  set_tests_properties(q4nx_moe_chain_test PROPERTIES LABELS npu
+                       SKIP_RETURN_CODE 77 TIMEOUT 600)
 endif()

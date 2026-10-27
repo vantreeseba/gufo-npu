@@ -125,6 +125,11 @@ VARIANTS = [
     # Qwen3.6-35B-A3B MoE, one expert per call: gate + up and down.
     (2048, 1024, "resnorm", "swiglu", MAX_DIM // 2),
     (512, 2048, "act", "store", SLOT),
+    # Qwen3.6-35B-A3B input projections: DeltaNet (qkv + z), attention
+    # (q + gate, k, v). Its mixer outputs (4096 -> 2048) and LM head
+    # (248,320 rows) use the shapes above.
+    (2048, 12288, "resnorm", "store", 12288),
+    (2048, 9216, "resnorm", "store", 9216),
 ]
 
 # MoE gathers as (dim, rows, input, output, Y token stride, gather, experts):
@@ -148,10 +153,12 @@ def _sequences():
             yield (dim, rows, prologue, epilogue, y_stride, tokens, gather, experts)
 
 
-# build.py checks these: the xclbin, then one instruction ELF per variant.
+# build.py checks these: the xclbin, then per variant an instruction ELF and
+# the raw instruction words (the host's instruction-buffer flow).
 OUTPUTS = [f"{XCLBIN}.xclbin"] + [
-    f"{sequence_name(d, n, p, e, t, g, x)}.insts.elf"
+    f"{sequence_name(d, n, p, e, t, g, x)}.insts.{suffix}"
     for d, n, p, e, _, t, g, x in _sequences()
+    for suffix in ("elf", "bin")
 ]
 
 

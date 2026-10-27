@@ -41,28 +41,66 @@ std::string Q4nxGemvSequence(std::size_t dim, std::size_t padded_rows,
 
 struct GemvRuntime::Impl {
   std::filesystem::path dir;
+  Flow flow;
   HwContext hw;
+  // The kernel of the instruction-buffer flow.
+  std::optional<xrt::kernel> kernel;
   std::map<std::string, std::unique_ptr<Sequence>> sequences;
+  // Instruction-buffer flow: one buffer per variant, shared by its calls.
+  std::map<std::string, std::unique_ptr<InstrSequence>> instructions;
 
-  explicit Impl(const std::filesystem::path& d) : dir(d), hw(d, "q4nx_gemv") {}
-
-  Sequence& Get(const std::string& name) {
-    auto& slot = sequences[name];
-    if (!slot) {
-      if (!std::filesystem::exists(dir / (name + ".insts.elf"))) {
-        throw std::runtime_error("no q4nx GEMV sequence " + name + " in " +
-                                 dir.string());
-      }
-      slot = std::make_unique<Sequence>(hw, dir, name);
+  Impl(const std::filesystem::path& d, Flow f)
+      : dir(d), flow(f), hw(d, "q4nx_gemv") {
+    if (flow == Flow::kInstructionBuffer) {
+      kernel.emplace(*hw.context, hw.kernel_name);
     }
-    return *slot;
+  }
+
+  std::filesystem::path Path(const std::string& name, const char* suffix) {
+    auto path = dir / (name + suffix);
+    if (!std::filesystem::exists(path)) {
+      throw std::runtime_error("no q4nx GEMV sequence " + name + " in " +
+                               dir.string());
+    }
+    return path;
+  }
+
+  // Loads variant `name` for this runtime's flow; throws when it was not
+  // compiled.
+  void Require(const std::string& name) {
+    if (flow == Flow::kElf) {
+      auto& slot = sequences[name];
+      if (!slot) {
+        Path(name, ".insts.elf");
+        slot = std::make_unique<Sequence>(hw, dir, name);
+      }
+    } else {
+      auto& slot = instructions[name];
+      if (!slot) {
+        slot = std::make_unique<InstrSequence>(hw, *kernel,
+                                               Path(name, ".insts.bin"));
+      }
+    }
+  }
+
+  // A run of variant `name` (Require()d) on `args`.
+  xrt::run Run(const std::string& name,
+               std::initializer_list<const xrt::bo*> args) {
+    if (flow == Flow::kElf) {
+      return sequences.at(name)->Run(args);
+    }
+    return instructions.at(name)->Run(*kernel, args);
   }
 };
 
-GemvRuntime::GemvRuntime(const std::filesystem::path& kernel_dir)
-    : impl_(std::make_unique<Impl>(kernel_dir)) {}
+GemvRuntime::GemvRuntime(const std::filesystem::path& kernel_dir, Flow flow)
+    : impl_(std::make_unique<Impl>(kernel_dir, flow)) {}
 
 GemvRuntime::~GemvRuntime() = default;
+
+Flow GemvRuntime::flow() const {
+  return impl_->flow;
+}
 
 struct Buffer::Impl {
   xrt::bo bo;
@@ -109,7 +147,8 @@ void Buffer::FromDevice() {
 }
 
 struct Q4nxGemv::Impl {
-  Sequence* sequences[kGemvTokens];
+  GemvRuntime::Impl& rt;
+  std::string sequences[kGemvTokens];
   std::size_t w_bytes;
   xrt::bo w;
   // Buffers of the host-memory convenience Run.
@@ -118,11 +157,11 @@ struct Q4nxGemv::Impl {
   std::optional<Buffer> residual;
   std::optional<xrt::run> run;
 
-  Impl(GemvRuntime::Impl& rt, const q4nx::Matrix& m, Prologue p, Epilogue e)
-      : w_bytes(m.bytes.size()), w(rt.hw.Buffer(w_bytes)) {
+  Impl(GemvRuntime::Impl& r, const q4nx::Matrix& m, Prologue p, Epilogue e)
+      : rt(r), w_bytes(m.bytes.size()), w(rt.hw.Buffer(w_bytes)) {
     for (std::size_t t = 0; t < kGemvTokens; ++t) {
-      sequences[t] =
-          &rt.Get(Q4nxGemvSequence(m.dim, m.padded_rows, p, e, t + 1));
+      sequences[t] = Q4nxGemvSequence(m.dim, m.padded_rows, p, e, t + 1);
+      rt.Require(sequences[t]);
     }
     std::memcpy(w.map<void*>(), m.bytes.data(), w_bytes);
     w.sync(XCL_BO_SYNC_BO_TO_DEVICE);
@@ -133,8 +172,8 @@ struct Q4nxGemv::Impl {
     if (tokens < 1 || tokens > kGemvTokens) {
       throw std::invalid_argument("q4nx GEMV: 1 or 2 tokens per call");
     }
-    return sequences[tokens - 1]->Run(
-        {&x_buf.impl().bo, &w, &y_buf.impl().bo, &r_buf.impl().bo});
+    return rt.Run(sequences[tokens - 1],
+                  {&x_buf.impl().bo, &w, &y_buf.impl().bo, &r_buf.impl().bo});
   }
 };
 
@@ -222,6 +261,210 @@ std::size_t Q4nxGemv::weight_bytes() const {
   return impl_->w_bytes;
 }
 
+namespace {
+
+// Word positions of the DDR address patches (opcode 0x81) of buffer argument
+// `arg` in an instruction stream, in stream order (aie/Runtime/TxnEncoding.h).
+std::vector<std::size_t> PatchSites(const std::vector<std::uint32_t>& w,
+                                    std::uint32_t arg) {
+  std::vector<std::size_t> sites;
+  std::size_t pos = 4;  // after the header
+  while (pos < w.size()) {
+    const std::uint32_t op = w[pos] & 0xFF;
+    std::size_t len = 0;
+    if (op == 0) {
+      len = 6;  // write32
+    } else if (op == 3 || op == 4) {
+      len = 7;  // maskwrite32, maskpoll32
+    } else if (op == 1) {
+      len = w[pos + 3] / 4;  // blockwrite
+    } else if (op == 0x80 || op == 0x81) {
+      len = w[pos + 1] / 4;  // tct, ddr patch
+    } else {
+      throw std::runtime_error("q4nx gather: unexpected instruction opcode " +
+                               std::to_string(op));
+    }
+    if (len == 0) {
+      throw std::runtime_error("q4nx gather: malformed instruction stream");
+    }
+    if (op == 0x81 && w[pos + 8] == arg) {
+      sites.push_back(pos);
+    }
+    pos += len;
+  }
+  return sites;
+}
+
+std::uint64_t PatchOffset(const std::vector<std::uint32_t>& w,
+                          std::size_t site) {
+  return w[site + 10] | (std::uint64_t{w[site + 11]} << 32);
+}
+
+void SetPatchOffset(std::vector<std::uint32_t>& w, std::size_t site,
+                    std::uint64_t offset) {
+  w[site + 10] = static_cast<std::uint32_t>(offset);
+  w[site + 11] = static_cast<std::uint32_t>(offset >> 32);
+}
+
+// The design's placeholder scale words, SCALE_SENTINEL + round * TOKENS +
+// token: NaN payloads that no other instruction word carries.
+constexpr std::uint32_t kScaleSentinel = 0x7FA50000;
+// The weight argument of the design's (X, W, Y, R).
+constexpr std::uint32_t kWeightArg = 1;
+constexpr std::size_t kArrayCores = q4nx::kCols * q4nx::kRows;
+// Output rounds of a down gather (kGemvHidden rows).
+constexpr std::size_t kDownRounds = kGemvHidden / q4nx::kOutPerRound;
+
+std::string GatherSequence(Q4nxGather::Kind kind, std::size_t tokens) {
+  const std::string experts = std::to_string(kGatherExperts);
+  const std::string t = "_t" + std::to_string(tokens);
+  if (kind == Q4nxGather::Kind::kGateUp) {
+    return "q4nx_gemv_k" + std::to_string(kGemvHidden) + "_n" +
+           std::to_string(kGatherExperts * q4nx::kOutPerRound) +
+           "_resnorm_swiglu_scaled_rounds" + experts + t;
+  }
+  return "q4nx_gemv_k" + std::to_string(kGatherExperts * kExpertFfn) + "_n" +
+         std::to_string(kGemvHidden) + "_act_store_k" + experts + t;
+}
+
+}  // namespace
+
+struct Q4nxGather::Impl {
+  GemvRuntime::Impl& rt;
+  Kind kind;
+  ExpertArena arena;
+  std::size_t tokens;
+  std::unique_ptr<InstrSequence> instructions;
+  // A weight patch: the expert slot (index into Select's ids) it reads and
+  // its offset inside that expert's matrix.
+  struct Site {
+    std::size_t word;
+    std::size_t expert;
+    std::uint64_t offset;
+  };
+  std::vector<Site> sites;
+  // A scale word (gate + up): its expert slot and token.
+  struct Scale {
+    std::size_t word;
+    std::size_t expert;
+    std::size_t token;
+  };
+  std::vector<Scale> scales;
+
+  Impl(GemvRuntime::Impl& r, Kind k, const ExpertArena& a, std::size_t t)
+      : rt(r), kind(k), arena(a), tokens(t) {
+    if (rt.flow != Flow::kInstructionBuffer) {
+      throw std::logic_error(
+          "q4nx gather: needs a runtime with the instruction-buffer flow");
+    }
+    if (tokens < 1 || tokens > kGemvTokens) {
+      throw std::invalid_argument("q4nx gather: 1 or 2 tokens per call");
+    }
+    const std::string name = GatherSequence(kind, tokens);
+    instructions = std::make_unique<InstrSequence>(rt.hw, *rt.kernel,
+                                                   rt.Path(name, ".insts.bin"));
+    const auto& w = instructions->words;
+    // The compiled offsets place segments back to back in a virtual matrix:
+    //   gate + up: segment round * kCols + col, a column's slice of the
+    //     gate + up of the round's expert;
+    //   down: segment (round * kCols + col) * kGatherExperts + expert, the
+    //     expert's part of that (round, col) slice.
+    const std::size_t seg =
+        kind == Kind::kGateUp
+            ? ExpertArena::kUpBytes / q4nx::kCols
+            : ExpertArena::kDownBytes / (kDownRounds * q4nx::kCols);
+    for (const std::size_t word : PatchSites(w, kWeightArg)) {
+      const std::uint64_t placeholder = PatchOffset(w, word);
+      if (placeholder % seg != 0) {
+        throw std::runtime_error("q4nx gather: unexpected patch offset in " +
+                                 name);
+      }
+      const std::uint64_t index = placeholder / seg;
+      const Site site =
+          kind == Kind::kGateUp
+              ? Site{word, index / q4nx::kCols, (index % q4nx::kCols) * seg}
+              : Site{word, index % kGatherExperts,
+                     (index / kGatherExperts) * seg};
+      if (site.expert >= kGatherExperts) {
+        throw std::runtime_error("q4nx gather: patch beyond the experts in " +
+                                 name);
+      }
+      sites.push_back(site);
+    }
+    const std::size_t want_sites =
+        kGatherExperts * q4nx::kCols *
+        (kind == Kind::kGateUp ? std::size_t{1} : kDownRounds);
+    if (sites.size() != want_sites) {
+      throw std::runtime_error("q4nx gather: " + std::to_string(sites.size()) +
+                               " weight patches in " + name + ", expected " +
+                               std::to_string(want_sites));
+    }
+    if (kind != Kind::kGateUp) {
+      return;
+    }
+    for (std::size_t i = 0; i < w.size(); ++i) {
+      if (w[i] >= kScaleSentinel &&
+          w[i] < kScaleSentinel + kGatherExperts * kGemvTokens) {
+        const std::size_t j = w[i] - kScaleSentinel;
+        scales.push_back({i, j / kGemvTokens, j % kGemvTokens});
+      }
+    }
+    const std::size_t want_scales = kArrayCores * kGatherExperts * kGemvTokens;
+    if (scales.size() != want_scales) {
+      throw std::runtime_error("q4nx gather: " + std::to_string(scales.size()) +
+                               " scale words in " + name + ", expected " +
+                               std::to_string(want_scales));
+    }
+  }
+};
+
+Q4nxGather::Q4nxGather(GemvRuntime& runtime, Kind kind,
+                       const ExpertArena& arena, std::size_t tokens)
+    : impl_(std::make_unique<Impl>(runtime.impl(), kind, arena, tokens)) {}
+
+Q4nxGather::~Q4nxGather() = default;
+
+void Q4nxGather::Select(const int* ids, const float* scales) {
+  Impl& m = *impl_;
+  auto& w = m.instructions->words;
+  for (std::size_t i = 0; i < kGatherExperts; ++i) {
+    if (ids[i] < 0 || static_cast<std::size_t>(ids[i]) >= m.arena.experts) {
+      throw std::out_of_range("q4nx gather: expert outside the arena");
+    }
+  }
+  for (const auto& site : m.sites) {
+    const auto e = static_cast<std::size_t>(ids[site.expert]);
+    const std::size_t base =
+        m.kind == Kind::kGateUp ? m.arena.UpOffset(e) : m.arena.DownOffset(e);
+    SetPatchOffset(w, site.word, base + site.offset);
+  }
+  if (m.kind == Kind::kGateUp) {
+    if (scales == nullptr) {
+      throw std::invalid_argument("q4nx gather: gate + up needs scales");
+    }
+    for (const auto& s : m.scales) {
+      // A token past the call's count has no output; its scale is unused.
+      const float v =
+          s.token < m.tokens ? scales[s.expert * m.tokens + s.token] : 0.0f;
+      std::memcpy(&w[s.word], &v, sizeof(v));
+    }
+  }
+  m.instructions->Sync();
+}
+
+std::size_t Q4nxGather::y_bytes() const {
+  if (impl_->kind == Kind::kGateUp) {
+    // As a SwiGLU Q4nxGemv: compact bf16 tokens kGemvMaxDim apart, and the
+    // padding the design discards past them.
+    return 8 * (kGemvMaxDim / 2) * sizeof(float);
+  }
+  return ((kGemvTokens - 1) * kGemvSlot + kGemvHidden) * sizeof(float);
+}
+
+std::size_t Q4nxGather::tokens() const {
+  return impl_->tokens;
+}
+
 struct Chain::Impl {
   xrt::runlist runlist;
   std::vector<xrt::run> runs;
@@ -236,6 +479,18 @@ Chain::~Chain() = default;
 void Chain::Add(Q4nxGemv& gemv, Buffer& x, Buffer& y, Buffer& residual,
                 std::size_t tokens) {
   impl_->runs.push_back(gemv.impl().Bind(x, y, residual, tokens));
+  impl_->runlist.add(impl_->runs.back());
+}
+
+void Chain::Add(Q4nxGather& gather, Buffer& x, Buffer& arena, Buffer& y,
+                Buffer& residual) {
+  auto& g = gather.impl();
+  if (arena.size() < g.arena.bytes()) {
+    throw std::invalid_argument("q4nx gather: arena buffer too small");
+  }
+  impl_->runs.push_back(g.instructions->Run(
+      *g.rt.kernel,
+      {&x.impl().bo, &arena.impl().bo, &y.impl().bo, &residual.impl().bo}));
   impl_->runlist.add(impl_->runs.back());
 }
 
