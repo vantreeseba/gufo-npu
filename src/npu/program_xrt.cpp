@@ -14,25 +14,24 @@ struct Program::Impl {
   std::filesystem::path dir;
   std::string name;
   HwContext hw;
-  // Calls pass their sequence's instruction words in a host buffer (the
-  // instruction-buffer flow), shared by every call of the sequence; the
-  // firmware adds the argument addresses at run time.
-  xrt::kernel kernel;
-  std::map<std::string, std::unique_ptr<InstrSequence>> sequences;
+  std::map<std::string, std::unique_ptr<Sequence>> sequences;
+  // Runs of finished batches, per sequence, for the next ones: making a run
+  // allocates its command buffer on the device, ~10-30 µs, more than a
+  // small call's own NPU time.
+  std::map<const Sequence*, std::vector<xrt::run>> spare;
 
   Impl(const std::filesystem::path& d, const std::string& n)
-      : dir(d), name(n), hw(d, n), kernel(*hw.context, hw.kernel_name) {}
+      : dir(d), name(n), hw(d, n) {}
 
-  InstrSequence& Get(const std::string& sequence) {
+  Sequence& Get(const std::string& sequence) {
     auto& slot = sequences[sequence];
     if (!slot) {
-      const auto path = dir / (sequence + ".insts.bin");
-      if (!std::filesystem::exists(path)) {
+      if (!std::filesystem::exists(dir / (sequence + ".insts.elf"))) {
         sequences.erase(sequence);
         throw std::runtime_error("no sequence " + sequence + " for " + name +
                                  " in " + dir.string());
       }
-      slot = std::make_unique<InstrSequence>(hw, kernel, path);
+      slot = std::make_unique<Sequence>(hw, dir, sequence);
     }
     return *slot;
   }
@@ -48,7 +47,7 @@ const std::string& Program::name() const {
 }
 
 bool Program::Has(const std::string& sequence) const {
-  return std::filesystem::exists(impl_->dir / (sequence + ".insts.bin"));
+  return std::filesystem::exists(impl_->dir / (sequence + ".insts.elf"));
 }
 
 Buffer::Buffer(Program& program, std::size_t bytes)
@@ -67,11 +66,25 @@ struct Batch::Impl {
 
   Program::Impl& program;
   std::vector<xrt::run> runs;
+  std::vector<const Sequence*> sequences;  // of each run
   std::vector<Buffer> keep;  // the runs' buffers, alive while they are
   std::vector<xrt::runlist> lists;
   bool sealed = false;
 
   explicit Impl(Program::Impl& p) : program(p) {}
+  ~Impl() { Release(); }
+
+  // Drops the runlists and hands the runs back to the program.
+  void Release() {
+    lists.clear();
+    for (std::size_t i = 0; i < runs.size(); ++i) {
+      program.spare[sequences[i]].push_back(std::move(runs[i]));
+    }
+    runs.clear();
+    sequences.clear();
+    keep.clear();
+    sealed = false;
+  }
 
   void Seal() {
     lists.clear();
@@ -92,17 +105,22 @@ Batch::~Batch() = default;
 
 void Batch::Add(const std::string& sequence,
                 std::initializer_list<const Buffer*> args) {
-  InstrSequence& seq = impl_->program.Get(sequence);
-  xrt::run run(impl_->program.kernel);
+  Sequence& seq = impl_->program.Get(sequence);
+  auto& spare = impl_->program.spare[&seq];
+  xrt::run run = spare.empty() ? xrt::run(seq.kernel) : std::move(spare.back());
+  if (!spare.empty()) {
+    spare.pop_back();
+  }
   run.set_arg(0, kOpcodeRun);
-  run.set_arg(1, seq.bo);
-  run.set_arg(2, static_cast<std::uint32_t>(seq.words.size()));
+  run.set_arg(1, 0);
+  run.set_arg(2, 0);
   int index = 3;
   for (const Buffer* arg : args) {
     run.set_arg(index++, arg->impl().bo);
     impl_->keep.push_back(*arg);
   }
   impl_->runs.push_back(std::move(run));
+  impl_->sequences.push_back(&seq);
   impl_->sealed = false;
 }
 
@@ -125,10 +143,7 @@ void Batch::Run() {
 }
 
 void Batch::Clear() {
-  impl_->lists.clear();
-  impl_->runs.clear();
-  impl_->keep.clear();
-  impl_->sealed = false;
+  impl_->Release();
 }
 
 }  // namespace gufo_npu::npu
