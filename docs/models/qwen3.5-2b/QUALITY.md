@@ -131,6 +131,57 @@ flight. Awaiting the residual first fixed it: 0 differing runs in 200,000.
 CPU load, DDR load, memory compaction and a second process on the NPU did
 not change the output (175 runs).
 
+## NPU prefill (Phase 4)
+
+`bfp16_gemm_test` (label `npu`): the prefill GEMM at every projection shape
+of the 2B and every chunk size (256, 512, 1024 prompt tokens per call), with
+random q4nx weights and bf16 activations, against a double-precision product
+on the CPU. Pass: relative L2 error < 1e-2 against the q4nx weights (the
+values the decode GEMV multiplies). 2026-10-27, every shape and chunk size:
+
+| Against | Relative error |
+|---|---|
+| The bfp16 weights the NPU holds (kernel error) | 6.9e-3 |
+| The q4nx weights (adds their rounding to bfp16) | 9.2e-3 |
+
+- The kernel error is the mmul's conversion of A (the activations) to
+  bfp16, 8 values per shared exponent, plus the bf16 output. The weights'
+  own bfp16 rounding adds the rest. Both are inside the 1e-2 budget, but
+  with little margin; an exact bf16 A would need a second (lo) mmul pass.
+- `bfp16_test` (hosted CI) checks the packer bit for bit against IRON's
+  `pack_b` order and rounding (ties to even, saturation at +127).
+
+`qwen35_npu_prefill_test` (labels `npu`, `model`; needs
+`GUFO_NPU_QWEN35_2B_Q4_GGUF` and `GUFO_NPU_QWEN35_2B_ORACLE`): each oracle
+prompt, and a 600-token prompt over several chunks, through NpuPrefill (all
+but the last token), then the decoder runs the last token and 16 greedy
+steps teacher-forced on the decode path's tokens; the reference is the same
+prompt token by token through NpuDecoder (same q4nx weights). Pass: final
+hidden state of every prompt position within 5e-2, logits within 5e-2, the
+first token equal, argmax agreement >= 95%. 2026-10-27:
+
+| Prompt | Tokens | Hidden rel err | Logits rel err | Argmax |
+|---|---|---|---|---|
+| chat | 19 | 3.6e-2 | 1.0e-2 | 17/17 |
+| code | 15 | 2.4e-2 | 1.3e-2 | 17/17 |
+| prose | 39 | 2.0e-2 | 1.3e-2 | 17/17 |
+| long | 600 | 3.7e-2 | 2.6e-2 | 17/17 |
+
+- With the fp16 K/V cache and compact q4nx scales (decode branch e3605ce);
+  prefill writes the cache in fp16 as the decoder does.
+- 68/68 argmax; the first token after the prompt is the same on every
+  prompt.
+- MTP speculative decoding after prefill gives the plain greedy output
+  after prefill token for token (48 tokens). Greedy decoding after prefill
+  and after the token-by-token prompt agree on the first 26 of 48 tokens
+  of the chat prompt (48/48 with the earlier fp32 cache and 5-bit scales),
+  the same in four runs: a near-tie at token 27, where 1–3% logit
+  differences pick the other token, not nondeterminism.
+- The gap to the decode path is mostly the bfp16 activations: each of the
+  96 GEMMs of a pass (4 per layer) adds ~7e-3 where the decode GEMV only
+  rounds its input to bf16, and the residual stream accumulates it. The DeltaNet and
+  attention mixers run in fp32 on the CPU with the decoder's arithmetic.
+
 ## Fast decoder vs reference
 
 `qwen35_decoder_test` (label `model`; needs `GUFO_NPU_QWEN35_2B_Q4_GGUF` and
@@ -147,5 +198,4 @@ one), argmax 19/19.
 |---|---|
 | Each NPU op vs CPU reference | relative error < 1e-2 |
 | NPU model vs CPU reference, teacher-forced, same weights | greedy argmax match |
-| Prefill vs one-token decode on the NPU | identical next token |
 | MTP head vs a reference | to be decided (no HF oracle) |

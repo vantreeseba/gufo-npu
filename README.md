@@ -26,7 +26,7 @@ on the CPU, threaded and vectorized, with an fp16 K/V cache.
 | 1 | Hardware microbenchmarks (dispatch, DMA bandwidth, int4 GEMV) | dispatch, copy bandwidth, FLM baseline done |
 | 2 | CPU reference model (GGUF): forward pass, tokenizer, chat, greedy generate; matches HF | done (MTP and FLM pack: later) |
 | 3 | NPU decode | chained NPU decode with MTP speculation and a draft vocabulary, 54–63 tok/s, 72/73 top-1 vs CPU |
-| 4 | NPU prefill | |
+| 4 | NPU prefill | bfp16 GEMMs on the NPU (11–18 TFLOPS) overlapped with batched CPU mixers: TTFT 0.11 s at 35 tokens, 0.35 s at 1k, 1.32 s at 4k (FLM: 0.60, 1.80, 3.34 s) |
 | 5 | OpenAI-compatible server | |
 
 ## Try it
