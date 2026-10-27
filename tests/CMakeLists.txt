@@ -87,6 +87,12 @@ add_test(NAME qwen36_mtp_test COMMAND qwen36_mtp_test)
 set_tests_properties(qwen36_mtp_test PROPERTIES SKIP_RETURN_CODE 77
                      LABELS model TIMEOUT 3600)
 
+add_executable(qwen36_q4nx_requant_test models/qwen36/q4nx_requant_test.cpp)
+target_link_libraries(qwen36_q4nx_requant_test PRIVATE gufo_npu_qwen35)
+add_test(NAME qwen36_q4nx_requant_test COMMAND qwen36_q4nx_requant_test)
+set_tests_properties(qwen36_q4nx_requant_test PROPERTIES SKIP_RETURN_CODE 77
+                     LABELS model TIMEOUT 7200)
+
 add_executable(qwen36_decoder_test models/qwen36/decoder_test.cpp)
 target_link_libraries(qwen36_decoder_test PRIVATE gufo_npu_qwen35)
 add_test(NAME qwen36_decoder_test COMMAND qwen36_decoder_test)

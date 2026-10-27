@@ -35,7 +35,7 @@ import numpy as np
 LLAMA_CPP_PYTHON = "0.3.36"
 LLAMA_CPP_COMMIT = "0c1e57098bba43ac29e6e3b677cdceebdd22334f"
 
-# The prompts of qwen35_oracle.py.
+# The prompts of qwen35_oracle.py, plus a longer one (over 200 tokens).
 PROMPTS = {
     "chat": [{"role": "user", "content": "Write one sentence about the moon."}],
     "code": "def fibonacci(n):\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n",
@@ -43,6 +43,25 @@ PROMPTS = {
         "The river ran past old stone bridges and quiet fields of wheat. "
         "In the evening the light turned gold, and the farmers walked home "
         "along the water, talking about the harvest and the coming rain."
+    ),
+    "long": (
+        "The lighthouse keeper had kept the same routine for thirty-one years. "
+        "Every evening, an hour before sunset, he climbed the one hundred and "
+        "twelve steps of the tower, wiped the salt from the great lens with a "
+        "soft cloth, trimmed the wick, and checked the clockwork that turned "
+        "the light. Ships no longer needed him the way they once had; "
+        "satellites told captains where they were to within a few meters, and "
+        "the harbor authority had sent three letters suggesting that the light "
+        "could be automated. He answered each letter politely and changed "
+        "nothing. On clear nights he could see the lights of the fishing boats "
+        "strung along the horizon like beads, and on foggy nights he listened "
+        "to the horn and counted the seconds between its calls. His daughter, "
+        "who lived in the city and worked on software for shipping companies, "
+        "visited every summer. She teased him about the letters, but she also "
+        "brought him a small weather station, which he mounted on the gallery "
+        "rail and checked every morning with his coffee. When the storm came "
+        "in October, the power failed across the whole coast, and the "
+        "automated beacons to the north and south went dark one after another."
     ),
 }
 
