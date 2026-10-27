@@ -104,8 +104,9 @@ void Reference::LoadWeights(const gguf::File& file) {
   }
   w.output_norm = ToFloats(file.Tensor("output_norm.weight"));
 
-  // The decoder layers, then the MTP layer (full attention).
-  for (int il = 0; il < c.layers + std::min(c.mtp_layers, 1); ++il) {
+  // The decoder layers, then the MTP layer (full attention) if present.
+  const bool mtp = HasMtpLayer(file, c);
+  for (int il = 0; il < c.layers + (mtp ? 1 : 0); ++il) {
     const std::string p = "blk." + std::to_string(il) + ".";
     auto tensor = [&](const char* name) -> const TensorInfo& {
       return file.Tensor(p + name);
@@ -130,7 +131,7 @@ void Reference::LoadWeights(const gguf::File& file) {
     }
     w.layers.push_back(std::move(layer));
   }
-  if (c.mtp_layers > 0) {
+  if (mtp) {
     const std::string p = "blk." + std::to_string(c.layers) + ".nextn.";
     w.mtp_enorm = ToFloats(file.Tensor(p + "enorm.weight"));
     w.mtp_hnorm = ToFloats(file.Tensor(p + "hnorm.weight"));
@@ -220,8 +221,11 @@ std::vector<float> Reference::Mtp(const std::vector<float>& h,
       projections != nullptr ? *projections : *gguf_projections_;
   const int n = static_cast<int>(tokens.size());
   const int d = c.hidden;
-  if (c.mtp_layers < 1 || h.size() != static_cast<std::size_t>(n) * d) {
-    throw std::invalid_argument("qwen35: no MTP layer, or bad hidden size");
+  if (w.mtp_enorm.empty()) {
+    throw std::runtime_error("qwen35: this GGUF has no MTP layer");
+  }
+  if (h.size() != static_cast<std::size_t>(n) * d) {
+    throw std::invalid_argument("qwen35: MTP hidden rows do not match tokens");
   }
   // [RMS(embed(token)) * enorm ; RMS(RMS(h) * output_norm) * hnorm]
   std::vector<float> eh(static_cast<std::size_t>(n) * 2 * d);

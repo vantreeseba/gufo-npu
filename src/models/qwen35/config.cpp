@@ -71,6 +71,12 @@ Config ReadConfig(const gguf::File& file) {
   return c;
 }
 
+bool HasMtpLayer(const gguf::File& file, const Config& c) {
+  return c.mtp_layers > 0 &&
+         file.FindTensor("blk." + std::to_string(c.layers) +
+                         ".nextn.eh_proj.weight") != nullptr;
+}
+
 Config RequireDenseTied(Config c, const char* who) {
   if (c.IsMoe() || !c.tied_embeddings) {
     throw std::runtime_error(

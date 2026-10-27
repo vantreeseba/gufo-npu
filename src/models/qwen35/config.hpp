@@ -60,6 +60,10 @@ struct Config {
 // Throws std::runtime_error when required keys are missing or inconsistent.
 Config ReadConfig(const gguf::File& file);
 
+// True when the GGUF declares MTP layers and holds the first one's nextn
+// tensors (only that one is used). Without them the main model still loads.
+bool HasMtpLayer(const gguf::File& file, const Config& c);
+
 // Returns `c` if it is a dense model with tied embeddings (token_embd is the
 // LM head; ffn_gate/up/down per layer), else throws std::runtime_error naming
 // `who`. For the paths that only support Qwen3.5-2B-like models.

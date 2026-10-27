@@ -136,8 +136,9 @@ GgufProjections::GgufProjections(const gguf::File& file, Precision precision)
   const auto value_dim = static_cast<std::uint64_t>(c.LinearValueDim());
   const auto attn_dim = static_cast<std::uint64_t>(c.heads * c.head_dim);
   const auto kv_dim = static_cast<std::uint64_t>(c.kv_heads * c.head_dim);
-  // The decoder layers, then the MTP layers (full attention).
-  for (int il = 0; il < c.layers + c.mtp_layers; ++il) {
+  // The decoder layers, then the MTP layer (full attention) if present.
+  const int loaded = c.layers + (HasMtpLayer(file, c) ? 1 : 0);
+  for (int il = 0; il < loaded; ++il) {
     const std::string p = "blk." + std::to_string(il) + ".";
     auto t = [&](const char* name) -> const TensorInfo& {
       return file.Tensor(p + name);

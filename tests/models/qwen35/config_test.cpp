@@ -187,6 +187,17 @@ int main() {
       threw = true;
     }
     Expect(threw, "moe: RequireDenseTied rejects it");
+    Expect(!qwen35::HasMtpLayer(*file, c),
+           "moe: MTP declared but its tensors absent");
+  }
+  {
+    auto with_mtp = untied;
+    with_mtp.push_back({"blk.8.nextn.eh_proj.weight", {128, 64}});
+    const auto bytes = Build(moe_keys, with_mtp);
+    const auto file =
+        gufo_npu::gguf::File::FromBytes(bytes.data(), bytes.size());
+    Expect(qwen35::HasMtpLayer(*file, qwen35::ReadConfig(*file)),
+           "moe: MTP tensors present");
   }
 
   // Inconsistent: experts used > experts, MoE without expert widths, a
