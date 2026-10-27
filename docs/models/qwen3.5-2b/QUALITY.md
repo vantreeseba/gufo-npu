@@ -27,6 +27,25 @@ prompts (chat template, code, prose; 73 tokens). Measured 2026-10-27.
   (thinking off) tokenizes to HF's ids, and greedy decoding on the BF16 GGUF
   reproduces HF `generate` for all 25 tokens up to `<|im_end|>`.
 
+## NPU op tests
+
+`q4nx_gemv_test` (CTest label `npu`): random weights packed to q4nx and a
+random bf16 token, NPU output against a double-precision GEMV over the same
+packed weights. Pass: relative L2 error < 1e-2. 2026-10-27, on the NPU:
+
+| Design | Relative error |
+|---|---|
+| q4nx_gemv_k2048_n2048 | 7.8e-3 |
+| q4nx_gemv_k2048_n6144 | 4.7e-3 |
+| q4nx_gemv_k6144_n2048 | 4.5e-3 |
+| q4nx_gemv_k2048_n248832_norm (RMS norm fused) | 6.1e-3 |
+
+The error comes from the kernel's bf16 narrowings: each 32-wide dot product of
+codes and token, the per-32 token sums and the output. Real tensors give
+0.4–0.6% (BENCHMARKS.md). `q4nx_test` (hosted CI) checks the packing: Q4_K
+codes carry over unchanged, and requantized weights stay within half a 4-bit
+step.
+
 ## Planned
 
 | Check | Tolerance |

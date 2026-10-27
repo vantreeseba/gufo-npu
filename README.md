@@ -9,16 +9,17 @@ ships its kernels as closed binaries. gufo-npu writes its own kernels with
 AMD's open [IRON](https://github.com/amd/IRON) / [MLIR-AIE](https://github.com/Xilinx/mlir-aie)
 toolchain so every bottleneck can be fixed. See [docs/PLAN.md](docs/PLAN.md).
 
-**Status: Phase 2 done.** The toolchain, CI and NPU runtime path work end to
-end, and an fp32 CPU reference of Qwen3.5-2B (GGUF) matches HF transformers.
-`gufo-npu generate` chats on the CPU; NPU kernels are next.
+**Status: Phase 3 started.** The toolchain, CI and NPU runtime path work end
+to end, and an fp32 CPU reference of Qwen3.5-2B (GGUF) matches HF
+transformers. `gufo-npu generate` chats on the CPU. The first NPU kernel, a
+q4nx GEMV, streams weights at 56 GB/s (`gufo-npu bench gemv`).
 
 | Phase | Scope | State |
 |---|---|---|
 | 0 | Repo, CI, pinned toolchain, smoke kernel | done |
 | 1 | Hardware microbenchmarks (dispatch, DMA bandwidth, int4 GEMV) | dispatch, copy bandwidth, FLM baseline done |
 | 2 | CPU reference model (GGUF): forward pass, tokenizer, chat, greedy generate; matches HF | done (MTP and FLM pack: later) |
-| 3 | NPU decode | |
+| 3 | NPU decode | q4nx GEMV (Q4_K packs exactly) done; fusion, runlists, DeltaNet and attention next |
 | 4 | NPU prefill | |
 | 5 | OpenAI-compatible server | |
 
@@ -28,7 +29,7 @@ end, and an fp32 CPU reference of Qwen3.5-2B (GGUF) matches HF transformers.
 docker run --rm --device /dev/accel/accel0 --ulimit memlock=-1:-1 \
   -v /opt/xilinx/xrt:/opt/xilinx/xrt:ro \
   ghcr.io/vantreeseba/gufo-npu:main diagnose
-# also: smoke, bench dispatch
+# also: smoke, bench dispatch, bench bandwidth, bench gemv --model GGUF
 ```
 
 Drop the `/opt/xilinx/xrt` mount to use the XRT bundled in the image. Host

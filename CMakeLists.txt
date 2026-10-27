@@ -44,6 +44,7 @@ target_include_directories(nlohmann_json SYSTEM INTERFACE
 add_library(gufo_npu_core STATIC
   src/core/diagnose.cpp
   src/core/gguf.cpp
+  src/core/q4nx.cpp
   src/core/quant.cpp
   src/core/tokenizer.cpp
 )
@@ -64,10 +65,12 @@ target_link_libraries(gufo_npu_qwen35 PUBLIC gufo_npu_core)
 # NPU runtime: XRT when enabled, otherwise a stub that reports it is absent.
 if(GUFO_NPU_ENABLE_XRT)
   find_package(XRT REQUIRED)
-  add_library(gufo_npu_runtime STATIC src/npu/device_xrt.cpp)
+  add_library(gufo_npu_runtime STATIC src/npu/device_xrt.cpp
+                                     src/npu/gemv_xrt.cpp)
   target_link_libraries(gufo_npu_runtime PUBLIC gufo_npu_core XRT::xrt_coreutil)
 else()
-  add_library(gufo_npu_runtime STATIC src/npu/device_stub.cpp)
+  add_library(gufo_npu_runtime STATIC src/npu/device_stub.cpp
+                                     src/npu/gemv_stub.cpp)
   target_link_libraries(gufo_npu_runtime PUBLIC gufo_npu_core)
 endif()
 

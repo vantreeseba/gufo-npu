@@ -54,6 +54,10 @@ Compiling NPU kernels needs no NPU; running them does. Run NPU work with
   Chain dependent dispatches in one `xrt::runlist` and fuse ops so a token
   needs few commands (`gufo-npu bench dispatch` measures this).
 - Successful optimizations become the default, without extra switches.
+- IRON reuses any kernel object already in a compile work dir, even when the
+  source changed; designs clear their work dir before compiling.
+- A core starts in floor (truncating) rounding mode; kernels that narrow to
+  bf16 set round-to-nearest-even first (see `kernels/aie/q4nx_gemv.cc`).
 
 ## Development
 

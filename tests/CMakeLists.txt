@@ -14,6 +14,10 @@ target_link_libraries(quant_test PRIVATE gufo_npu_core)
 add_test(NAME quant_test
          COMMAND quant_test "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/quant")
 
+add_executable(q4nx_test core/q4nx_test.cpp)
+target_link_libraries(q4nx_test PRIVATE gufo_npu_core)
+add_test(NAME q4nx_test COMMAND q4nx_test)
+
 add_executable(tokenizer_test core/tokenizer_test.cpp)
 target_link_libraries(tokenizer_test PRIVATE gufo_npu_core nlohmann_json)
 add_test(NAME tokenizer_test
@@ -52,4 +56,11 @@ if(GUFO_NPU_ENABLE_XRT AND GUFO_NPU_BUILD_KERNELS)
            COMMAND gufo-npu smoke --iters 200
                    --kernels "${CMAKE_BINARY_DIR}/kernels")
   set_tests_properties(npu_smoke PROPERTIES LABELS npu)
+
+  add_executable(q4nx_gemv_test npu/q4nx_gemv_test.cpp)
+  target_link_libraries(q4nx_gemv_test PRIVATE gufo_npu_runtime)
+  add_test(NAME q4nx_gemv_test
+           COMMAND q4nx_gemv_test "${CMAKE_BINARY_DIR}/kernels")
+  set_tests_properties(q4nx_gemv_test PROPERTIES LABELS npu
+                       SKIP_RETURN_CODE 77)
 endif()

@@ -1,11 +1,13 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <optional>
+#include <random>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -13,11 +15,14 @@
 #include "build_info.hpp"
 #include "core/diagnose.hpp"
 #include "core/gguf.hpp"
+#include "core/q4nx.hpp"
+#include "core/quant.hpp"
 #include "core/tokenizer.hpp"
 #include "models/qwen35/chat.hpp"
 #include "models/qwen35/generate.hpp"
 #include "models/qwen35/reference.hpp"
 #include "npu/device.hpp"
+#include "npu/gemv.hpp"
 
 namespace {
 
@@ -35,6 +40,8 @@ constexpr char kUsage[] =
     "                           per-dispatch cost: sync, async and runlist\n"
     "  bench bandwidth [--iters N] [--kernels DIR]\n"
     "                           DDR bandwidth through all NPU columns\n"
+    "  bench gemv --model GGUF [--iters N] [--kernels DIR]\n"
+    "                           q4nx GEMV on real Qwen3.5-2B decode shapes\n"
     "  generate --model GGUF --prompt TEXT [--system TEXT] [--max-tokens N]\n"
     "           [--think]       greedy chat completion on the CPU reference\n"
     "  version                  print the version\n";
@@ -188,6 +195,120 @@ int BenchBandwidth(const std::vector<std::string_view>& args) {
   return 0;
 }
 
+// Relative L2 error of the NPU output over the first `rows` values.
+double RelativeError(const std::vector<std::uint16_t>& y,
+                     const std::vector<double>& ref, std::size_t rows) {
+  double err2 = 0;
+  double ref2 = 0;
+  for (std::size_t r = 0; r < rows; ++r) {
+    const double e = gufo_npu::quant::Bf16ToFloat(y[r]) - ref[r];
+    err2 += e * e;
+    ref2 += ref[r] * ref[r];
+  }
+  return std::sqrt(err2 / ref2);
+}
+
+int BenchGemv(const std::vector<std::string_view>& args) {
+  int iterations = 200;
+  std::optional<std::string> kernels;
+  std::string model;
+  for (std::size_t i = 0; i < args.size(); ++i) {
+    const bool has_value = i + 1 < args.size();
+    if (args[i] == "--iters" && has_value) {
+      iterations = std::atoi(std::string(args[++i]).c_str());
+    } else if (args[i] == "--kernels" && has_value) {
+      kernels = std::string(args[++i]);
+    } else if (args[i] == "--model" && has_value) {
+      model = std::string(args[++i]);
+    } else {
+      std::cerr << kUsage;
+      return 2;
+    }
+  }
+  if (model.empty()) {
+    std::cerr << kUsage;
+    return 2;
+  }
+  namespace q4nx = gufo_npu::q4nx;
+  namespace quant = gufo_npu::quant;
+  const auto dir = KernelDir(kernels);
+  const auto file = gufo_npu::gguf::File::Open(model);
+
+  struct Case {
+    const char* tensor;
+    const char* norm;  // RMS norm weight folded into the kernel, if any
+  };
+  // One tensor per compiled decode shape.
+  const Case cases[] = {
+      {"blk.0.ssm_out.weight", nullptr},
+      {"blk.0.ffn_gate.weight", nullptr},
+      {"blk.0.ffn_down.weight", nullptr},
+      {"token_embd.weight", "output_norm.weight"},
+  };
+  std::printf("%-22s %-5s %6s %7s %8s %9s %9s %7s %9s %9s\n", "tensor", "type",
+              "dim", "rows", "MB", "mean us", "best us", "GB/s", "err npu",
+              "err total");
+  std::mt19937 rng(42);
+  std::normal_distribution<float> normal(0.0f, 1.0f);
+  for (const auto& c : cases) {
+    const auto& t = file->Tensor(c.tensor);
+    const std::size_t dim = t.RowElements();
+    const std::size_t rows = t.Rows();
+    const bool norm = c.norm != nullptr;
+    const auto packed = q4nx::Pack(t.type, t.data, rows, dim);
+
+    std::vector<std::uint16_t> x_bits((norm ? 2 : 1) * dim);
+    std::vector<float> operand(dim);
+    for (std::size_t i = 0; i < dim; ++i) {
+      x_bits[i] = quant::FloatToBf16(normal(rng));
+    }
+    if (norm) {
+      std::vector<float> w(dim);
+      const auto& nt = file->Tensor(c.norm);
+      quant::Dequantize(nt.type, nt.data, w.data(), dim);
+      double sq = 0;
+      for (std::size_t i = 0; i < dim; ++i) {
+        const double v = quant::Bf16ToFloat(x_bits[i]);
+        sq += v * v;
+      }
+      const double inv = 1.0 / std::sqrt(sq / dim + 1e-6);
+      for (std::size_t i = 0; i < dim; ++i) {
+        x_bits[dim + i] = quant::FloatToBf16(w[i]);
+        operand[i] = quant::Bf16ToFloat(quant::FloatToBf16(
+            static_cast<float>(quant::Bf16ToFloat(x_bits[i]) * inv *
+                               quant::Bf16ToFloat(x_bits[dim + i]))));
+      }
+    } else {
+      for (std::size_t i = 0; i < dim; ++i) {
+        operand[i] = quant::Bf16ToFloat(x_bits[i]);
+      }
+    }
+
+    gufo_npu::npu::Q4nxGemv gemv(dir, packed, norm);
+    std::vector<std::uint16_t> y(packed.padded_rows);
+    gemv.Run(x_bits.data(), y.data());
+    gemv.Time(20);  // warm up
+    const auto timing = gemv.Time(iterations);
+
+    const double err_npu = RelativeError(
+        y, q4nx::Reference(q4nx::Unpack(packed), packed, operand.data()), rows);
+    // Against the GGUF weights themselves: kernel error plus requantization.
+    std::vector<float> original(rows * dim);
+    quant::Dequantize(t.type, t.data, original.data(), original.size());
+    q4nx::Matrix shape = packed;
+    shape.padded_rows = rows;
+    const double err_total = RelativeError(
+        y, q4nx::Reference(original, shape, operand.data()), rows);
+
+    const double mb = static_cast<double>(gemv.weight_bytes()) / 1e6;
+    std::printf("%-22s %-5s %6zu %7zu %8.1f %9.1f %9.1f %7.1f %9.2e %9.2e\n",
+                c.tensor, std::string(gufo_npu::gguf::TypeName(t.type)).c_str(),
+                dim, rows, mb, timing.mean_us, timing.best_us,
+                mb * 1e6 / timing.mean_us / 1e3, err_npu, err_total);
+  }
+  return 0;
+}
+
 int Generate(const std::vector<std::string_view>& args) {
   std::string model;
   std::string prompt;
@@ -277,6 +398,9 @@ int main(int argc, char** argv) {
   }
   if (args[0] == "bench" && !rest.empty() && rest[0] == "bandwidth") {
     return BenchBandwidth({rest.begin() + 1, rest.end()});
+  }
+  if (args[0] == "bench" && !rest.empty() && rest[0] == "gemv") {
+    return BenchGemv({rest.begin() + 1, rest.end()});
   }
   std::cerr << "unknown command: " << args[0] << "\n" << kUsage;
   return 2;
