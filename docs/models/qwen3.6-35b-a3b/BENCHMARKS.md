@@ -7,7 +7,7 @@ xdna-driver 2.26, NPU runtime power control `auto`.
 
 | | FastFlowLM (measured below) | MVP target | Ceiling |
 |---|---|---|---|
-| Decode, 1k context | 16.9 tok/s | ≥ 22 tok/s | ~30 tok/s (est. 54 GB/s read ÷ 1.7 GB/token; read-only bandwidth not yet measured) |
+| Decode, 1k context | 16.9 tok/s | ≥ 22 tok/s | ~33 tok/s (56 GB/s NPU read ÷ 1.69 GB per token with every matrix in q4nx) |
 | Prefill, 2k | ~178 tok/s | ≥ 400 tok/s | |
 | TTFT, 35-token prompt | 3.48 s | < 1 s | |
 
@@ -55,16 +55,25 @@ runs: 43.5, 43.6 and 43.4 ms per token, **23.0 tok/s** at short context.
   (`docker --cpuset-cpus=0-7` or `--cpus=8`) the decoder test runs at
   9.3 tok/s instead of falling off that cliff, and the 2B NPU decode keeps
   its 7 mixer workers (sky prompt, no draft: 39.37, 39.13, 39.16 tok/s).
-- The CPU reads these weights at ~70 GB/s averaged over the step, more than
-  the NPU's read bandwidth (52–56 GB/s in the plan's research; ~40 GB/s
-  each way in `bench bandwidth` below).
+- The CPU reads these weights at ~70 GB/s averaged over the step. On its
+  own it streams 115–120 GB/s on 16 threads; the NPU reads at most ~56 GB/s
+  (below).
 
 ## DDR bandwidth (Phase 1)
 
 `gufo-npu bench bandwidth --iters 30`: 64 MiB int32 copy through all 8
 columns, both shim DMA channels each (`kernels/designs/bw_memcpy.py`). Three
 runs: **79.5, 80.7, 80.8 GB/s** counting read + write (≈40 GB/s each way,
-concurrently). A read-only probe (decode's access pattern) is next.
+concurrently). Reading only, decode's access pattern, the NPU reaches
+55.9–56.4 GB/s ([2B benchmarks](../qwen3.5-2b/BENCHMARKS.md)), the ceiling
+for NPU decode.
+
+CPU and NPU reading at the same time (one-off probe, 2026-10-27, 256 MiB
+NPU reads against a 16-thread CPU read loop, each timed alone first): the
+NPU alone 55.6–55.9 GB/s, the CPU alone 120.0 GB/s; together the NPU 51.0,
+55.6 and 55.6 GB/s and the CPU 119.5 GB/s, ~170 GB/s combined. With 8 CPU
+threads: NPU 55.9–56.6, CPU 81.7. Neither slows the other much, so splitting
+large matrix products between them is possible in principle.
 
 ## Dispatch cost (Phase 1)
 
