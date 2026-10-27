@@ -523,6 +523,9 @@ struct NpuPrefill::Impl {
     }
     grow(mtp.in);
     grow(eh_proj);
+    if (mtp.in) {
+      in_rows = std::max(in_rows, mtp.in->rows());  // FillMtpChunk's `in`
+    }
     const auto rows = static_cast<std::size_t>(kMaxChunk);
     const auto d = static_cast<std::size_t>(cfg.hidden);
     for (Lane& lane : lanes) {
