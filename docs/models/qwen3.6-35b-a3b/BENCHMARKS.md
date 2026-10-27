@@ -7,9 +7,9 @@ xdna-driver 2.26, NPU runtime power control `auto`.
 
 | | FastFlowLM (measured below) | gufo-npu NPU (below) | MVP target | Ceiling |
 |---|---|---|---|---|
-| Decode, 1k context | 16.9 tok/s | 19.8 tok/s | ≥ 22 tok/s | ~33 tok/s (56 GB/s NPU read ÷ 1.69 GB per token with every matrix in q4nx) |
-| Prefill, 2k | ~178 tok/s | ~20 tok/s (no prefill yet: one token per pass) | ≥ 400 tok/s | |
-| TTFT, 35-token prompt | 3.48 s | 1.4 s (24 tokens) | < 1 s | |
+| Decode, 1k context | 16.9 tok/s | **26.3 tok/s** with MTP (19.2 without) | ≥ 22 tok/s | ~33 tok/s without MTP (56 GB/s NPU read ÷ 1.69 GB per token with every matrix in q4nx) |
+| Prefill, ~1k | ~120 tok/s (8.75 s) | ~30 tok/s (31 s; no prefill yet: two tokens per pass) | ≥ 400 tok/s | |
+| TTFT, 35-token prompt | 3.48 s | 0.9 s (24 tokens) | < 1 s | |
 
 ## NPU decode
 
@@ -19,30 +19,78 @@ one device arena read through two gathers (`npu::Q4nxGather`), the mixers
 and the router on the CPU, instruction-buffer flow. Per layer: the mixer's
 output projection (one submission), routing on the CPU, then the gate + up
 and down gathers chained with the next layer's input projection (a second
-submission): 81 submissions per token. One token per pass, prompt included;
-no MTP yet.
+submission): 81 submissions per token.
 
-Sweep, 2026-10-27: release build, greedy, `--draft none`, 128
-tokens at most, three runs each after a warm-up run, short and ~1k prompts
-interleaved, the GGUF in page cache. Each run loads the model anew.
+### MTP speculation and two-token passes
+
+A two-token pass (an MTP draft's verify, or two prompt tokens) reads the
+dense weights once and the union of both tokens' experts once: 8 to 16
+routed experts and the shared one, through a gather variant per count. Each
+token weighs the experts only the other chose 0, and the experts sum in
+ascending id order, so a token's result is bit-identical to a one-token
+pass (checked over 3 positions × 248,320 logits, and by the output below).
+The MTP block (`blk.40`, an MoE block with a BF16 router) runs on the NPU
+like a decoder layer, with its own expert arena; its LM head scores the
+32,768-token draft vocabulary (rows of the untied `output`).
+
+Cost of one two-token MoE layer FFN by union size (`bench gemv`, both
+gathers in one submission, mean of 200 warm calls):
+
+| Experts | 9 | 11 | 13 | 15 | 17 |
+|---|---|---|---|---|---|
+| MB | 16.4 | 20.0 | 23.6 | 27.3 | 30.9 |
+| µs | 480 | 554 | 631 | 704 | 779 |
+
+Each further expert costs ~37 µs, so padding every pair to 17 experts
+(one variant) would cost 4.5–7.6 ms per step at typical unions of 12–14;
+per-count variants cost only instruction streams. The down gather's K
+reaches 17 × 512 = 8,704, so the design's `MAX_DIM` went from 6,144 to
+8,704 (core data memory still fits). Splitting the down into two calls
+would have needed an accumulating output stage and a further call per
+layer. Qwen3.5-2B is unchanged by it: same output hashes, 38.96–39.13 and
+63.23–63.41 tok/s (sky without a draft, Fibonacci with MTP) against
+39.0–39.2 and 62.7–63.5 before.
+
+Sweep, 2026-10-27: release build, greedy, 128 tokens at most, three runs
+each after a warm-up run, `--draft none` and `--draft mtp` interleaved on a
+short and a ~1k prompt, the GGUF in page cache. Each run loads the model
+anew.
+
+| Prompt | Draft | Run 1 | Run 2 | Run 3 | Drafts accepted | Prompt time |
+|---|---|---|---|---|---|---|
+| Sky (24 tokens), 77 generated | none | 20.30 tok/s | 19.39 | 20.12 | | 0.88 s |
+| | MTP | **26.54** | **28.24** | **28.90** | 35 of 42 steps (83%) | 0.87–0.92 s |
+| Lighthouse story ×4 + question (942 tokens), 94 generated | none | 19.81 | 18.99 | 18.71 | | 30.8–32.3 s |
+| | MTP | **26.04** | **26.39** | **26.45** | 40 of 53 steps (75%) | 31.3–32.3 s |
+
+- The draft and no-draft replies are the same text (one hash per prompt in
+  every run).
+- Against FLM on the same box: decode **26.0–28.9 tok/s against 16.9–17.1**
+  (+55–70%) with MTP, and 18.7–20.3 without. TTFT 0.9 s against 3.49 s for
+  short prompts. Long prompts are still far slower than FLM's (31 s against
+  8.75 s at ~1k tokens): two tokens per pass at decode speed until there is
+  an MoE prefill.
+- Against the CPU decoder (23.0 tok/s, below): with MTP the NPU path is
+  15–26% faster; without, 12–19% slower.
+- Device buffers: 19.0 GiB (19,416 MiB, the MTP block's arena and dense
+  matrices included), anonymous memory ~0.6 GB. Load 20.2–21.2 s.
+
+### One token per pass
+
+The first version (one token per pass, prompt included, no MTP), same
+sweep method:
 
 | Prompt | Run 1 | Run 2 | Run 3 | Prompt time |
 |---|---|---|---|---|
 | Sky (24 tokens), decode | 18.59 tok/s | 20.17 | 20.30 | 1.31–1.48 s |
 | Lighthouse story ×4 + question (942 tokens), decode | 19.79 tok/s | 19.75 | 19.85 | 47.4–49.1 s |
 
-- Against FLM on the same box: decode **19.8–20.3 tok/s against 16.9–17.1**
-  (+17–19%), TTFT 1.4 s against 3.49 s for short prompts. Long prompts are
-  far slower than FLM's (48 s against 8.75 s at ~1k tokens), since they run
-  one token per pass at decode speed; that needs the MoE prefill.
-- Against the CPU decoder (23.0 tok/s, below): 12–14% slower; the NPU path
-  reads 1.69 GB per token where the CPU reads the GGUF's 2.75 GB, but the
-  NPU reads at most ~56 GB/s.
+- The NPU path reads 1.69 GB per token where the CPU decoder reads the
+  GGUF's 2.75 GB, but the NPU reads at most ~56 GB/s.
 - Run 1 of the short prompt (18.6) was slower than runs 2 and 3; other CPU
   jobs were running on the box during the sweep.
-- Output: the short reply is the same text in every run (one hash), and
-  reads correctly ("The sky appears blue because of a phenomenon called
-  Rayleigh scattering…").
+- Output: the short reply reads correctly ("The sky appears blue because of
+  a phenomenon called Rayleigh scattering…").
 
 Where a token's ~49.5 ms go (short prompt, run 3: 121 steps): waiting on
 the NPU 45.6 ms (including ~81 submission round trips), CPU mixers 3.0 ms,
@@ -67,8 +115,9 @@ decoder (chained calls skip some of each call's fixed cost; the CPU work
 between submissions adds it back). The gathers and the small mixer output
 projection run well below the 56 GB/s read ceiling: per-call fixed cost.
 
-Memory: device buffers 18.9 GiB (the 40 expert arenas, 467 MB each, are
-18.7 GB; the dense matrices ~1 GB), anonymous memory ~0.6 GB, and up to
+Memory, without the MTP block: device buffers 18.9 GiB (the 40 expert
+arenas, 467 MB each, are 18.7 GB; the dense matrices ~1 GB), anonymous
+memory ~0.6 GB, and up to
 ~20 GB of the memory-mapped GGUF in page cache while loading. Loading
 (packing every matrix to q4nx, Q4_K experts code for code) takes 19.8–24 s.
 

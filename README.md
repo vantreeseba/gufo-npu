@@ -20,11 +20,12 @@ head drafts a token (scoring a 32k draft vocabulary) that a 2-token pass
 verifies (same output as plain greedy). DeltaNet and attention run in fp32
 on the CPU, threaded and vectorized, with an fp16 K/V cache.
 
-Qwen3.6-35B-A3B also decodes on the NPU: ~20 tok/s at short and ~1k
-context (FLM: 16.9–17.1), every matrix in q4nx, each layer's experts read
-through two gathers re-pointed per token after routing on the CPU. No MTP
-or prompt batching for it yet, so long prompts are slow
-([benchmarks](docs/models/qwen3.6-35b-a3b/BENCHMARKS.md)).
+Qwen3.6-35B-A3B also decodes on the NPU: 26–29 tok/s with MTP drafting
+at short and ~1k context, ~19–20 without (FLM: 16.9–17.1). Every matrix is
+in q4nx; each layer's experts are read through two gathers re-pointed after
+routing on the CPU, and a two-token pass reads the pair's expert union. No
+MoE prefill yet, so long prompts are slow (31 s at ~1k tokens against FLM's
+8.75 s; [benchmarks](docs/models/qwen3.6-35b-a3b/BENCHMARKS.md)).
 
 | Phase | Scope | State |
 |---|---|---|

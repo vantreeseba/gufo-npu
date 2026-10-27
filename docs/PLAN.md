@@ -166,9 +166,16 @@ routing and experts. Est. ~1.1 GB read per token, ~45–50 tok/s NPU ceiling.
   - The router runs on the CPU in fp32: a second sync per layer, so ~81
     submissions per token.
   - Projection: ~48 ms per token (~21 tok/s, FLM 16.5), ~26 tok/s with MTP.
-  - Open: quality of 4.625-bit weights where the GGUF keeps Q8_0 or Q5_K;
-    the down gather's K is capped at 12 experts until `MAX_DIM` grows (for
-    MTP's 2-token expert unions).
+    Measured (2026-10-27, docs/models/qwen3.6-35b-a3b/BENCHMARKS.md):
+    19–20 tok/s without a draft, 26–29 with MTP (73–83% of drafts kept).
+  - Two-token passes read the pair's expert union (9 to 17 experts with the
+    shared one, a gather variant per count; `MAX_DIM` is 8,704 so one down
+    gather covers 17); each token weighs the other's experts 0, so its
+    result is bit-identical to a one-token pass.
+  - Open: quality of 4.625-bit weights where the GGUF keeps Q8_0 or Q5_K
+    (QUALITY.md: ~87% top-1 against llama.cpp on the as-stored GGUF); the
+    MoE prefill (a grouped expert GEMM over q4nx: no room for a bfp16 copy
+    of the experts).
 - Bandwidth: weight layout matters ~5× (contiguous 128 KB runs vs strided).
   Pre-pack weights at load/convert time; never stream strided.
 - MTP: FLM's Qwen3.6 pack has **no MTP tensors**, so FLM cannot speculate.
