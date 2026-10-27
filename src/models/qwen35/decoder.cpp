@@ -9,6 +9,7 @@
 #include "core/quant.hpp"
 #include "core/thread_pool.hpp"
 #include "core/vec.hpp"
+#include "models/qwen35/moe.hpp"
 
 namespace gufo_npu::qwen35 {
 namespace {
@@ -30,13 +31,6 @@ float Silu(float x) {
 }
 float Softplus(float x) {
   return x > 20.0f ? x : std::log1p(std::exp(x));
-}
-
-void CheckDense(const Config& c) {
-  if (c.experts != 0 || !c.tied_embeddings) {
-    throw std::runtime_error(
-        "qwen35 decoder: dense, tied-embedding models only");
-  }
 }
 
 }  // namespace
@@ -73,7 +67,6 @@ Mixer::Mixer(const gguf::File& file)
       weights_(std::make_unique<Weights>()),
       scratch_(std::make_unique<Scratch>()) {
   const Config& c = config_;
-  CheckDense(c);
   auto& w = *weights_;
   for (int il = 0; il < c.layers + c.mtp_layers; ++il) {
     const std::string p = "blk." + std::to_string(il) + ".";
@@ -393,6 +386,12 @@ struct Decoder::Scratch {
   std::vector<float> ffn;     // gate | up
   std::vector<float> act;     // silu(gate) * up
   std::vector<float> logits;
+  // MoE: router logits | shared gate logit, the chosen experts and their
+  // weights, and one expert's output.
+  std::vector<float> router;
+  std::vector<int> chosen;
+  std::vector<float> weights;
+  std::vector<float> expert_out;
 };
 
 Decoder::Decoder(const gguf::File& file, const Projections& projections)
@@ -417,9 +416,17 @@ Decoder::Decoder(const gguf::File& file, const Projections& projections)
                        StageOutputs(c, Stage::kAttentionIn, 3)));
   s.mixed.resize(std::max(c.LinearValueDim(), c.heads * c.head_dim));
   s.out.resize(c.hidden);
-  s.ffn.resize(2 * static_cast<std::size_t>(c.ffn));
-  s.act.resize(c.ffn);
+  const auto width =
+      static_cast<std::size_t>(std::max(c.FfnWidth(), c.expert_ffn));
+  s.ffn.resize(2 * width);
+  s.act.resize(width);
   s.logits.resize(c.vocab);
+  if (c.IsMoe()) {
+    s.router.resize(StageOutputs(c, Stage::kRouter, 0));
+    s.chosen.resize(c.experts_used);
+    s.weights.resize(c.experts_used);
+    s.expert_out.resize(c.hidden);
+  }
 }
 
 Decoder::~Decoder() = default;
@@ -453,14 +460,18 @@ const std::vector<float>& Decoder::Step(int token, State& state) {
     for (int i = 0; i < d; ++i) {
       s.h[i] += s.out[i];
     }
-    // SwiGLU MLP.
+    // SwiGLU MLP: the dense FFN, or the shared expert plus the routed ones.
     RmsNorm(s.h.data(), lw.post_attention_norm.data(), d, c.rms_eps,
             s.normed.data());
     projections_.Apply(Stage::kFfnIn, il, s.normed.data(), 1, s.ffn.data());
-    for (int i = 0; i < c.ffn; ++i) {
-      s.act[i] = Silu(s.ffn[i]) * s.ffn[c.ffn + i];
+    const int f = c.FfnWidth();
+    for (int i = 0; i < f; ++i) {
+      s.act[i] = Silu(s.ffn[i]) * s.ffn[f + i];
     }
     projections_.Apply(Stage::kFfnDown, il, s.act.data(), 1, s.out.data());
+    if (c.IsMoe()) {
+      MoeFfn(il);
+    }
     for (int i = 0; i < d; ++i) {
       s.h[i] += s.out[i];
     }
@@ -470,6 +481,36 @@ const std::vector<float>& Decoder::Step(int token, State& state) {
   RmsNorm(s.h.data(), w.output_norm.data(), d, c.rms_eps, s.normed.data());
   projections_.Apply(Stage::kLmHead, -1, s.normed.data(), 1, s.logits.data());
   return s.logits;
+}
+
+void Decoder::MoeFfn(int il) {
+  const Config& c = mixer_.config();
+  auto& s = *scratch_;
+  const int d = c.hidden;
+  const int ef = c.expert_ffn;
+  // s.out holds the shared expert's output; scale it, then add the routed
+  // experts' in order of their weight.
+  projections_.Apply(Stage::kRouter, il, s.normed.data(), 1, s.router.data());
+  Route(s.router.data(), c.experts, c.experts_used, s.chosen.data(),
+        s.weights.data());
+  const float shared_scale = SharedExpertScale(s.router[c.experts]);
+  for (int i = 0; i < d; ++i) {
+    s.out[i] *= shared_scale;
+  }
+  for (int slot = 0; slot < c.experts_used; ++slot) {
+    const int e = s.chosen[slot];
+    projections_.ApplyExpert(Stage::kExpertIn, il, e, s.normed.data(), 1,
+                             s.ffn.data());
+    for (int i = 0; i < ef; ++i) {
+      s.act[i] = Silu(s.ffn[i]) * s.ffn[ef + i];
+    }
+    projections_.ApplyExpert(Stage::kExpertDown, il, e, s.act.data(), 1,
+                             s.expert_out.data());
+    const float weight = s.weights[slot];
+    for (int i = 0; i < d; ++i) {
+      s.out[i] += weight * s.expert_out[i];
+    }
+  }
 }
 
 }  // namespace gufo_npu::qwen35

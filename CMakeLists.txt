@@ -60,6 +60,7 @@ add_library(gufo_npu_qwen35 STATIC
   src/models/qwen35/decoder.cpp
   src/models/qwen35/draft_vocab.cpp
   src/models/qwen35/generate.cpp
+  src/models/qwen35/moe.cpp
   src/models/qwen35/mtp.cpp
   src/models/qwen35/reference.cpp
 )

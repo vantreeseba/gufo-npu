@@ -3,13 +3,13 @@
 #include <algorithm>
 #include <cmath>
 #include <initializer_list>
-#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <utility>
 
 #include "core/parallel.hpp"
 #include "core/quant.hpp"
+#include "models/qwen35/moe.hpp"
 
 namespace gufo_npu::qwen35 {
 namespace {
@@ -39,10 +39,6 @@ float Silu(float x) {
 float Softplus(float x) {
   return x > 20.0f ? x : std::log1p(std::exp(x));
 }
-
-// The smallest positive normal fp16, llama.cpp's floor for the sum of the
-// top-k router probabilities before renormalizing.
-constexpr double kRouterWeightSumFloor = 6.103515625e-5;
 
 std::vector<float> ToFloats(const TensorInfo& t) {
   std::vector<float> out(t.num_elements);
@@ -684,45 +680,20 @@ void Reference::Ffn(int il, const float* x, int n, const Projections& proj,
   std::vector<float> shared(nd);
   proj.Apply(Stage::kFfnDown, il, act.data(), n, shared.data());
 
-  // Routing: softmax over all expert logits, the top k (ties to the lower
-  // index), their probabilities renormalized to sum 1. The shared expert is
-  // scaled by sigmoid of its own gate logit.
+  // Routing (moe.hpp); the shared expert is scaled by sigmoid of its own
+  // gate logit, the router's last output.
   const int experts = c.experts;
   const int k = c.experts_used;
   std::vector<float> router(static_cast<std::size_t>(n) * (experts + 1));
   proj.Apply(Stage::kRouter, il, x, n, router.data());
   std::vector<int> chosen(static_cast<std::size_t>(n) * k);
-  std::vector<double> weight(static_cast<std::size_t>(n) * k);
-  std::vector<double> shared_scale(n);
-  std::vector<double> prob(experts);
-  std::vector<int> order(experts);
+  std::vector<float> weight(static_cast<std::size_t>(n) * k);
+  std::vector<float> shared_scale(n);
   for (int t = 0; t < n; ++t) {
     const float* logits = &router[static_cast<std::size_t>(t) * (experts + 1)];
-    const double max_logit = *std::max_element(logits, logits + experts);
-    double total = 0;
-    for (int e = 0; e < experts; ++e) {
-      prob[e] = std::exp(static_cast<double>(logits[e]) - max_logit);
-      total += prob[e];
-    }
-    for (auto& p : prob) {
-      p /= total;
-    }
-    std::iota(order.begin(), order.end(), 0);
-    std::partial_sort(
-        order.begin(), order.begin() + k, order.end(), [&](int a, int b) {
-          return prob[a] > prob[b] || (prob[a] == prob[b] && a < b);
-        });
-    double top = 0;
-    for (int slot = 0; slot < k; ++slot) {
-      top += prob[order[slot]];
-    }
-    top = std::max(top, kRouterWeightSumFloor);
-    for (int slot = 0; slot < k; ++slot) {
-      chosen[static_cast<std::size_t>(t) * k + slot] = order[slot];
-      weight[static_cast<std::size_t>(t) * k + slot] = prob[order[slot]] / top;
-    }
-    shared_scale[t] =
-        1.0 / (1.0 + std::exp(-static_cast<double>(logits[experts])));
+    Route(logits, experts, k, &chosen[static_cast<std::size_t>(t) * k],
+          &weight[static_cast<std::size_t>(t) * k]);
+    shared_scale[t] = SharedExpertScale(logits[experts]);
   }
 
   // Each routed expert once over the tokens that chose it.
@@ -764,10 +735,10 @@ void Reference::Ffn(int il, const float* x, int n, const Projections& proj,
       double acc = 0;
       for (int slot = 0; slot < k; ++slot) {
         const std::size_t s = static_cast<std::size_t>(t) * k + slot;
-        acc += weight[s] * routed[s * d + i];
+        acc += static_cast<double>(weight[s]) * routed[s * d + i];
       }
       const std::size_t ti = static_cast<std::size_t>(t) * d + i;
-      acc += shared_scale[t] * shared[ti];
+      acc += static_cast<double>(shared_scale[t]) * shared[ti];
       out[ti] = static_cast<float>(acc);
     }
   }
