@@ -129,6 +129,10 @@ int main() {
   const auto vocab = static_cast<std::size_t>(c.vocab);
 
   const auto ids = ReadIds(fs::path(oracle) / "chat.ids.json");
+  if (ids.empty()) {
+    std::fprintf(stderr, "FAIL: no token ids in %s/chat.ids.json\n", oracle);
+    return 1;
+  }
   auto ref_state = reference.NewState();
   auto state = decoder.NewState();
   double worst_before = 0;  // before the first routing difference

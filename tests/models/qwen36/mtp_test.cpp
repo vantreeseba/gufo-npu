@@ -76,6 +76,11 @@ int main() {
     const auto ids =
         ReadIds(fs::path(oracle) / (std::string(name) + ".ids.json"));
     const std::size_t n = ids.size();
+    if (n < 3) {
+      std::fprintf(stderr, "FAIL: %s: need at least 3 token ids, have %zu\n",
+                   name, n);
+      return 1;
+    }
     auto state = reference.NewState();
     const auto main = reference.Forward(ids, state, true, true);
     // Last layer outputs at positions 0 .. n - 2, tokens at 1 .. n - 1.
