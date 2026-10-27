@@ -24,6 +24,10 @@ add_executable(vec_portable_test core/vec_test.cpp)
 target_link_libraries(vec_portable_test PRIVATE gufo_npu_core)
 add_test(NAME vec_portable_test COMMAND vec_portable_test)
 
+add_executable(bfp16_test core/bfp16_test.cpp)
+target_link_libraries(bfp16_test PRIVATE gufo_npu_core)
+add_test(NAME bfp16_test COMMAND bfp16_test)
+
 add_executable(q4nx_test core/q4nx_test.cpp)
 target_link_libraries(q4nx_test PRIVATE gufo_npu_core)
 add_test(NAME q4nx_test COMMAND q4nx_test)
@@ -93,4 +97,11 @@ if(GUFO_NPU_ENABLE_XRT AND GUFO_NPU_BUILD_KERNELS)
            COMMAND q4nx_gemv_chain_test "${CMAKE_BINARY_DIR}/kernels")
   set_tests_properties(q4nx_gemv_chain_test PROPERTIES LABELS npu
                        SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+  add_executable(bfp16_gemm_test npu/bfp16_gemm_test.cpp)
+  target_link_libraries(bfp16_gemm_test PRIVATE gufo_npu_runtime)
+  add_test(NAME bfp16_gemm_test
+           COMMAND bfp16_gemm_test "${CMAKE_BINARY_DIR}/kernels")
+  set_tests_properties(bfp16_gemm_test PROPERTIES LABELS npu
+                       SKIP_RETURN_CODE 77)
 endif()

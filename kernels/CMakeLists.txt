@@ -7,7 +7,7 @@ set(GUFO_NPU_KERNEL_DEVICE "npu2" CACHE STRING "mlir-aie device family")
 set(GUFO_NPU_KERNEL_OUT "${CMAKE_BINARY_DIR}/kernels")
 
 # One entry per design in designs/<name>.py.
-set(GUFO_NPU_KERNEL_DESIGNS smoke_add_one bw_memcpy bw_read q4nx_gemv)
+set(GUFO_NPU_KERNEL_DESIGNS smoke_add_one bw_memcpy bw_read q4nx_gemv bfp16_gemm)
 # Designs that write other files than <name>.xclbin + <name>.insts.elf list
 # them here (must match OUTPUTS in the design); <name>_SOURCES are extra
 # inputs.
@@ -30,6 +30,14 @@ set(q4nx_gemv_OUTPUTS
   q4nx_gemv_k2048_n32768_resnorm_store_t1.insts.elf
   q4nx_gemv_k2048_n32768_resnorm_store_t2.insts.elf)
 set(q4nx_gemv_SOURCES aie/q4nx_gemv.cc)
+set(bfp16_gemm_OUTPUTS
+  bfp16_gemm.xclbin
+  bfp16_gemm_m256_k2048_n8192.insts.elf
+  bfp16_gemm_m256_k2048_n5120.insts.elf
+  bfp16_gemm_m256_k2048_n2048.insts.elf
+  bfp16_gemm_m256_k2048_n12288.insts.elf
+  bfp16_gemm_m256_k6144_n2048.insts.elf
+  bfp16_gemm_m256_k4096_n2048.insts.elf)
 
 set(kernel_outputs)
 foreach(design IN LISTS GUFO_NPU_KERNEL_DESIGNS)

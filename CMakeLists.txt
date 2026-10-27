@@ -42,6 +42,7 @@ target_include_directories(nlohmann_json SYSTEM INTERFACE
 
 # CPU-only core: no XRT, safe for hosted CI and unit tests.
 add_library(gufo_npu_core STATIC
+  src/core/bfp16.cpp
   src/core/diagnose.cpp
   src/core/gguf.cpp
   src/core/q4nx.cpp
@@ -74,10 +75,12 @@ set_source_files_properties(src/models/qwen35/decoder.cpp
 if(GUFO_NPU_ENABLE_XRT)
   find_package(XRT REQUIRED)
   add_library(gufo_npu_runtime STATIC src/npu/device_xrt.cpp
+                                     src/npu/gemm_xrt.cpp
                                      src/npu/gemv_xrt.cpp)
   target_link_libraries(gufo_npu_runtime PUBLIC gufo_npu_core XRT::xrt_coreutil)
 else()
   add_library(gufo_npu_runtime STATIC src/npu/device_stub.cpp
+                                     src/npu/gemm_stub.cpp
                                      src/npu/gemv_stub.cpp)
   target_link_libraries(gufo_npu_runtime PUBLIC gufo_npu_core)
 endif()
