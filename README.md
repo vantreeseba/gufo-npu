@@ -32,7 +32,7 @@ or prompt batching for it yet, so long prompts are slow
 | 1 | Hardware microbenchmarks (dispatch, DMA bandwidth, int4 GEMV) | dispatch, copy bandwidth, FLM baseline done |
 | 2 | CPU reference model (GGUF): forward pass, tokenizer, chat, greedy generate; matches HF | done (MTP and FLM pack: later) |
 | 3 | NPU decode | chained NPU decode with MTP speculation and a draft vocabulary, 54–63 tok/s, 72/73 top-1 vs CPU |
-| 4 | NPU prefill | |
+| 4 | NPU prefill | bfp16 GEMMs on the NPU (11–18 TFLOPS) overlapped with batched CPU mixers: TTFT 0.11 s at 35 tokens, 0.31 s at 1k, 1.24 s at 4k (FLM: 0.60, 1.80, 3.34 s); needs `bfp16_gemm.xclbin` and ~1.56 GB more pinned memory |
 | 5 | OpenAI-compatible server | |
 
 ## Try it
