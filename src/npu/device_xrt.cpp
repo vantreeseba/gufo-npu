@@ -25,6 +25,10 @@ constexpr unsigned int kOpcodeRun = 3;
 // Must match PROBLEM_SIZE in kernels/designs/smoke_add_one.py.
 constexpr std::size_t kSmokeElements = 4096;
 constexpr std::size_t kSmokeBytes = kSmokeElements * sizeof(std::int32_t);
+// Must match SIZE in kernels/designs/bw_memcpy.py.
+constexpr std::size_t kBandwidthElements = 16ULL * 1024 * 1024;
+constexpr std::size_t kBandwidthBytes =
+    kBandwidthElements * sizeof(std::int32_t);
 
 using Clock = std::chrono::steady_clock;
 
@@ -43,8 +47,9 @@ std::string KernelName(const xrt::xclbin& xclbin) {
   return {};
 }
 
-// The smoke_add_one kernel loaded into one hardware context.
-struct SmokeKernel {
+// One compiled design (<dir>/<name>.xclbin + .insts.elf) loaded into its own
+// hardware context.
+struct LoadedKernel {
   xrt::device device{0U};
   xrt::xclbin xclbin;
   std::optional<xrt::hw_context> context;
@@ -52,20 +57,22 @@ struct SmokeKernel {
   std::optional<xrt::module> module;
   xrt::kernel kernel;
 
-  explicit SmokeKernel(const std::filesystem::path& dir)
-      : xclbin((dir / "smoke_add_one.xclbin").string()) {
+  LoadedKernel(const std::filesystem::path& dir, const std::string& design)
+      : xclbin((dir / (design + ".xclbin")).string()) {
     const auto name = KernelName(xclbin);
     if (name.empty()) {
-      throw std::runtime_error("no MLIR_AIE kernel in smoke_add_one.xclbin");
+      throw std::runtime_error("no MLIR_AIE kernel in " + design + ".xclbin");
     }
     device.register_xclbin(xclbin);
     context.emplace(device, xclbin.get_uuid());
-    elf.emplace((dir / "smoke_add_one.insts.elf").string());
+    elf.emplace((dir / (design + ".insts.elf")).string());
     module.emplace(*elf);
     kernel = xrt::ext::kernel(*context, *module, name);
   }
 
-  xrt::bo Buffer() { return xrt::ext::bo{device, kSmokeBytes}; }
+  xrt::bo Buffer(std::size_t bytes = kSmokeBytes) {
+    return xrt::ext::bo{device, bytes};
+  }
 
   xrt::run Run(const xrt::bo& input, const xrt::bo& output) {
     xrt::run run(kernel);
@@ -126,7 +133,7 @@ SmokeResult RunSmoke(const std::filesystem::path& kernel_dir, int iterations) {
   SmokeResult result;
   result.iterations = std::max(iterations, 1);
   try {
-    SmokeKernel smoke(kernel_dir);
+    LoadedKernel smoke(kernel_dir, "smoke_add_one");
     auto input = smoke.Buffer();
     auto output = smoke.Buffer();
     Fill(input);
@@ -160,7 +167,7 @@ DispatchBenchResult BenchDispatch(const std::filesystem::path& kernel_dir,
   DispatchBenchResult result;
   rounds = std::max(rounds, 1);
   try {
-    SmokeKernel smoke(kernel_dir);
+    LoadedKernel smoke(kernel_dir, "smoke_add_one");
     auto input = smoke.Buffer();
     Fill(input);
 
@@ -245,6 +252,58 @@ DispatchBenchResult BenchDispatch(const std::filesystem::path& kernel_dir,
           return result;
         }
       }
+    }
+    result.ok = true;
+  } catch (const std::exception& error) {
+    result.error = error.what();
+  }
+  return result;
+}
+
+BandwidthResult BenchBandwidth(const std::filesystem::path& kernel_dir,
+                               int iterations) {
+  BandwidthResult result;
+  result.bytes_per_run = 2 * kBandwidthBytes;
+  iterations = std::max(iterations, 1);
+  try {
+    LoadedKernel copy(kernel_dir, "bw_memcpy");
+    auto input = copy.Buffer(kBandwidthBytes);
+    auto output = copy.Buffer(kBandwidthBytes);
+    auto* in = input.map<std::int32_t*>();
+    for (std::size_t i = 0; i < kBandwidthElements; ++i) {
+      in[i] = static_cast<std::int32_t>(i * 2654435761U);
+    }
+    input.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    std::memset(output.map<void*>(), 0, kBandwidthBytes);
+    output.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+    auto run = copy.Run(input, output);
+    for (int i = 0; i < 3; ++i) {
+      run.start();
+      run.wait();
+    }
+    double total_us = 0;
+    double best_us = std::numeric_limits<double>::max();
+    for (int i = 0; i < iterations; ++i) {
+      const auto start = Clock::now();
+      run.start();
+      run.wait();
+      const double us = MicrosSince(start);
+      total_us += us;
+      best_us = std::min(best_us, us);
+    }
+    const double mean_us = total_us / iterations;
+    result.mean_us = mean_us;
+    result.mean_gb_s =
+        static_cast<double>(result.bytes_per_run) / mean_us / 1e3;
+    result.best_gb_s =
+        static_cast<double>(result.bytes_per_run) / best_us / 1e3;
+
+    output.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    const auto* out = output.map<const std::int32_t*>();
+    if (std::memcmp(in, out, kBandwidthBytes) != 0) {
+      result.error = "copied buffer differs from the input";
+      return result;
     }
     result.ok = true;
   } catch (const std::exception& error) {

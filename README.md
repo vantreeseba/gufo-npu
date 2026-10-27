@@ -15,7 +15,7 @@ not implemented yet.
 | Phase | Scope | State |
 |---|---|---|
 | 0 | Repo, CI, pinned toolchain, smoke kernel | done |
-| 1 | Hardware microbenchmarks (dispatch, DMA bandwidth, int4 GEMV) | dispatch done |
+| 1 | Hardware microbenchmarks (dispatch, DMA bandwidth, int4 GEMV) | dispatch, copy bandwidth, FLM baseline done |
 | 2 | CPU reference model (GGUF + Q4NX) | |
 | 3 | NPU decode | |
 | 4 | NPU prefill | |

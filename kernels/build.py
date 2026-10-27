@@ -10,6 +10,9 @@ import importlib.util
 from pathlib import Path
 import sys
 
+# Keep the source tree clean when designs are imported from it.
+sys.dont_write_bytecode = True
+
 DESIGNS_DIR = Path(__file__).resolve().parent / "designs"
 
 
