@@ -15,9 +15,10 @@
 #include "models/qwen35/q4nx_projections.hpp"
 #include "models/qwen35/reference.hpp"
 
-// The fast fp32 decode step against the reference, token by token, with the
+// The fast decode step against the reference, token by token, with the
 // same projections (q4nx weights on the CPU), so only the non-matrix math is
-// compared.
+// compared. The decoder keeps the attention K/V cache in fp16 (the
+// reference in fp32), which accounts for most of the difference.
 //   GUFO_NPU_QWEN35_2B_Q4_GGUF  UD-Q4_K_XL GGUF of Qwen3.5-2B
 //   GUFO_NPU_QWEN35_2B_ORACLE   oracle output directory (for prompt ids)
 // Exits 77 (skip) when either is unset.
@@ -26,7 +27,8 @@ namespace {
 namespace fs = std::filesystem;
 namespace qwen35 = gufo_npu::qwen35;
 
-constexpr double kLogitTolerance = 1e-4;
+// fp16 K/V: 6.2e-4 measured on the chat prompt (fp32 K/V: ~1e-6).
+constexpr double kLogitTolerance = 2e-3;
 
 std::vector<int> ReadIds(const fs::path& path) {
   std::ifstream in(path);

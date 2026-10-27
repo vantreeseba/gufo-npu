@@ -92,10 +92,12 @@ proposed; acceptance per prompt and vocabulary size is in BENCHMARKS.md.
 ## Fast decoder vs reference
 
 `qwen35_decoder_test` (label `model`; needs `GUFO_NPU_QWEN35_2B_Q4_GGUF` and
-`GUFO_NPU_QWEN35_2B_ORACLE`, no NPU): the fp32 decode step against the
+`GUFO_NPU_QWEN35_2B_ORACLE`, no NPU): the decode step against the
 reference, token by token on the chat prompt, both with the same q4nx
-projections on the CPU. Pass: logits relative error < 1e-4 and every argmax
-equal. 2026-10-27: worst 2.5e-6, argmax 19/19.
+projections on the CPU. The decoder keeps the attention K/V cache in fp16,
+the reference in fp32. Pass: logits relative error < 2e-3 and every argmax
+equal. 2026-10-27: worst 6.2e-4 with the fp16 cache (9.3e-7 with an fp32
+one), argmax 19/19.
 
 ## Planned
 

@@ -268,8 +268,11 @@ void Mixer::Attention(int il, float* in, int position, DecodeState::Layer& st,
     RmsNorm(head, lw.k_norm.data(), hd, c.rms_eps, head);
     rope(head);
   }
-  st.keys.insert(st.keys.end(), k, k + kv);
-  st.values.insert(st.values.end(), v, v + kv);
+  const std::size_t cached = st.keys.size();
+  st.keys.resize(cached + kv);
+  st.values.resize(cached + kv);
+  vec::ToHalf(k, st.keys.data() + cached, kv);
+  vec::ToHalf(v, st.values.data() + cached, kv);
 
   // Every cached position (equals position + 1 for the decoder layers; the
   // MTP layer's cache can start later).
@@ -306,10 +309,12 @@ void Mixer::Attention(int il, float* in, int position, DecodeState::Layer& st,
     const float* queries =
         s.queries.data() + static_cast<std::size_t>(kh) * group * hd;
     for (int j = begin; j < end; ++j) {
-      const float* key = &st.keys[static_cast<std::size_t>(j) * kv + kh * hd];
+      const std::uint16_t* key =
+          &st.keys[static_cast<std::size_t>(j) * kv + kh * hd];
       for (int g = 0; g < group; ++g) {
         scores[g * slice_len + (j - begin)] =
-            Dot(queries + static_cast<std::size_t>(g) * hd, key, hd) * scale;
+            vec::DotHalf(queries + static_cast<std::size_t>(g) * hd, key, hd) *
+            scale;
       }
     }
     for (int g = 0; g < group; ++g) {
@@ -329,14 +334,11 @@ void Mixer::Attention(int il, float* in, int position, DecodeState::Layer& st,
       acc[hd + 1] = total;
     }
     for (int j = begin; j < end; ++j) {
-      const float* value =
+      const std::uint16_t* value =
           &st.values[static_cast<std::size_t>(j) * kv + kh * hd];
       for (int g = 0; g < group; ++g) {
-        const float p = scores[g * slice_len + (j - begin)];
-        float* acc = out + g * partial;
-        for (int e = 0; e < hd; ++e) {
-          acc[e] += p * value[e];
-        }
+        vec::AddScaledHalf(scores[g * slice_len + (j - begin)], value,
+                           out + g * partial, hd);
       }
     }
   });

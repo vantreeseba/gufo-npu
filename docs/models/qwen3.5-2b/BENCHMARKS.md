@@ -236,6 +236,25 @@ Decode at 2k context is now ~8% below short context (no draft: 29.1 vs
 of K/V, still well below the CPU's 115 GB/s (a bf16 cache would halve the
 bytes).
 
+### fp16 K/V cache
+
+The attention cache now holds fp16 (llama.cpp's default cache type: half
+the bytes of fp32, 3 more mantissa bits than bf16); F16C converts on load.
+Prompts of 2,120 and 9,050 tokens ("Item i: …", then the sky question),
+the committed build and this one interleaved, warm, 2026-10-27:
+
+| | fp32 K/V | fp16 K/V |
+|---|---|---|
+| 2k context, `--draft none` | 34.56, 34.62, 34.57 tok/s | **35.49, 35.67, 35.45** |
+| 2k context, `--draft mtp` | 47.56, 47.28, 46.17 | **48.20, 48.40, 48.70** |
+| 9k context, `--draft none` | 28.67, 28.68, 28.63 | **31.62, 31.84, 31.85** |
+| 9k prompt (token by token) | 160.2–160.8 s | 146.9–148.0 s |
+| CPU mixer time, 9k run | 36.4–37.1 s | 23.1–24.2 s |
+
+At 9k context the cache is 222 MB per token in fp32 and 111 MB in fp16;
+decode there is now 18% below short context (31.8 vs 37.2 tok/s, no
+draft).
+
 ### Draft vocabulary for the MTP head
 
 A draft spent 5.8 of its ~7.5 ms in the LM head (248,832 rows, 290 MB). It

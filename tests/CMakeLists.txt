@@ -14,6 +14,16 @@ target_link_libraries(quant_test PRIVATE gufo_npu_core)
 add_test(NAME quant_test
          COMMAND quant_test "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/quant")
 
+# The same source twice: with the decoders' flags (F16C, AVX2, FMA paths)
+# and with the default flags (portable fallbacks).
+add_executable(vec_test core/vec_test.cpp)
+target_link_libraries(vec_test PRIVATE gufo_npu_core)
+target_compile_options(vec_test PRIVATE -march=x86-64-v3)
+add_test(NAME vec_test COMMAND vec_test)
+add_executable(vec_portable_test core/vec_test.cpp)
+target_link_libraries(vec_portable_test PRIVATE gufo_npu_core)
+add_test(NAME vec_portable_test COMMAND vec_portable_test)
+
 add_executable(q4nx_test core/q4nx_test.cpp)
 target_link_libraries(q4nx_test PRIVATE gufo_npu_core)
 add_test(NAME q4nx_test COMMAND q4nx_test)

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -16,10 +17,12 @@ namespace gufo_npu::qwen35 {
 struct DecodeState {
   int position = 0;
   struct Layer {
-    std::vector<float> conv;    // [conv_kernel - 1][channels], oldest first
-    std::vector<float> ssm;     // [value heads][key dim i][value dim j]
-    std::vector<float> keys;    // [position][kv_heads * head_dim]
-    std::vector<float> values;  // [position][kv_heads * head_dim]
+    std::vector<float> conv;  // [conv_kernel - 1][channels], oldest first
+    std::vector<float> ssm;   // [value heads][key dim i][value dim j]
+    // The attention cache in fp16 bits (vec::ToHalf), [position][kv_heads *
+    // head_dim]; keys after q/k norm and RoPE.
+    std::vector<std::uint16_t> keys;
+    std::vector<std::uint16_t> values;
     // A speculative token's DeltaNet state and the conv window before it,
     // kept until the token is accepted or rolled back (NpuDecoder).
     std::vector<float> ssm_spec;
