@@ -144,6 +144,13 @@ int main() {
     Expect(c.vocab == 100 && c.tied_embeddings, "dense: tied vocab");
     Expect(c.linear_key_heads == 2 && c.linear_value_heads == 2,
            "dense: DeltaNet heads");
+    bool threw = false;
+    try {
+      (void)qwen35::RequireDenseTied(c, "test");
+    } catch (const std::runtime_error&) {
+      threw = true;
+    }
+    Expect(!threw, "dense: RequireDenseTied accepts it");
   }
 
   // MoE: 32 value heads over 16 key heads in the real model, here 4 over 2.
@@ -173,6 +180,13 @@ int main() {
     Expect(!c.IsFullAttention(2) && c.IsFullAttention(3) &&
                c.IsFullAttention(7) && c.IsFullAttention(8),
            "moe: layer pattern and MTP layer");
+    bool threw = false;
+    try {
+      (void)qwen35::RequireDenseTied(c, "test");
+    } catch (const std::runtime_error&) {
+      threw = true;
+    }
+    Expect(threw, "moe: RequireDenseTied rejects it");
   }
 
   // Inconsistent: experts used > experts, MoE without expert widths, a

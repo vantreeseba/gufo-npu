@@ -31,7 +31,7 @@ q4nx::Segment SegmentOf(const gguf::TensorInfo& t) {
 }  // namespace
 
 Q4nxProjections::Q4nxProjections(const gguf::File& file)
-    : config_(ReadConfig(file)) {
+    : config_(RequireDenseTied(ReadConfig(file), "qwen35 Q4nxProjections")) {
   const Config& c = config_;
   const auto hidden = static_cast<std::size_t>(c.hidden);
   for (int il = 0; il < c.layers; ++il) {

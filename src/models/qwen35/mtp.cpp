@@ -50,7 +50,9 @@ struct MtpHead::Impl {
   std::vector<float> eh, x, normed, qkv, ctx, proj, ffn, act, logits;
 
   Impl(const gguf::File& file, Options o)
-      : config(ReadConfig(file)), options(o), mixer(file) {
+      : config(RequireDenseTied(ReadConfig(file), "qwen35 MtpHead")),
+        options(o),
+        mixer(file) {
     const Config& c = config;
     if (c.mtp_layers < 1) {
       throw std::runtime_error("qwen35: model has no MTP layer");

@@ -60,4 +60,9 @@ struct Config {
 // Throws std::runtime_error when required keys are missing or inconsistent.
 Config ReadConfig(const gguf::File& file);
 
+// Returns `c` if it is a dense model with tied embeddings (token_embd is the
+// LM head; ffn_gate/up/down per layer), else throws std::runtime_error naming
+// `who`. For the paths that only support Qwen3.5-2B-like models.
+Config RequireDenseTied(Config c, const char* who);
+
 }  // namespace gufo_npu::qwen35

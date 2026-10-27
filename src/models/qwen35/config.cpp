@@ -71,4 +71,15 @@ Config ReadConfig(const gguf::File& file) {
   return c;
 }
 
+Config RequireDenseTied(Config c, const char* who) {
+  if (c.IsMoe() || !c.tied_embeddings) {
+    throw std::runtime_error(
+        std::string(who) +
+        " supports dense models with tied embeddings only; this GGUF (" +
+        c.architecture + ") has " +
+        (c.IsMoe() ? "MoE layers" : "an untied output.weight"));
+  }
+  return c;
+}
+
 }  // namespace gufo_npu::qwen35

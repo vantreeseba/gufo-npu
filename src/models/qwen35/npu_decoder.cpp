@@ -168,7 +168,9 @@ struct NpuDecoder::Impl {
   }
 
   Impl(const gguf::File& file, const std::filesystem::path& kernel_dir)
-      : config(ReadConfig(file)), mixer(file), runtime(kernel_dir) {
+      : config(RequireDenseTied(ReadConfig(file), "qwen35 NpuDecoder")),
+        mixer(file),
+        runtime(kernel_dir) {
     const Config& c = config;
     if (static_cast<std::size_t>(c.hidden) != npu::kGemvHidden) {
       throw std::runtime_error("npu decoder: hidden size must be " +
