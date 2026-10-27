@@ -13,12 +13,18 @@ set(GUFO_NPU_KERNEL_DESIGNS smoke_add_one bw_memcpy bw_read q4nx_gemv)
 # inputs.
 set(q4nx_gemv_OUTPUTS
   q4nx_gemv.xclbin
-  q4nx_gemv_k2048_n2048_plain_store.insts.elf
-  q4nx_gemv_k2048_n5120_resnorm_store.insts.elf
-  q4nx_gemv_k2048_n8192_resnorm_store.insts.elf
-  q4nx_gemv_k2048_n12288_resnorm_swiglu.insts.elf
-  q4nx_gemv_k6144_n2048_act_store.insts.elf
-  q4nx_gemv_k2048_n248832_resnorm_store.insts.elf)
+  q4nx_gemv_k2048_n2048_plain_store_t1.insts.elf
+  q4nx_gemv_k2048_n2048_plain_store_t2.insts.elf
+  q4nx_gemv_k2048_n5120_resnorm_store_t1.insts.elf
+  q4nx_gemv_k2048_n5120_resnorm_store_t2.insts.elf
+  q4nx_gemv_k2048_n8192_resnorm_store_t1.insts.elf
+  q4nx_gemv_k2048_n8192_resnorm_store_t2.insts.elf
+  q4nx_gemv_k2048_n12288_resnorm_swiglu_t1.insts.elf
+  q4nx_gemv_k2048_n12288_resnorm_swiglu_t2.insts.elf
+  q4nx_gemv_k6144_n2048_act_store_t1.insts.elf
+  q4nx_gemv_k6144_n2048_act_store_t2.insts.elf
+  q4nx_gemv_k2048_n248832_resnorm_store_t1.insts.elf
+  q4nx_gemv_k2048_n248832_resnorm_store_t2.insts.elf)
 set(q4nx_gemv_SOURCES aie/q4nx_gemv.cc)
 
 set(kernel_outputs)

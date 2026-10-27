@@ -120,6 +120,25 @@ stops after 64). Three runs in a row per row, 2026-10-27:
   4-token GEMV costs about the same as one).
 - Prompts run token by token through the decode path (prefill is Phase 4).
 
+### Two tokens per weight read (speculative decoding, step 1)
+
+Every GEMV variant also takes two tokens per call (the weights are read once
+and each block is widened once for both). `gufo-npu bench gemv`, two runs,
+2026-10-27:
+
+| Stage | 1 token µs | 2 tokens µs | 2 vs 1 |
+|---|---|---|---|
+| DeltaNet in (qkv + z) | 273–279 | 288–295 | 1.06× |
+| Attention in (q + k + v) | 206–208 | 223–224 | 1.07× |
+| Mixer out (ssm_out) | 125–134 | 126–147 | 1.01–1.10× |
+| FFN in (gate + up, SwiGLU) | 376 | 392–393 | 1.04× |
+| FFN down | 224–225 | 232 | 1.03× |
+| LM head | 5,775–5,782 | 5,792–5,803 | 1.00× |
+
+A second token costs 0–10% per call: verifying one draft token per step
+reads the weights once. Single-token decode after the change: 35.27, 35.41,
+35.05 tok/s (35.5 before; the token buffer grew from 24 to 36 KB).
+
 ### NPU power mode
 
 `xrt-smi configure --pmode <mode>` (needs CAP_SYS_ADMIN; the box runs

@@ -1,12 +1,18 @@
-// q4nx matrix-vector product for decode: y = W x, one token.
+// q4nx matrix-vector product for decode: y = W x for one or two tokens per
+// weight read (two verify a speculative draft).
 //
 // Each core owns Q4NX_M_TILE out-features per round and streams their q4nx
-// blocks (Q4NX_M_TILE x Q4NX_K_TILE) past the token. The token buffer holds
-// GEMV_MAX_DIM fp32 values; the number of k blocks in use and the input and
-// output stages arrive at run time, so one core program serves every call:
-//   input:  plain (x in fp32), or resnorm: rms_norm(H + D) * w, with H + D
-//           also written out as the next residual by one column's cores.
-//   output: store (fp32), or swiglu: silu(gate) * up from paired rows.
+// blocks (Q4NX_M_TILE x Q4NX_K_TILE) past the tokens. The k block count, the
+// token count and the input and output stages arrive at run time, so one core
+// program serves every call:
+//   input:  plain (fp32), act (bf16, a compact SwiGLU output), or resnorm:
+//           rms_norm(H + D) * w, with H + D also written out as the next
+//           residual by one column's cores.
+//   output: store (fp32), or swiglu: silu(gate) * up from paired rows, bf16.
+//
+// The token buffer (raw) holds GEMV_TOKENS slots of SLOT fp32 each, then the
+// norm weight; act tokens sit back to back as bf16 instead (MAX_DIM apart).
+// Each output object carries GEMV_TOKENS * M_TILE values, token-major.
 //
 // The block layout is IRON's q4nx.h. The accumulation is adapted from its
 // q4nx_accumulate, keeping more precision: each block's dot product and each
@@ -22,7 +28,8 @@
 #include <stdint.h>
 
 #if !defined(Q4NX_M_TILE) || !defined(Q4NX_K_TILE) || !defined(Q4NX_GROUP) || \
-    !defined(GEMV_MAX_DIM) || !defined(GEMV_RMS_EPS) || !defined(GEMV_HIDDEN)
+    !defined(GEMV_MAX_DIM) || !defined(GEMV_RMS_EPS) ||                      \
+    !defined(GEMV_HIDDEN) || !defined(GEMV_TOKENS) || !defined(GEMV_SLOT)
 #error "q4nx_gemv.cc needs its geometry -D defined"
 #endif
 
@@ -33,38 +40,44 @@ namespace {
 constexpr int M_TILE = Q4NX_M_TILE;
 constexpr int K_TILE = Q4NX_K_TILE;
 constexpr int MAX_DIM = GEMV_MAX_DIM;
+constexpr int TOKENS = GEMV_TOKENS;  // tokens a call can carry
+constexpr int SLOT = GEMV_SLOT;      // fp32 per plain/resnorm token slot
+constexpr int SUMS = 2 * MAX_DIM / 32;  // hi then lo, per token
 
 static_assert(Q4NX_GROUP == 32, "a column sum covers exactly one group");
 static_assert(K_TILE % 32 == 0, "a k tile must hold whole groups");
 static_assert(MAX_DIM % K_TILE == 0, "the token must cover whole k tiles");
 static_assert(M_TILE % 16 == 0, "rows are processed 16 at a time");
+static_assert(TOKENS == 1 || TOKENS == 2, "one or two tokens per call");
 
-// c[0:M] += dequantize(A) * B[0:N], with the minima folded in through the
-// per-32 sums of B (given as hi and lo bf16 halves).
-template <int M, int N>
-void accumulate(const q4nx_block<M, N> *A, const bf16 *B, float *c,
-                const bf16 *sums_hi, const bf16 *sums_lo) {
+// c_t[0:M] += dequantize(A) * B_t[0:N] for T tokens, with the minima folded
+// in through the per-32 sums of each B_t (hi and lo bf16 halves). The codes
+// are widened once and used for every token.
+template <int M, int N, int T>
+void accumulate(const q4nx_block<M, N> *A, const bf16 *const *B,
+                float *const *c, const bf16 *const *sums_hi,
+                const bf16 *const *sums_lo) {
   constexpr int pr = 16;
   const uint4 *qs_ptr = A->qs;
 
   AIE_LOOP_RANGE(M / pr, M / pr)
   for (int row = 0; row < M; row += pr) {
-    aie::accum<accfloat, pr> c_accum;
-    c_accum.from_vector(aie::load_v<pr>(c + row));
-    const bf16 *it_B = B;
+    aie::accum<accfloat, pr> c_accum[T];
+#pragma clang loop unroll(full)
+    for (int t = 0; t < T; t++) {
+      c_accum[t].from_vector(aie::load_v<pr>(c[t] + row));
+    }
     uint32_t scale_min_offset = row;
 
     AIE_LOOP_RANGE(N / 32, N / 32)
     for (int sub_chunk = 0; sub_chunk < N / 32; sub_chunk++) {
-      aie::vector<bf16, 32> b_col = aie::load_v<32>(it_B);
-      it_B += 32;
       aie::vector<bf16, pr> a_scales =
           aie::load_v<pr>(A->scales + scale_min_offset);
       aie::vector<bf16, pr> a_mins = aie::load_v<pr>(A->mins + scale_min_offset);
       scale_min_offset += M;
 
       // 32 columns = 4 uint4 sub-vectors x 8 lanes each, fully unrolled so
-      // the scheduler pipelines one flat 32-long MAC chain.
+      // the scheduler pipelines one flat 32-long MAC chain per token.
       aie::vector<bf16, pr * 8> a_cc_bf16[4];
 #pragma clang loop unroll(full)
       for (int sv = 0; sv < 4; sv++) {
@@ -74,39 +87,46 @@ void accumulate(const q4nx_block<M, N> *A, const bf16 *B, float *c,
         acc.from_vector(aie::to_float(a_cc, 0));
         a_cc_bf16[sv] = acc.template to_vector<bf16>();
       }
-      aie::accum<accfloat, pr> dot =
-          aie::mul(a_cc_bf16[0].extract<pr>(0), b_col.get(0));
 #pragma clang loop unroll(full)
-      for (int sv = 0; sv < 4; sv++) {
+      for (int t = 0; t < T; t++) {
+        aie::vector<bf16, 32> b_col = aie::load_v<32>(B[t] + sub_chunk * 32);
+        aie::accum<accfloat, pr> dot =
+            aie::mul(a_cc_bf16[0].extract<pr>(0), b_col.get(0));
 #pragma clang loop unroll(full)
-        for (int cc = 0; cc < 8; cc++) {
-          if (sv == 0 && cc == 0)
-            continue;
-          dot = aie::mac(dot, a_cc_bf16[sv].extract<pr>(cc),
-                         b_col.get(sv * 8 + cc));
+        for (int sv = 0; sv < 4; sv++) {
+#pragma clang loop unroll(full)
+          for (int cc = 0; cc < 8; cc++) {
+            if (sv == 0 && cc == 0)
+              continue;
+            dot = aie::mac(dot, a_cc_bf16[sv].extract<pr>(cc),
+                           b_col.get(sv * 8 + cc));
+          }
         }
+        // The scale multiply takes bf16 operands, so split the fp32 dot into
+        // hi + lo: the residual error drops from 2^-9 to about 2^-17.
+        aie::vector<bf16, pr> dot_hi = dot.template to_vector<bf16>();
+        aie::accum<accfloat, pr> rest = aie::sub(dot, dot_hi);
+        aie::vector<bf16, pr> dot_lo = rest.template to_vector<bf16>();
+        c_accum[t] = aie::mac(c_accum[t], dot_hi, a_scales);
+        c_accum[t] = aie::mac(c_accum[t], dot_lo, a_scales);
+        c_accum[t] = aie::mac(c_accum[t], a_mins, sums_hi[t][sub_chunk]);
+        c_accum[t] = aie::mac(c_accum[t], a_mins, sums_lo[t][sub_chunk]);
       }
-
-      // The scale multiply takes bf16 operands, so split the fp32 dot into
-      // hi + lo: the residual error drops from 2^-9 to about 2^-17.
-      aie::vector<bf16, pr> dot_hi = dot.template to_vector<bf16>();
-      aie::accum<accfloat, pr> rest = aie::sub(dot, dot_hi);
-      aie::vector<bf16, pr> dot_lo = rest.template to_vector<bf16>();
-      c_accum = aie::mac(c_accum, dot_hi, a_scales);
-      c_accum = aie::mac(c_accum, dot_lo, a_scales);
-      c_accum = aie::mac(c_accum, a_mins, sums_hi[sub_chunk]);
-      c_accum = aie::mac(c_accum, a_mins, sums_lo[sub_chunk]);
     }
-    aie::store_v(c + row, c_accum.template to_vector<float>());
+#pragma clang loop unroll(full)
+    for (int t = 0; t < T; t++) {
+      aie::store_v(c[t] + row, c_accum[t].template to_vector<float>());
+    }
   }
 }
 
 // Input stage modes (RTP word 2).
-constexpr int PROLOGUE_PLAIN = 0;    // x: fp32
-constexpr int PROLOGUE_RESNORM = 1;  // [H fp32 | D fp32 | w bf16]: rms(H + D) w
+constexpr int PROLOGUE_PLAIN = 0;    // slot: dim fp32
+constexpr int PROLOGUE_RESNORM = 1;  // slot: [H | D] fp32; w bf16 after slots
+constexpr int PROLOGUE_ACT = 2;      // dim bf16 per token, MAX_DIM apart
 // Output stage modes (RTP word 3).
-constexpr int EPILOGUE_STORE = 0;   // y: M_TILE fp32
-constexpr int EPILOGUE_SWIGLU = 1;  // y[m] = silu(acc[m]) acc[m + 16], m < 16
+constexpr int EPILOGUE_STORE = 0;   // per token: M_TILE fp32
+constexpr int EPILOGUE_SWIGLU = 1;  // per token: 16 bf16 silu(g) * u, then pad
 
 constexpr float RMS_EPS = GEMV_RMS_EPS;
 constexpr int HIDDEN = GEMV_HIDDEN;
@@ -180,25 +200,31 @@ void norm(float *h, const bfloat16 *w, int n) {
   }
 }
 
-// The rest of the input stage, then the per-32 sums of x (hi and lo bf16
-// halves at sums[0 : MAX_DIM / 32] and sums[MAX_DIM / 32 :]) that fold every
-// block's minima into one MAC. x ends as bf16 at the start of `raw`.
-void prep(float *raw, bfloat16 *sums, int k_blocks, int prologue) {
+// Where token t's bf16 x sits in the token buffer after the input stage.
+bfloat16 *token_x(float *raw, int prologue, int t) {
+  return prologue == PROLOGUE_ACT ? (bfloat16 *)raw + t * MAX_DIM
+                                  : (bfloat16 *)(raw + t * SLOT);
+}
+
+// The rest of the input stage for token t, then the per-32 sums of its x
+// (hi and lo bf16 halves) that fold every block's minima into one MAC.
+void prep(float *raw, bfloat16 *sums, int k_blocks, int prologue, int t) {
   const int n = k_blocks * K_TILE;
-  bfloat16 *x = (bfloat16 *)raw;
+  bfloat16 *x = token_x(raw, prologue, t);
   if (prologue == PROLOGUE_RESNORM) {
-    norm(raw, (const bfloat16 *)(raw + 2 * n), n);
-  } else {
-    to_bf16(x, raw, n);
+    norm(raw + t * SLOT, (const bfloat16 *)(raw + TOKENS * SLOT), n);
+  } else if (prologue == PROLOGUE_PLAIN) {
+    to_bf16(x, raw + t * SLOT, n);
   }
-  bfloat16 *lo = sums + MAX_DIM / 32;
+  bfloat16 *hi_out = sums + t * SUMS;
+  bfloat16 *lo_out = hi_out + SUMS / 2;
   for (int g = 0; g < n / 32; g++) {
     const float sum = aie::reduce_add(
         aie::accum<accfloat, 32>(aie::load_v<32>(x + 32 * g))
             .template to_vector<float>());
     const bfloat16 hi = (bfloat16)sum;
-    sums[g] = hi;
-    lo[g] = (bfloat16)(sum - (float)hi);
+    hi_out[g] = hi;
+    lo_out[g] = (bfloat16)(sum - (float)hi);
   }
 }
 
@@ -206,75 +232,100 @@ void prep(float *raw, bfloat16 *sums, int k_blocks, int prologue) {
 
 extern "C" {
 
-// Once per token, first: with PROLOGUE_RESNORM, h = H + D in place over H.
-// Also selects round-to-nearest-even for every float-to-bf16 narrowing that
-// follows: a core powers up in floor mode, which truncates each block's dot
-// products and biases the sum over the k blocks (about 1% relative error at
-// dim 2048); the mode is core-global and sticky.
-void gemv_residual(float *raw, int k_blocks, int prologue) {
+// Once per call, first: with PROLOGUE_RESNORM, h = H + D in place over H for
+// each of `tokens`. Also selects round-to-nearest-even for every
+// float-to-bf16 narrowing that follows: a core powers up in floor mode, which
+// truncates each block's dot products and biases the sum over the k blocks
+// (about 1% relative error at dim 2048); the mode is core-global and sticky.
+void gemv_residual(float *raw, int k_blocks, int prologue, int tokens) {
   event0();
   aie::set_rounding(aie::rounding_mode::conv_even);
   if (prologue == PROLOGUE_RESNORM) {
     const int n = k_blocks * K_TILE;
-    for (int i = 0; i < n; i += 16) {
-      aie::accum<accfloat, 16> acc;
-      acc.from_vector(aie::load_v<16>(raw + i));
-      acc = aie::add(acc, aie::load_v<16>(raw + n + i));
-      aie::store_v(raw + i, acc.template to_vector<float>());
+    for (int t = 0; t < tokens; t++) {
+      float *h = raw + t * SLOT;
+      for (int i = 0; i < n; i += 16) {
+        aie::accum<accfloat, 16> acc;
+        acc.from_vector(aie::load_v<16>(h + i));
+        acc = aie::add(acc, aie::load_v<16>(h + n + i));
+        aie::store_v(h + i, acc.template to_vector<float>());
+      }
     }
   }
   event1();
 }
 
 // On the residual column, between gemv_residual and gemv_prep: M_TILE values
-// of h, piece `piece` of this core's quarter (`row` of 4).
+// of each token's h, piece `piece` of this core's quarter (`row` of 4).
 void gemv_residual_out(float *y, const float *raw, int row, int piece) {
   event0();
-  copy_vectorized<float, M_TILE>(
-      y, raw + (row * (HIDDEN / 4) + piece * M_TILE));
+  for (int t = 0; t < TOKENS; t++) {
+    copy_vectorized<float, M_TILE>(
+        y + t * M_TILE, raw + (t * SLOT + row * (HIDDEN / 4) + piece * M_TILE));
+  }
   event1();
 }
 
-// Once per token, after gemv_residual: the rest of the input stage.
-void gemv_prep(float *raw, bfloat16 *sums, int k_blocks, int prologue) {
+// Once per call, after gemv_residual: the rest of the input stage.
+void gemv_prep(float *raw, bfloat16 *sums, int k_blocks, int prologue,
+               int tokens) {
   event0();
-  prep(raw, sums, k_blocks, prologue);
+  for (int t = 0; t < tokens; t++) {
+    prep(raw, sums, k_blocks, prologue, t);
+  }
   event1();
 }
 
 // Before each round's k loop.
 void gemv_zero(float *y_acc) {
   event0();
-  zero_vectorized<float, M_TILE, 1, false>(y_acc);
+  zero_vectorized<float, TOKENS * M_TILE, 1, false>(y_acc);
   event1();
 }
 
-// y_acc += block * x[k * K_TILE : (k + 1) * K_TILE].
-void gemv_block(const q4nx_block_t *w, const bfloat16 *x, float *y_acc,
-                const bfloat16 *sums, int k) {
+// y_acc[t] += block * x_t[k * K_TILE : (k + 1) * K_TILE] for each token.
+void gemv_block(const q4nx_block_t *w, float *raw, float *y_acc,
+                const bfloat16 *sums, int k, int prologue, int tokens) {
   event0();
-  accumulate<M_TILE, K_TILE>(w, x + k * K_TILE, y_acc, sums + k * (K_TILE / 32),
-                             sums + MAX_DIM / 32 + k * (K_TILE / 32));
+  const bf16 *b[TOKENS];
+  float *c[TOKENS];
+  const bf16 *hi[TOKENS];
+  const bf16 *lo[TOKENS];
+  for (int t = 0; t < TOKENS; t++) {
+    b[t] = token_x(raw, prologue, t) + k * K_TILE;
+    c[t] = y_acc + t * M_TILE;
+    hi[t] = sums + t * SUMS + k * (K_TILE / 32);
+    lo[t] = hi[t] + SUMS / 2;
+  }
+  if (TOKENS == 2 && tokens == 2) {
+    accumulate<M_TILE, K_TILE, TOKENS>(w, b, c, hi, lo);
+  } else {
+    accumulate<M_TILE, K_TILE, 1>(w, b, c, hi, lo);
+  }
   event1();
 }
 
-// After each round's k loop. EPILOGUE_STORE writes the fp32 sums; with
-// EPILOGUE_SWIGLU the core's rows are 16 gate rows then their 16 up rows,
-// and it writes silu(gate) * up to the first 16 values (the rest are zero).
+// After each round's k loop, per token. EPILOGUE_STORE writes the fp32 sums;
+// with EPILOGUE_SWIGLU the core's rows are 16 gate rows then their 16 up
+// rows, and it writes silu(gate) * up as 16 bf16 at the start of the token's
+// M_TILE values (the rest is padding the sequence discards).
 void gemv_store(float *y, const float *y_acc, int epilogue) {
   event0();
-  if (epilogue == EPILOGUE_SWIGLU) {
-    static_assert(M_TILE == 32, "SwiGLU pairs 16 gate rows with 16 up rows");
-    aie::vector<float, 16> g = aie::load_v<16>(y_acc);
-    aie::vector<float, 16> u = aie::load_v<16>(y_acc + 16);
-    const aie::vector<float, 16> sig = sigmoid(g);
-    aie::vector<float, 16> out =
-        aie::mul(aie::mul(g, sig).template to_vector<float>(), u)
-            .template to_vector<float>();
-    aie::store_v(y, out);
-    aie::store_v(y + 16, aie::zeros<float, 16>());
-  } else {
-    copy_vectorized<float, M_TILE>(y, y_acc);
+  for (int t = 0; t < TOKENS; t++) {
+    float *yt = y + t * M_TILE;
+    const float *acc = y_acc + t * M_TILE;
+    if (epilogue == EPILOGUE_SWIGLU) {
+      static_assert(M_TILE == 32, "SwiGLU pairs 16 gate rows with 16 up rows");
+      aie::vector<float, 16> g = aie::load_v<16>(acc);
+      aie::vector<float, 16> u = aie::load_v<16>(acc + 16);
+      const aie::vector<float, 16> sig = sigmoid(g);
+      aie::accum<accfloat, 16> out;
+      out.from_vector(aie::mul(aie::mul(g, sig).template to_vector<float>(), u)
+                          .template to_vector<float>());
+      aie::store_v((bfloat16 *)yt, out.template to_vector<bfloat16>());
+    } else {
+      copy_vectorized<float, M_TILE>(yt, acc);
+    }
   }
   event1();
 }

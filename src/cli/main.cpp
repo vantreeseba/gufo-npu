@@ -258,8 +258,8 @@ int BenchGemv(const std::vector<std::string_view>& args) {
       {"ffn down", {"blk.0.ffn_down.weight"}, Prologue::kAct, Epilogue::kStore},
       {"LM head", {"token_embd.weight"}, Prologue::kResNorm, Epilogue::kStore},
   };
-  std::printf("%-22s %6s %7s %8s %9s %9s %7s\n", "stage", "dim", "rows", "MB",
-              "mean us", "best us", "GB/s");
+  std::printf("%-22s %6s %7s %8s %10s %10s %8s %9s\n", "stage", "dim", "rows",
+              "MB", "1 tok us", "2 tok us", "GB/s(1)", "2 vs 1");
   for (const auto& c : cases) {
     std::vector<q4nx::Segment> segments;
     for (const char* name : c.tensors) {
@@ -271,19 +271,22 @@ int BenchGemv(const std::vector<std::string_view>& args) {
     namespace npu = gufo_npu::npu;
     npu::Q4nxGemv gemv(runtime, packed, c.prologue, c.epilogue);
     // Unit inputs: timing only (tests/npu/q4nx_gemv_test.cpp checks values).
-    npu::Buffer x(
-        runtime, c.prologue == Prologue::kAct ? 8 * dim : npu::kGemvInputBytes);
+    npu::Buffer x(runtime, std::max<std::size_t>(npu::kGemvInputBytes,
+                                                 4 * dim * sizeof(float)));
     std::fill_n(x.as<float>(), x.size() / sizeof(float), 1.0f);
     x.ToDevice();
-    npu::Buffer y(runtime, packed.padded_rows * sizeof(float));
-    npu::Buffer r(runtime, npu::kGemvHidden * sizeof(float));
-    gemv.Run(x, y, r);
-    gemv.Time(20);  // warm up
-    const auto timing = gemv.Time(iterations);
+    npu::Buffer y(runtime, gemv.y_bytes());
+    npu::Buffer r(runtime, npu::kGemvResidualBytes);
+    double mean_us[2];
+    for (std::size_t tokens = 1; tokens <= 2; ++tokens) {
+      gemv.Run(x, y, r, tokens);
+      gemv.Time(20);  // warm up
+      mean_us[tokens - 1] = gemv.Time(iterations).mean_us;
+    }
     const double mb = static_cast<double>(gemv.weight_bytes()) / 1e6;
-    std::printf("%-22s %6zu %7zu %8.1f %9.1f %9.1f %7.1f\n", c.label, dim,
-                packed.rows, mb, timing.mean_us, timing.best_us,
-                mb * 1e6 / timing.mean_us / 1e3);
+    std::printf("%-22s %6zu %7zu %8.1f %10.1f %10.1f %8.1f %8.2fx\n", c.label,
+                dim, packed.rows, mb, mean_us[0], mean_us[1],
+                mb * 1e6 / mean_us[0] / 1e3, mean_us[1] / mean_us[0]);
   }
   return 0;
 }

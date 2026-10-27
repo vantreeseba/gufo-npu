@@ -9,32 +9,46 @@
 
 // The q4nx GEMV design (kernels/designs/q4nx_gemv.py): one xclbin in one
 // hardware context, one instruction sequence per variant (shape, input stage,
-// output stage). A Q4nxGemv keeps one matrix resident on the device; its
-// calls read and write device Buffers, so the output of one call can be the
-// input region of the next and a Chain can run them back to back.
+// output stage, 1 or 2 tokens). A Q4nxGemv keeps one matrix resident on the
+// device; its calls read and write device Buffers, so the output of one call
+// can be the input region of the next and a Chain can run them back to back.
+// A two-token call reads the weights once for both tokens.
 namespace gufo_npu::npu {
 
-// The longest plain input, in fp32 values. Every call reads 4 * kGemvMaxDim
-// bytes of its input region (the tail past the input is ignored).
+// The longest input, in values.
 inline constexpr std::size_t kGemvMaxDim = 6144;
-inline constexpr std::size_t kGemvInputBytes = 4 * kGemvMaxDim;
 // Residual width of the resnorm input stage.
 inline constexpr std::size_t kGemvHidden = 2048;
+// Tokens a call can carry.
+inline constexpr std::size_t kGemvTokens = 2;
+// The input region (every call reads all of it): kGemvTokens slots of
+// kGemvSlot fp32, then a kGemvHidden bf16 norm weight at kGemvNormOffset.
+inline constexpr std::size_t kGemvSlot = 2 * kGemvHidden;  // fp32
+inline constexpr std::size_t kGemvNormOffset =
+    kGemvTokens * kGemvSlot * sizeof(float);  // bytes
+inline constexpr std::size_t kGemvInputBytes =
+    kGemvNormOffset + kGemvHidden * sizeof(std::uint16_t);
+// The residual buffer: token t's kGemvHidden fp32 at t * kGemvSlot.
+inline constexpr std::size_t kGemvResidualBytes =
+    (kGemvSlot + kGemvHidden) * sizeof(float);
 
 enum class Prologue {
-  kPlain,    // dim fp32
-  kAct,      // a SwiGLU output: the first 16 of every 32 fp32, dim of them
-  kResNorm,  // [H | D | w]: dim fp32, dim fp32, dim bf16 -> rms(H + D) * w;
-             // H + D also goes to the residual buffer
+  kPlain,    // slot t: dim fp32
+  kAct,      // dim bf16 per token, back to back (a compact SwiGLU output)
+  kResNorm,  // slot t: [H | D] (dim fp32 each), norm weight after the slots
+             // -> rms(H + D) * w; H + D also goes to the residual buffer
 };
 enum class Epilogue {
-  kStore,   // padded_rows fp32
-  kSwiGlu,  // per 32 rows (16 gate, then their 16 up): silu(g) * u, 16 zeros
+  kStore,   // padded_rows fp32 per token
+  kSwiGlu,  // rows 16 gate, then their 16 up, per 32 -> silu(g) * u as
+            // compact bf16 (padded_rows / 2 per token)
 };
 
-// The instruction sequence name, e.g. "q4nx_gemv_k2048_n8192_resnorm_store".
+// The instruction sequence name, e.g.
+// "q4nx_gemv_k2048_n8192_resnorm_store_t2".
 std::string Q4nxGemvSequence(std::size_t dim, std::size_t padded_rows,
-                             Prologue prologue, Epilogue epilogue);
+                             Prologue prologue, Epilogue epilogue,
+                             std::size_t tokens);
 
 class GemvRuntime {
 public:
@@ -89,9 +103,9 @@ public:
   Q4nxGemv(const Q4nxGemv&) = delete;
   Q4nxGemv& operator=(const Q4nxGemv&) = delete;
 
-  // One call on device buffers: x (kGemvInputBytes; 8 * dim for kAct), y
-  // (padded_rows fp32), residual (kGemvHidden fp32, written by kResNorm).
-  void Run(Buffer& x, Buffer& y, Buffer& residual);
+  // One call on device buffers for `tokens` (1 or 2): x (kGemvInputBytes),
+  // y (y_bytes()), residual (kGemvResidualBytes, written by kResNorm).
+  void Run(Buffer& x, Buffer& y, Buffer& residual, std::size_t tokens = 1);
 
   // Convenience for a plain/store GEMV on host memory: x has dim fp32
   // values (rounded to bf16 on the device), y gets `rows` values.
@@ -111,6 +125,13 @@ public:
   std::size_t rows() const { return rows_; }
   std::size_t padded_rows() const { return padded_rows_; }
   std::size_t weight_bytes() const;
+  // Where token t's output starts in y: t * y_token_stride() fp32 (store) or
+  // fp32 words of packed bf16 (SwiGLU). Calls that output a hidden vector
+  // put token t in slot t of the next input region (kGemvSlot apart).
+  std::size_t y_token_stride() const { return y_token_stride_; }
+  // Bytes a y buffer must span (both tokens' regions, and the SwiGLU
+  // padding the design discards past them).
+  std::size_t y_bytes() const;
 
   struct Impl;
   Impl& impl() { return *impl_; }
@@ -120,6 +141,8 @@ private:
   std::size_t dim_ = 0;
   std::size_t rows_ = 0;
   std::size_t padded_rows_ = 0;
+  std::size_t y_token_stride_ = 0;
+  Epilogue epilogue_ = Epilogue::kStore;
 };
 
 // Calls submitted together and run back to back (an XRT runlist).
@@ -131,7 +154,8 @@ public:
   Chain& operator=(const Chain&) = delete;
 
   // The buffers must outlive the chain.
-  void Add(Q4nxGemv& gemv, Buffer& x, Buffer& y, Buffer& residual);
+  void Add(Q4nxGemv& gemv, Buffer& x, Buffer& y, Buffer& residual,
+           std::size_t tokens = 1);
   // Runs every call in order and waits for the last.
   void Run();
 

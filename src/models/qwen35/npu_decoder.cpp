@@ -30,11 +30,16 @@ q4nx::Segment SegmentOf(const gguf::TensorInfo& t) {
   return {t.type, t.data, static_cast<std::size_t>(t.Rows())};
 }
 
-// A resnorm input region: [H | D | w | pad], kGemvInputBytes.
+// A resnorm input region: token t's [H | D] at t * kGemvSlot fp32, then the
+// norm weight. Outputs that feed it are written from H or D with token
+// stride kGemvSlot.
 constexpr std::size_t kH = 0;
 constexpr std::size_t kD = npu::kGemvHidden * sizeof(float);
-constexpr std::size_t kW = 2 * npu::kGemvHidden * sizeof(float);
+constexpr std::size_t kW = npu::kGemvNormOffset;
 constexpr std::size_t kHiddenBytes = npu::kGemvHidden * sizeof(float);
+constexpr std::size_t kSlotBytes = npu::kGemvSlot * sizeof(float);
+// Two tokens' worth of a hidden vector in a slotted region.
+constexpr std::size_t kSlottedBytes = kSlotBytes + kHiddenBytes;
 
 // Writes a norm weight (bf16) into the w slot of a resnorm input region.
 void SetNormWeight(Buffer& region, const gguf::TensorInfo& t) {
@@ -80,7 +85,7 @@ struct NpuDecoder::Impl {
     }
     const auto hidden = static_cast<std::size_t>(c.hidden);
     embed = &file.Tensor("token_embd.weight");
-    scratch = std::make_unique<Buffer>(runtime, kHiddenBytes);
+    scratch = std::make_unique<Buffer>(runtime, npu::kGemvResidualBytes);
     layers.resize(c.layers);
     for (int il = 0; il < c.layers; ++il) {
       const std::string p = "blk." + std::to_string(il) + ".";
@@ -127,12 +132,10 @@ struct NpuDecoder::Impl {
           Prologue::kAct, Epilogue::kStore);
 
       l.in_x = std::make_unique<Buffer>(runtime, npu::kGemvInputBytes);
-      l.in_y = std::make_unique<Buffer>(runtime,
-                                        l.in->padded_rows() * sizeof(float));
+      l.in_y = std::make_unique<Buffer>(runtime, l.in->y_bytes());
       l.out_x = std::make_unique<Buffer>(runtime, npu::kGemvInputBytes);
       l.ffn_x = std::make_unique<Buffer>(runtime, npu::kGemvInputBytes);
-      l.ffn_y = std::make_unique<Buffer>(runtime,
-                                         l.ffn->padded_rows() * sizeof(float));
+      l.ffn_y = std::make_unique<Buffer>(runtime, l.ffn->y_bytes());
       SetNormWeight(*l.in_x, t("attn_norm.weight"));
       SetNormWeight(*l.ffn_x, t("post_attention_norm.weight"));
       l.attn_norm = ToFloats(t("attn_norm.weight"));
@@ -142,7 +145,7 @@ struct NpuDecoder::Impl {
         runtime, q4nx::Pack(embed_t.type, embed_t.data, embed_t.Rows(), hidden),
         Prologue::kResNorm, Epilogue::kStore);
     lm_x = std::make_unique<Buffer>(runtime, npu::kGemvInputBytes);
-    lm_y = std::make_unique<Buffer>(runtime, lm->padded_rows() * sizeof(float));
+    lm_y = std::make_unique<Buffer>(runtime, lm->y_bytes());
     SetNormWeight(*lm_x, file.Tensor("output_norm.weight"));
 
     // Wiring. in_l: residual -> ffn_x.H. out_l: -> ffn_x.D. ffn_l: residual
@@ -150,14 +153,14 @@ struct NpuDecoder::Impl {
     first = std::make_unique<Chain>(runtime);
     first->Add(
         *layers[0].in, *layers[0].in_x, *layers[0].in_y,
-        layers[0].views.emplace_back(layers[0].ffn_x->Sub(kH, kHiddenBytes)));
+        layers[0].views.emplace_back(layers[0].ffn_x->Sub(kH, kSlottedBytes)));
     for (int il = 0; il < c.layers; ++il) {
       Layer& l = layers[il];
       const bool last = il + 1 == c.layers;
       Buffer& next_x = last ? *lm_x : *layers[il + 1].in_x;
-      Buffer& ffn_d = l.views.emplace_back(l.ffn_x->Sub(kD, kHiddenBytes));
-      Buffer& next_h = l.views.emplace_back(next_x.Sub(kH, kHiddenBytes));
-      Buffer& next_d = l.views.emplace_back(next_x.Sub(kD, kHiddenBytes));
+      Buffer& ffn_d = l.views.emplace_back(l.ffn_x->Sub(kD, kSlottedBytes));
+      Buffer& next_h = l.views.emplace_back(next_x.Sub(kH, kSlottedBytes));
+      Buffer& next_d = l.views.emplace_back(next_x.Sub(kD, kSlottedBytes));
       l.chain = std::make_unique<Chain>(runtime);
       l.chain->Add(*l.out, *l.out_x, ffn_d, *scratch);
       l.chain->Add(*l.ffn, *l.ffn_x, *l.ffn_y, next_h);
@@ -166,7 +169,7 @@ struct NpuDecoder::Impl {
         l.chain->Add(*lm, *lm_x, *lm_y, *scratch);
       } else {
         Layer& n = layers[il + 1];
-        Buffer& n_res = n.views.emplace_back(n.ffn_x->Sub(kH, kHiddenBytes));
+        Buffer& n_res = n.views.emplace_back(n.ffn_x->Sub(kH, kSlottedBytes));
         l.chain->Add(*n.in, *n.in_x, *n.in_y, n_res);
       }
     }

@@ -32,10 +32,11 @@ const char* EpilogueName(Epilogue e) {
 }  // namespace
 
 std::string Q4nxGemvSequence(std::size_t dim, std::size_t padded_rows,
-                             Prologue prologue, Epilogue epilogue) {
+                             Prologue prologue, Epilogue epilogue,
+                             std::size_t tokens) {
   return "q4nx_gemv_k" + std::to_string(dim) + "_n" +
          std::to_string(padded_rows) + "_" + PrologueName(prologue) + "_" +
-         EpilogueName(epilogue);
+         EpilogueName(epilogue) + "_t" + std::to_string(tokens);
 }
 
 struct GemvRuntime::Impl {
@@ -71,7 +72,11 @@ struct Buffer::Impl {
 Buffer::Buffer(GemvRuntime& runtime, std::size_t bytes)
     : impl_(std::make_shared<Impl>(Impl{
           runtime.impl().hw.Buffer(std::max<std::size_t>(bytes, 64)), bytes})) {
+  // Zero it and push the zeros out of the CPU cache now: dirty lines left
+  // behind can be written back over what the NPU writes later (seen as
+  // intermittently corrupted LM head output).
   std::memset(data(), 0, bytes);
+  ToDevice();
 }
 
 Buffer::Buffer(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -104,8 +109,7 @@ void Buffer::FromDevice() {
 }
 
 struct Q4nxGemv::Impl {
-  Sequence& sequence;
-  Prologue prologue;
+  Sequence* sequences[kGemvTokens];
   std::size_t w_bytes;
   xrt::bo w;
   // Buffers of the host-memory convenience Run.
@@ -115,39 +119,59 @@ struct Q4nxGemv::Impl {
   std::optional<xrt::run> run;
 
   Impl(GemvRuntime::Impl& rt, const q4nx::Matrix& m, Prologue p, Epilogue e)
-      : sequence(rt.Get(Q4nxGemvSequence(m.dim, m.padded_rows, p, e))),
-        prologue(p),
-        w_bytes(m.bytes.size()),
-        w(rt.hw.Buffer(w_bytes)) {
+      : w_bytes(m.bytes.size()), w(rt.hw.Buffer(w_bytes)) {
+    for (std::size_t t = 0; t < kGemvTokens; ++t) {
+      sequences[t] =
+          &rt.Get(Q4nxGemvSequence(m.dim, m.padded_rows, p, e, t + 1));
+    }
     std::memcpy(w.map<void*>(), m.bytes.data(), w_bytes);
     w.sync(XCL_BO_SYNC_BO_TO_DEVICE);
   }
 
-  xrt::run Bind(Buffer& x_buf, Buffer& y_buf, Buffer& r_buf) {
-    return sequence.Run(
+  xrt::run Bind(Buffer& x_buf, Buffer& y_buf, Buffer& r_buf,
+                std::size_t tokens) {
+    if (tokens < 1 || tokens > kGemvTokens) {
+      throw std::invalid_argument("q4nx GEMV: 1 or 2 tokens per call");
+    }
+    return sequences[tokens - 1]->Run(
         {&x_buf.impl().bo, &w, &y_buf.impl().bo, &r_buf.impl().bo});
   }
 };
 
 Q4nxGemv::Q4nxGemv(GemvRuntime& runtime, const q4nx::Matrix& weights,
                    Prologue prologue, Epilogue epilogue)
-    : impl_(
-          std::make_unique<Impl>(runtime.impl(), weights, prologue, epilogue)),
+    : impl_(std::make_unique<Impl>(runtime.impl(), weights, prologue, epilogue)),
       dim_(weights.dim),
       rows_(weights.rows),
-      padded_rows_(weights.padded_rows) {
+      padded_rows_(weights.padded_rows),
+      epilogue_(epilogue) {
   if (weights.dim > kGemvMaxDim) {
     throw std::invalid_argument("q4nx GEMV: dim above the design's maximum");
   }
+  // Must match VARIANTS in kernels/designs/q4nx_gemv.py.
+  if (epilogue == Epilogue::kSwiGlu) {
+    y_token_stride_ = padded_rows_ / 4;
+  } else if (padded_rows_ == kGemvHidden) {
+    y_token_stride_ = kGemvSlot;
+  } else {
+    y_token_stride_ = padded_rows_;
+  }
   impl_->x.emplace(runtime, kGemvInputBytes);
-  impl_->y.emplace(runtime, padded_rows_ * sizeof(float));
-  impl_->residual.emplace(runtime, kGemvHidden * sizeof(float));
+  impl_->y.emplace(runtime, y_bytes());
+  impl_->residual.emplace(runtime, kGemvResidualBytes);
 }
 
 Q4nxGemv::~Q4nxGemv() = default;
 
-void Q4nxGemv::Run(Buffer& x, Buffer& y, Buffer& residual) {
-  impl_->run.emplace(impl_->Bind(x, y, residual));
+std::size_t Q4nxGemv::y_bytes() const {
+  if (epilogue_ == Epilogue::kSwiGlu) {
+    return 8 * y_token_stride_ * sizeof(float);
+  }
+  return ((kGemvTokens - 1) * y_token_stride_ + padded_rows_) * sizeof(float);
+}
+
+void Q4nxGemv::Run(Buffer& x, Buffer& y, Buffer& residual, std::size_t tokens) {
+  impl_->run.emplace(impl_->Bind(x, y, residual, tokens));
   impl_->run->start();
   impl_->run->wait();
 }
@@ -156,7 +180,7 @@ void Q4nxGemv::Run(const float* x, float* y) {
   std::memcpy(impl_->x->data(), x, dim_ * sizeof(float));
   impl_->x->ToDevice();
   if (!impl_->run) {
-    impl_->run.emplace(impl_->Bind(*impl_->x, *impl_->y, *impl_->residual));
+    impl_->run.emplace(impl_->Bind(*impl_->x, *impl_->y, *impl_->residual, 1));
   }
   impl_->run->start();
   impl_->run->wait();
@@ -169,21 +193,13 @@ void Q4nxGemv::Run(const std::uint16_t* x, float* y) {
   for (std::size_t i = 0; i < dim_; ++i) {
     wide[i] = quant::Bf16ToFloat(x[i]);
   }
-  std::memcpy(impl_->x->data(), wide.data(), dim_ * sizeof(float));
-  impl_->x->ToDevice();
-  if (!impl_->run) {
-    impl_->run.emplace(impl_->Bind(*impl_->x, *impl_->y, *impl_->residual));
-  }
-  impl_->run->start();
-  impl_->run->wait();
-  impl_->y->FromDevice();
-  std::memcpy(y, impl_->y->data(), padded_rows_ * sizeof(float));
+  Run(wide.data(), y);
 }
 
 Q4nxGemv::Timing Q4nxGemv::Time(int iterations) {
   iterations = std::max(iterations, 1);
   if (!impl_->run) {
-    impl_->run.emplace(impl_->Bind(*impl_->x, *impl_->y, *impl_->residual));
+    impl_->run.emplace(impl_->Bind(*impl_->x, *impl_->y, *impl_->residual, 1));
   }
   Timing t;
   t.best_us = std::numeric_limits<double>::max();
@@ -215,8 +231,9 @@ Chain::Chain(GemvRuntime& runtime)
 
 Chain::~Chain() = default;
 
-void Chain::Add(Q4nxGemv& gemv, Buffer& x, Buffer& y, Buffer& residual) {
-  impl_->runs.push_back(gemv.impl().Bind(x, y, residual));
+void Chain::Add(Q4nxGemv& gemv, Buffer& x, Buffer& y, Buffer& residual,
+                std::size_t tokens) {
+  impl_->runs.push_back(gemv.impl().Bind(x, y, residual, tokens));
   impl_->runlist.add(impl_->runs.back());
 }
 

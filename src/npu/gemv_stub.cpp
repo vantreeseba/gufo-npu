@@ -47,7 +47,7 @@ Q4nxGemv::Q4nxGemv(GemvRuntime&, const q4nx::Matrix&, Prologue, Epilogue) {
   NoXrt();
 }
 Q4nxGemv::~Q4nxGemv() = default;
-void Q4nxGemv::Run(Buffer&, Buffer&, Buffer&) {}
+void Q4nxGemv::Run(Buffer&, Buffer&, Buffer&, std::size_t) {}
 void Q4nxGemv::Run(const float*, float*) {}
 void Q4nxGemv::Run(const std::uint16_t*, float*) {}
 Q4nxGemv::Timing Q4nxGemv::Time(int) {
@@ -56,13 +56,16 @@ Q4nxGemv::Timing Q4nxGemv::Time(int) {
 std::size_t Q4nxGemv::weight_bytes() const {
   return 0;
 }
+std::size_t Q4nxGemv::y_bytes() const {
+  return 0;
+}
 
 struct Chain::Impl {};
 Chain::Chain(GemvRuntime&) {
   NoXrt();
 }
 Chain::~Chain() = default;
-void Chain::Add(Q4nxGemv&, Buffer&, Buffer&, Buffer&) {}
+void Chain::Add(Q4nxGemv&, Buffer&, Buffer&, Buffer&, std::size_t) {}
 void Chain::Run() {}
 
 }  // namespace gufo_npu::npu
