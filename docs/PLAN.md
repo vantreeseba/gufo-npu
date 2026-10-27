@@ -218,3 +218,29 @@ MVP phases:
    `PrefillAttention`.
 5. `gufo-npu serve` for the 2B.
 6. Then: MTP speculative decode for the 2B, and the 35B second pass.
+
+## Phase 4 decisions (2026-10-27)
+
+Prefill for the 2B, as built (numbers in
+`docs/models/qwen3.5-2b/BENCHMARKS.md` and `QUALITY.md`):
+
+- **Projections: IRON's `flm.GEMM` over a resident bfp16 copy of the
+  decoder's q4nx weights** (`kernels/designs/bfp16_gemm.py`), packed on the
+  host at load (1.56 GB more pinned memory, ~2.7 s). Measured 11–18 TFLOPS
+  at the 2B's shapes, compute-bound from 256 tokens per call, so a weight
+  format that reads fewer bytes would not help; a q4nx-native GEMM (unpack
+  each 32x256 block once in the core, TileFuse-style) would save the memory
+  and the second copy but needs the same bfp16 mmul and was not needed for
+  speed. No on-device `DequantBFP` per chunk: it would re-read and re-write
+  the weights every chunk.
+- **Mixers on the CPU, batched over the chunk**: the DeltaNet recurrence
+  runs token by token per (value head, 32-column block) job; a chunked or
+  parallel-scan form is not needed (~2 µs per token for all heads). Causal
+  attention is a blocked online-softmax kernel (AVX-512 when the CPU has
+  it, else AVX2). NPU
+  attention (IRON `PrefillAttention`) is left for longer prompts, where the
+  CPU's O(n²) part grows.
+- **Two chunks in flight** (up to 1,024 tokens each): one chunk's GEMMs run
+  on the NPU while the CPU runs the other's mixers.
+- The prompt's last token goes through the decoder, which produces the
+  first logits (the decode LM head) and continues from the prefilled state.

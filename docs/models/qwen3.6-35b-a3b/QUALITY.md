@@ -18,7 +18,7 @@ There is no HF transformers oracle for this model here (the BF16 weights are
 
 ## CPU reference vs llama.cpp
 
-`tests/models/qwen36/reference_llama_test.cpp` (label `model`;
+`tests/models/qwen36_35b_a3b/reference_llama_test.cpp` (label `model`;
 `GUFO_NPU_QWEN36_MODEL` is the UD-Q4_K_XL GGUF, `GUFO_NPU_QWEN36_ORACLE` the
 output of `tools/reference/qwen36_llama_oracle.py`). llama.cpp
 0c1e57098bba43ac29e6e3b677cdceebdd22334f via llama-cpp-python 0.3.36, built
@@ -114,7 +114,7 @@ test takes ~110 s.
 
 ## Decoder vs reference
 
-`tests/models/qwen36/decoder_test.cpp` (label `model`, same variables): the
+`tests/models/qwen36_35b_a3b/decoder_test.cpp` (label `model`, same variables): the
 CPU decode path, `Decoder` (fp32 with an fp16 K/V cache, the MoE routing of
 `moe.hpp`) over `GgufProjections` in fp32, against the reference (the same
 GGUF in double), token by token over the chat prompt. 2026-10-27:
@@ -141,7 +141,7 @@ be at a near tie.
 
 ## MTP head
 
-`tests/models/qwen36/mtp_test.cpp` (label `model`, same variables).
+`tests/models/qwen36_35b_a3b/mtp_test.cpp` (label `model`, same variables).
 Neither oracle runs this model's MTP layer (llama.cpp's MTP context API is
 experimental), so the reference's head (`Reference::Mtp`, the `blk.40`
 nextn layer with its MoE FFN) is checked against the main model: teacher
@@ -167,7 +167,7 @@ matter inside the MTP block's own cache).
 What the NPU's q4nx format (`src/core/q4nx.hpp`: 4.625 bits per weight,
 4-bit codes, 8-bit sub-scale and sub-minimum per 32, bf16 d and dmin per row
 and 256 inputs) costs when every matrix is stored in it.
-`tests/models/qwen36/q4nx_requant_test.cpp` (label `model`, same variables)
+`tests/models/qwen36_35b_a3b/q4nx_requant_test.cpp` (label `model`, same variables)
 runs the fp32 CPU decoder teacher forced over the four oracle prompts (chat,
 code, prose and a 230-token prose passage; 301 positions) with four weight
 sets:
@@ -227,7 +227,7 @@ rest page cache of the memory-mapped GGUF; ~7 minutes.
 
 ## NPU decode
 
-`tests/models/qwen36/npu_decode_test.cpp` (labels `npu`, `model`; same
+`tests/models/qwen36_35b_a3b/npu_decode_test.cpp` (labels `npu`, `model`; same
 variables plus the kernel directory): `NpuDecoder` (every matrix in q4nx on
 the NPU, experts through `npu::Q4nxGather`, router and mixers on the CPU)
 against the fp32 CPU `Decoder` over `Q4nxProjections`, the same q4nx weights
@@ -314,7 +314,7 @@ relative error 4.8e-4 to 7.9e-4).
 
 ## GGUF load
 
-`tests/models/qwen36/gguf_load_test.cpp` (label `model`): ReadConfig gives
+`tests/models/qwen36_35b_a3b/gguf_load_test.cpp` (label `model`): ReadConfig gives
 the shape in [README.md](README.md) (40 + 1 layers, 10 full-attention, 16/32
 DeltaNet heads, 256/8 experts of width 512, shared expert 512, untied head),
 and every tensor dequantizes to finite values (753 tensors, 35.5 B values,

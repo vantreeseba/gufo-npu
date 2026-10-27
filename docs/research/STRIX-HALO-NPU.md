@@ -113,6 +113,15 @@ HTTP range requests). "Inferred" marks conclusions not read directly.
   to int8).
 - Open int4 path: `aie_kernels/quant/q4nx_dequant.cc` (q4nx → bfp16) feeding
   `flm.GEMM` reaches ~2.1 TFLOPS, 1.3× FLM's shipped overlay.
+- Measured (2026-10-27, `bfp16_gemm_test`): `flm.GEMM` alone, B already
+  bfp16 in DDR, at the 2B's projections runs 9–12 TFLOPS at M = 256 and
+  16–18 TFLOPS at M = 1024 (12.6 for K = 6144), compute-bound: B at 9 bits
+  per weight is read once per call. The mmul also converts A to bfp16 (8
+  values per shared exponent), which costs ~7e-3 relative error per GEMM
+  (9e-3 with B's own rounding); a bf16 A would need a second (lo) pass.
+  A first timing through IRON's Python runtime came out 3–10× slower and
+  bimodal while another process used the NPU; time designs through our own
+  runtime, alone on the NPU.
 
 ## Reusable IRON FLM operators
 

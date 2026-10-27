@@ -90,7 +90,7 @@ SwiGLU GEMV of similar size runs at about 38 GB/s.
     order: 138 µs (39.6 GB/s).
   - The same grouping does nothing for the gate + up gather (279 → 285 µs),
     which already runs at the dense SwiGLU rate.
-- **Correctness:** `tests/npu/q4nx_moe_gather_test.cpp` (label `npu`) runs 20
+- **Correctness:** `tests/models/qwen36_35b_a3b/q4nx_moe_gather_test.cpp` (label `npu`) runs 20
   random selections of 9 of 16 experts with random router weights. Worst
   relative error against the CPU over the same q4nx weights: 4.9e-4.
 - **The shared core program still fits:** 11.5 KB of 16 KB of program memory
@@ -194,7 +194,7 @@ both tokens' experts, up to 17 (8 + 8 routed + shared). Its cost:
   shapes for option (a): 2048 × 1024 SwiGLU and 512 × 2048 act.
 - `kernels/aie/q4nx_gemv.cc`: `gemv_store(y, y_acc, rtp, round)` with the
   scaled SwiGLU stage.
-- `tests/npu/q4nx_moe_gather_test.cpp`: correctness and patch/layer timing.
+- `tests/models/qwen36_35b_a3b/q4nx_moe_gather_test.cpp`: correctness and patch/layer timing.
 - `tools/bench/npu_moe_spike.cpp`: the comparisons above, options (a), (b)
   and (c), and the chains. Build it against a release tree:
 

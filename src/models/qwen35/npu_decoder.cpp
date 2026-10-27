@@ -751,7 +751,8 @@ std::vector<int> SpeculativeGenerate(NpuDecoder& model,
                                      int max_tokens,
                                      const std::vector<int>& stop, bool draft,
                                      const std::function<void(int)>& on_token,
-                                     SpeculativeStats* stats) {
+                                     SpeculativeStats* stats,
+                                     const PromptPrefill& prefill) {
   if (prompt.empty()) {
     throw std::invalid_argument("generate: empty prompt");
   }
@@ -780,13 +781,23 @@ std::vector<int> SpeculativeGenerate(NpuDecoder& model,
     return !is_stop(id) && static_cast<int>(out.size()) < max_tokens;
   };
 
-  // Prompt, two tokens per pass (both kept). hidden[p]: final residual after
-  // the token at p, for the MTP cache.
+  // Prompt: `prefill`'s part, then two tokens per pass (both kept).
+  // hidden[p]: final residual after the token at p, for the MTP cache.
   auto start = std::chrono::steady_clock::now();
   const int n = static_cast<int>(prompt.size());
   std::vector<float> hidden(static_cast<std::size_t>(n) * d);
   const float* logits = nullptr;
-  for (int p = 0; p < n; p += 2) {
+  const int prefilled =
+      prefill ? prefill(prompt, state, draft ? &mtp : nullptr, hidden.data())
+              : 0;
+  // The decoder runs at least the last prompt token: its logits start the
+  // output.
+  if (prefilled < 0 || prefilled > n - 1) {
+    throw std::logic_error("generate: prompt prefill ran " +
+                           std::to_string(prefilled) + " of " +
+                           std::to_string(n) + " tokens");
+  }
+  for (int p = prefilled; p < n; p += 2) {
     const int count = std::min(2, n - p);
     logits = model.Step(&prompt[p], count, state);
     if (count == 2) {
@@ -801,7 +812,7 @@ std::vector<int> SpeculativeGenerate(NpuDecoder& model,
   int y2 = -1;
   if (draft) {
     // The MTP cache over the prompt: pair (h[p - 1], token p) at p.
-    for (int p = 1; p < n; p += 2) {
+    for (int p = prefilled + 1; p < n; p += 2) {
       const int count = std::min(2, n - p);
       const float* hs[2] = {hidden.data() + (p - 1) * d, hidden.data() + p * d};
       model.FillMtp(hs, &prompt[p], count, p, mtp);

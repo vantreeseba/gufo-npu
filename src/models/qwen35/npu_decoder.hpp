@@ -105,17 +105,26 @@ struct SpeculativeStats {
   double decode_seconds = 0;
 };
 
+// Prompt processing ahead of the decoder (NpuPrefill): runs prompt tokens
+// [0, k) into a fresh `state` and returns k (< prompt.size()), writing each
+// token's final residual to rows [0, k) of `hidden`; with `mtp`, also fills
+// the MTP cache at positions [1, k] (pairs (hidden row p - 1, prompt[p])).
+using PromptPrefill =
+    std::function<int(const std::vector<int>& prompt, DecodeState& state,
+                      DecodeState* mtp, float* hidden)>;
+
 // Greedy decoding with MTP speculation: each step verifies one MTP draft in a
 // 2-token pass and keeps it when the main model agrees, so the output is the
-// main model's greedy output. The prompt runs two tokens per pass. With
-// `draft` false, every step decodes one token (no MTP); `draft` needs
-// can_draft(). `on_token` sees each generated id (including a stop id) as it
-// is produced.
+// main model's greedy output. The prompt runs through `prefill` when given,
+// the rest of it two tokens per pass. With `draft` false, every step decodes
+// one token (no MTP); `draft` needs can_draft(). `on_token` sees each
+// generated id (including a stop id) as it is produced.
 std::vector<int> SpeculativeGenerate(NpuDecoder& model,
                                      const std::vector<int>& prompt,
                                      int max_tokens,
                                      const std::vector<int>& stop, bool draft,
                                      const std::function<void(int)>& on_token,
-                                     SpeculativeStats* stats = nullptr);
+                                     SpeculativeStats* stats = nullptr,
+                                     const PromptPrefill& prefill = {});
 
 }  // namespace gufo_npu::qwen35

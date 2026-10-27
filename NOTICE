@@ -13,7 +13,11 @@ NPU kernels are built with, and may include code from:
 kernels/designs/q4nx_gemv.py is adapted from IRON's
 iron/operators/flm/lm_head design. kernels/aie/q4nx_gemv.cc includes
 MLIR-AIE's aie_kernels/flm_gemma4 headers (q4nx block format) and adapts
-their q4nx_accumulate. Both Copyright (C) 2026 Advanced Micro Devices, Inc.
+their q4nx_accumulate. kernels/designs/bfp16_gemm.py builds IRON's
+iron/operators/flm/gemm design with MLIR-AIE's fused_mm kernel
+(aie_kernels/fused), and src/core/bfp16.cpp ports IRON's pack_b and
+f32_to_bfp16ebs8 (iron/operators/flm/packing.py). All Copyright (C) 2026
+Advanced Micro Devices, Inc.
 The runtime image bundles XRT (https://github.com/Xilinx/XRT), Apache-2.0.
 
 Vendored in third_party/:
