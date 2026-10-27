@@ -1,13 +1,14 @@
 #pragma once
 
 #include <cstddef>
+#include <stdexcept>
 
 #include "models/qwen35/config.hpp"
 
 // The matrix products of a Qwen3.5 forward pass, grouped by shared input so a
 // backend can fuse them. The reference computes everything else (norms,
-// convolution, DeltaNet, attention, activations) and calls a Projections for
-// these. Each output row is one token, laid out as listed.
+// convolution, DeltaNet, attention, activations, expert routing) and calls a
+// Projections for these. Each output row is one token, laid out as listed.
 namespace gufo_npu::qwen35 {
 
 enum class Stage {
@@ -19,12 +20,19 @@ enum class Stage {
   kAttentionIn,
   // ssm_out or attn_output: hidden.
   kMixerOut,
-  // [gate (ffn) | up (ffn)].
+  // [gate | up] (Config::FfnWidth() each): the dense FFN, or the MoE shared
+  // expert.
   kFfnIn,
-  // ffn_down: hidden.
+  // ffn_down or ffn_down_shexp: hidden.
   kFfnDown,
-  // Tied embedding as the output projection: vocab.
+  // The LM head (token_embd when tied, else output): vocab.
   kLmHead,
+  // MoE router: [expert logits (experts) | shared-expert gate logit (1)].
+  kRouter,
+  // A routed expert's [gate | up] (expert_ffn each); ApplyExpert only.
+  kExpertIn,
+  // A routed expert's down projection: hidden; ApplyExpert only.
+  kExpertDown,
 };
 
 // Input and output widths of `stage` at `layer`.
@@ -38,6 +46,13 @@ public:
   // rows of StageOutputs values.
   virtual void Apply(Stage stage, int layer, const float* x, int tokens,
                      float* y) const = 0;
+  // The same for routed expert `expert` of an MoE layer (kExpertIn or
+  // kExpertDown).
+  virtual void ApplyExpert(Stage /*stage*/, int /*layer*/, int /*expert*/,
+                           const float* /*x*/, int /*tokens*/,
+                           float* /*y*/) const {
+    throw std::logic_error("qwen35: these projections have no MoE experts");
+  }
 };
 
 }  // namespace gufo_npu::qwen35

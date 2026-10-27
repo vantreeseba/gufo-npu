@@ -1,5 +1,6 @@
 #include "models/qwen35/q4nx_projections.hpp"
 
+#include <stdexcept>
 #include <string>
 
 #include "core/quant.hpp"
@@ -113,6 +114,10 @@ void Q4nxProjections::Apply(Stage stage, int layer, const float* x, int tokens,
         break;
       case Stage::kLmHead:
         break;
+      case Stage::kRouter:
+      case Stage::kExpertIn:
+      case Stage::kExpertDown:
+        throw std::logic_error("q4nx projections: dense models only");
     }
   }
 }
