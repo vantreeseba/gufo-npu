@@ -9,30 +9,49 @@ ships its kernels as closed binaries. gufo-npu writes its own kernels with
 AMD's open [IRON](https://github.com/amd/IRON) / [MLIR-AIE](https://github.com/Xilinx/mlir-aie)
 toolchain so every bottleneck can be fixed. See [docs/PLAN.md](docs/PLAN.md).
 
-**Status: Phase 3 started.** The toolchain, CI and NPU runtime path work end
-to end, and an fp32 CPU reference of Qwen3.5-2B (GGUF) matches HF
-transformers. `gufo-npu generate --device npu` decodes at 54–63 tok/s on
-short prompts (English, code), ~48 tok/s at 2k context and 33 tok/s at 9k
-without drafting (FLM: 28.5): q4nx GEMVs (4.625 bits per weight) stream
-weights at the NPU's 56 GB/s read ceiling and also run the norms, residual
-adds and SwiGLU, chained so a step needs 25 NPU submissions; the model's MTP
-head drafts a token (scoring a 32k draft vocabulary) that a 2-token pass
-verifies (same output as plain greedy). DeltaNet and attention run in fp32
-on the CPU, threaded and vectorized, with an fp16 K/V cache.
+## Models and benchmarks
 
-Qwen3.6-35B-A3B also decodes on the NPU: ~20 tok/s at short and ~1k
-context (FLM: 16.9–17.1), every matrix in q4nx, each layer's experts read
-through two gathers re-pointed per token after routing on the CPU. No MTP
-or prompt batching for it yet, so long prompts are slow
-([benchmarks](docs/models/qwen3.6-35b-a3b/BENCHMARKS.md)).
+| Model | Inference modes | Hugging Face weights | Benchmarks | Quality |
+|---|---|---|---|---|
+| [Qwen3.5-2B](docs/models/qwen3.5-2b/README.md) | NPU decode, MTP with a 32k draft vocabulary, NPU prefill | Unsloth [UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.5-2B-MTP-GGUF/blob/e05864f8066d874d5f85aaff007ae57a2a7d1efe/Qwen3.5-2B-UD-Q4_K_XL.gguf) | Up to **63.5 tok/s** decode (FLM 28.5); **0.11 s** to first token at 35 tokens, 1.23 s at 4k (FLM 0.60 s, 3.34 s) · [Benchmarks](docs/models/qwen3.5-2b/BENCHMARKS.md) | [Quality](docs/models/qwen3.5-2b/QUALITY.md) |
+| [Qwen3.6-35B-A3B](docs/models/qwen3.6-35b-a3b/README.md) | NPU decode (MoE), CPU decode | Unsloth [UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/blob/5bc3e238d916f48a861bac2f8a1990a0e9b7e98d/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf) | **20.3 tok/s** decode on the NPU (FLM 17.1); 23.0 tok/s on the CPU · [Benchmarks](docs/models/qwen3.6-35b-a3b/BENCHMARKS.md) | [Quality](docs/models/qwen3.6-35b-a3b/QUALITY.md) |
+
+### Against FastFlowLM on the same machine
+
+| Model | Workload | gufo-npu | FastFlowLM |
+|---|---|---|---|
+| Qwen3.5-2B | Decode, short prompt | 53–64 tok/s with MTP, 39 without | 28.5 tok/s |
+| | Decode, 2k context | 48.4 tok/s with MTP | 28.0 (1k), 26.4 (4k) |
+| | Decode, 9k context | 33.2 tok/s without drafting | 24.6 (8.5k) |
+| | Time to first token, 35 tokens | 0.11 s | 0.60 s |
+| | Time to first token, ~1k tokens | 0.31 s | 1.80 s |
+| | Time to first token, ~4k tokens | 1.23 s | 3.34 s |
+| Qwen3.6-35B-A3B | Decode, short prompt | 20.2–20.3 tok/s | 17.1 tok/s |
+| | Decode, ~1k context | 19.8–19.9 tok/s | 16.9 tok/s |
+| | Time to first token, short | 1.3–1.5 s | 3.49 s |
+| | Time to first token, ~1k tokens | 47–49 s | 8.75 s |
+
+- **How these were measured:** Strix Halo, Ryzen AI MAX+ 395, 2026-10-27. Greedy decoding, warm, three or more runs each.
+  - gufo-npu runs in-process through `gufo-npu generate`.
+  - FastFlowLM runs through its OpenAI-compatible server (streaming, temperature 0), so its time to first token includes a local HTTP round trip.
+  - Each model's BENCHMARKS.md has the exact prompts and every run.
+- **Short-prompt decode with MTP** depends on how many drafts are accepted: more on code, fewer on prose.
+- **The 35B** has no MTP or batched prompt yet. Its prompt runs one token per pass at decode speed, so long prompts are slower than FastFlowLM's. A third short-prompt run measured 18.6 tok/s while another job shared the CPU.
+
+**How it works:**
+- Every weight matrix is stored as q4nx (4.625 bits per weight) and read by NPU GEMVs that run at up to the NPU's ~56 GB/s read ceiling. The same GEMVs also do the norms, residual adds and SwiGLU.
+- Calls are chained into a few NPU submissions per token.
+- DeltaNet, attention and MoE routing run in fp32 on the CPU.
+- Prompts go through bfp16 GEMMs on the NPU (2B).
+- The model's MTP head drafts tokens that a 2-token pass verifies, with the same output as plain greedy.
 
 | Phase | Scope | State |
 |---|---|---|
 | 0 | Repo, CI, pinned toolchain, smoke kernel | done |
-| 1 | Hardware microbenchmarks (dispatch, DMA bandwidth, int4 GEMV) | dispatch, copy bandwidth, FLM baseline done |
-| 2 | CPU reference model (GGUF): forward pass, tokenizer, chat, greedy generate; matches HF | done (MTP and FLM pack: later) |
-| 3 | NPU decode | chained NPU decode with MTP speculation and a draft vocabulary, 54–63 tok/s, 72/73 top-1 vs CPU |
-| 4 | NPU prefill | |
+| 1 | Hardware microbenchmarks (dispatch, DMA bandwidth, int4 GEMV) | done |
+| 2 | CPU reference models (GGUF): forward pass, tokenizer, chat, greedy generate | done: 2B matches HF transformers, 35B matches llama.cpp |
+| 3 | NPU decode | 2B with MTP; 35B (MTP next) |
+| 4 | NPU prefill | 2B; 35B not yet |
 | 5 | OpenAI-compatible server | |
 
 ## Try it
@@ -47,7 +66,7 @@ docker run --rm --device /dev/accel/accel0 --ulimit memlock=-1:-1 \
 Drop the `/opt/xilinx/xrt` mount to use the XRT bundled in the image. Host
 requirements and pinned versions: [docs/TOOLCHAIN.md](docs/TOOLCHAIN.md).
 Testing and CI: [docs/TESTING.md](docs/TESTING.md).
-Model docs: [docs/models/qwen3.6-35b-a3b](docs/models/qwen3.6-35b-a3b/README.md).
+Model docs: [docs/models](docs/models/README.md).
 
 ## License
 
