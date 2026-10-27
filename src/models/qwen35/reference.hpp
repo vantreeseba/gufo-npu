@@ -5,6 +5,7 @@
 
 #include "core/gguf.hpp"
 #include "models/qwen35/config.hpp"
+#include "models/qwen35/gguf_projections.hpp"
 #include "models/qwen35/projections.hpp"
 
 // fp32 CPU reference forward pass for Qwen3.5 / Qwen3.6, dense (GGUF arch
@@ -70,7 +71,6 @@ public:
 
 private:
   struct Weights;
-  class GgufProjections;
   void LoadWeights(const gguf::File& file);
   // Runs layer `il` on `n` rows of the residual stream `h` (in place), at
   // positions state.position onwards.

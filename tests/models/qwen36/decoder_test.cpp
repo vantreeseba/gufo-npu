@@ -17,11 +17,10 @@
 #include "models/qwen35/moe.hpp"
 #include "models/qwen35/reference.hpp"
 
-// The decode step (Decoder, with its MoE routing) against the reference on
-// Qwen3.6-35B-A3B, token by token, both over the reference's own GGUF
-// projections, so only the non-matrix math is compared: mixers, routing,
-// expert sums, norms. The decoder keeps the attention K/V cache in fp16 and
-// computes in fp32 (the reference in fp32 and double).
+// The CPU decode path on Qwen3.6-35B-A3B against the reference, token by
+// token: Decoder (mixers, MoE routing, expert sums and norms in fp32, an fp16
+// K/V cache) over GgufProjections in fp32, against the reference over the
+// same GGUF in double. Also reports the decoder's speed.
 //
 // Top-k routing is discontinuous: where a layer's 8th and 9th experts are
 // nearly tied, those small differences can pick a different 8th expert, and
@@ -39,7 +38,8 @@ namespace qwen35 = gufo_npu::qwen35;
 using qwen35::Stage;
 
 // docs/models/qwen3.6-35b-a3b/QUALITY.md.
-// Logits relative L2 before the first routing difference (fp16 K/V cache).
+// Logits relative L2 before the first routing difference (fp16 K/V cache,
+// fp32 dot products).
 constexpr double kLogitTolerance = 2e-3;
 // Largest relative gap between the 8th and 9th expert probabilities (in the
 // reference) at which the two may first choose different experts.
@@ -121,8 +121,10 @@ int main() {
   const auto file = gufo_npu::gguf::File::Open(model);
   const qwen35::Reference reference(*file);
   const auto& c = reference.config();
+  const qwen35::GgufProjections fast(
+      *file, qwen35::GgufProjections::Precision::kFloat);
   const RoutingLog ref_routing(reference.projections(), c);
-  const RoutingLog dec_routing(reference.projections(), c);
+  const RoutingLog dec_routing(fast, c);
   qwen35::Decoder decoder(*file, dec_routing);
   const auto vocab = static_cast<std::size_t>(c.vocab);
 
@@ -135,16 +137,11 @@ int main() {
   double first_gap = 0;       // the reference's gap there
   int differences = 0;
   std::size_t argmax_match = 0;
-  double decoder_seconds = 0;
   for (std::size_t t = 0; t < ids.size(); ++t) {
     const auto want =
         reference.Forward({ids[t]}, ref_state, true, false, &ref_routing)
             .logits;
-    const auto start = std::chrono::steady_clock::now();
     const auto& got = decoder.Step(ids[t], state);
-    decoder_seconds +=
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
-            .count();
     for (int il = 0; il < c.layers; ++il) {
       const auto& r = ref_routing.entries[t * c.layers + il];
       if (r.experts != dec_routing.entries[t * c.layers + il].experts) {
@@ -174,16 +171,26 @@ int main() {
   }
   const bool ok = worst_before < kLogitTolerance && first_gap < kNearTie &&
                   argmax_match == ids.size();
+
+  // Speed: the prompt again, now that its weights are mapped and cached.
+  state = decoder.NewState();
+  const auto start = std::chrono::steady_clock::now();
+  for (const int id : ids) {
+    decoder.Step(id, state);
+  }
+  const double decoder_seconds =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+          .count();
   std::printf(
       "%s decoder vs reference: %zu tokens; logits rel err %.2e before the "
       "first routing difference (%s, gap %.1e), %.2e overall; %d routing "
-      "differences; argmax %zu/%zu; %.2f s per decoder step over the "
-      "reference's projections\n",
+      "differences; argmax %zu/%zu; decoder %.2f tok/s"
+      "\n",
       ok ? "ok  " : "FAIL", ids.size(), worst_before,
       first_difference < 0
           ? "none"
           : ("position " + std::to_string(first_difference)).c_str(),
       first_gap, worst, differences, argmax_match, ids.size(),
-      decoder_seconds / ids.size());
+      ids.size() / decoder_seconds);
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

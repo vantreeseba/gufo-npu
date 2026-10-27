@@ -7,7 +7,6 @@
 #include <string>
 #include <utility>
 
-#include "core/parallel.hpp"
 #include "core/quant.hpp"
 #include "models/qwen35/moe.hpp"
 
@@ -46,34 +45,6 @@ std::vector<float> ToFloats(const TensorInfo& t) {
   return out;
 }
 
-// y[t][r] = sum_c W[first + r][c] * x[t][c] for `rows` rows of W from row
-// `first` and `tokens` rows of x. Each weight row is dequantized once and
-// applied to every token.
-void MatMulRows(const TensorInfo& w, std::size_t first, std::size_t rows,
-                const float* x, int tokens, float* y) {
-  const auto in = static_cast<std::size_t>(w.RowElements());
-  const auto row_bytes = quant::RowBytes(w.type, in);
-  ParallelFor(rows, [&](std::size_t begin, std::size_t end) {
-    std::vector<float> row(in);
-    for (std::size_t r = begin; r < end; ++r) {
-      quant::Dequantize(w.type, w.data + (first + r) * row_bytes, row.data(),
-                        in);
-      for (int t = 0; t < tokens; ++t) {
-        const float* xt = x + static_cast<std::size_t>(t) * in;
-        double sum = 0;
-        for (std::size_t c = 0; c < in; ++c) {
-          sum += static_cast<double>(row[c]) * xt[c];
-        }
-        y[static_cast<std::size_t>(t) * rows + r] = static_cast<float>(sum);
-      }
-    }
-  });
-}
-
-void MatMul(const TensorInfo& w, const float* x, int tokens, float* y) {
-  MatMulRows(w, 0, w.Rows(), x, tokens, y);
-}
-
 // Splits `tokens` rows of concatenated outputs into one buffer per part.
 void Split(const std::vector<float>& fused, int tokens,
            std::initializer_list<std::pair<std::vector<float>*, int>> parts) {
@@ -91,177 +62,44 @@ void Split(const std::vector<float>& fused, int tokens,
   }
 }
 
-// Rows [first, first + rows) of a weight matrix.
-struct RowSpan {
-  const TensorInfo* w;
-  std::size_t first;
-  std::size_t rows;
-};
-
-RowSpan All(const TensorInfo* w) {
-  return {w, 0, static_cast<std::size_t>(w->Rows())};
-}
-
-// Writes `tokens` rows of W x for each of `spans` side by side, in order.
-void MatMulFused(std::initializer_list<RowSpan> spans, const float* x,
-                 int tokens, float* y) {
-  std::size_t stride = 0;
-  for (const auto& span : spans) {
-    stride += span.rows;
-  }
-  std::size_t offset = 0;
-  std::vector<float> part;
-  for (const auto& span : spans) {
-    part.resize(static_cast<std::size_t>(tokens) * span.rows);
-    MatMulRows(*span.w, span.first, span.rows, x, tokens, part.data());
-    for (int t = 0; t < tokens; ++t) {
-      std::copy_n(&part[static_cast<std::size_t>(t) * span.rows], span.rows,
-                  y + static_cast<std::size_t>(t) * stride + offset);
-    }
-    offset += span.rows;
-  }
-}
-
-// `t` must be [cols, rows], [cols] when rows is 1, or, with `experts`,
-// [cols, rows, experts].
-void CheckShape(const TensorInfo& t, std::uint64_t cols, std::uint64_t rows,
-                std::uint64_t experts = 0) {
-  std::vector<std::uint64_t> want = {cols, rows};
-  if (experts != 0) {
-    want.push_back(experts);
-  } else if (rows == 1 && t.shape.size() == 1) {
-    want.pop_back();
-  }
-  if (t.shape != want) {
-    auto text = [](const std::vector<std::uint64_t>& shape) {
-      std::string out;
-      for (const auto dim : shape) {
-        out += (out.empty() ? "" : ", ") + std::to_string(dim);
-      }
-      return "[" + out + "]";
-    };
-    throw std::runtime_error("qwen35: tensor " + t.name + " has shape " +
-                             text(t.shape) + ", expected " + text(want));
-  }
-}
-
 }  // namespace
 
 struct Reference::Weights {
   struct Layer {
     std::vector<float> attn_norm;
     std::vector<float> post_attention_norm;
-    // The dense FFN, or the MoE shared expert.
-    const TensorInfo* ffn_gate = nullptr;
-    const TensorInfo* ffn_up = nullptr;
-    const TensorInfo* ffn_down = nullptr;
-    // MoE: router [hidden, experts], shared-expert gate [hidden], and the
-    // routed experts stacked as [cols, rows, experts].
-    const TensorInfo* router = nullptr;
-    const TensorInfo* shared_gate = nullptr;
-    const TensorInfo* gate_exps = nullptr;
-    const TensorInfo* up_exps = nullptr;
-    const TensorInfo* down_exps = nullptr;
     // Gated DeltaNet.
-    const TensorInfo* qkv = nullptr;
-    const TensorInfo* gate = nullptr;  // z
-    const TensorInfo* alpha = nullptr;
-    const TensorInfo* beta = nullptr;
-    const TensorInfo* ssm_out = nullptr;
     std::vector<float> conv;      // [channels][kernel]
     std::vector<float> ssm_a;     // -exp(A_log), per value head
     std::vector<float> dt_bias;   // per value head
     std::vector<float> ssm_norm;  // per value-head dim, no +1
     // Gated full attention.
-    const TensorInfo* q = nullptr;  // per head: [query, gate]
-    const TensorInfo* k = nullptr;
-    const TensorInfo* v = nullptr;
-    const TensorInfo* o = nullptr;
     std::vector<float> q_norm;
     std::vector<float> k_norm;
   };
   const TensorInfo* embed = nullptr;
-  const TensorInfo* lm_head = nullptr;  // `embed` when tied
   std::vector<float> output_norm;
   std::vector<Layer> layers;
   std::vector<float> rope_inv_freq;  // rope_dim / 2 entries
 };
 
-// The reference's own projections: the GGUF weights, dequantized per row.
-class Reference::GgufProjections : public Projections {
-public:
-  GgufProjections(const Config& c, const Weights& w) : c_(c), w_(w) {}
-
-  void Apply(Stage stage, int layer, const float* x, int tokens,
-             float* y) const override {
-    if (stage == Stage::kLmHead) {
-      return MatMul(*w_.lm_head, x, tokens, y);
-    }
-    const auto& l = w_.layers[static_cast<std::size_t>(layer)];
-    switch (stage) {
-      case Stage::kLinearIn:
-        return MatMulFused({All(l.qkv), All(l.gate), All(l.alpha), All(l.beta)},
-                           x, tokens, y);
-      case Stage::kAttentionIn:
-        return MatMulFused({All(l.q), All(l.k), All(l.v)}, x, tokens, y);
-      case Stage::kMixerOut:
-        return MatMul(l.o != nullptr ? *l.o : *l.ssm_out, x, tokens, y);
-      case Stage::kFfnIn:
-        return MatMulFused({All(l.ffn_gate), All(l.ffn_up)}, x, tokens, y);
-      case Stage::kFfnDown:
-        return MatMul(*l.ffn_down, x, tokens, y);
-      case Stage::kRouter:
-        return MatMulFused({All(l.router), All(l.shared_gate)}, x, tokens, y);
-      case Stage::kLmHead:
-      case Stage::kExpertIn:
-      case Stage::kExpertDown:
-        break;
-    }
-    throw std::logic_error("qwen35: expert stages go through ApplyExpert");
-  }
-
-  void ApplyExpert(Stage stage, int layer, int expert, const float* x,
-                   int tokens, float* y) const override {
-    const auto& l = w_.layers[static_cast<std::size_t>(layer)];
-    const auto e = static_cast<std::size_t>(expert);
-    const auto ffn = static_cast<std::size_t>(c_.expert_ffn);
-    const auto hidden = static_cast<std::size_t>(c_.hidden);
-    switch (stage) {
-      case Stage::kExpertIn:
-        return MatMulFused(
-            {{l.gate_exps, e * ffn, ffn}, {l.up_exps, e * ffn, ffn}}, x, tokens,
-            y);
-      case Stage::kExpertDown:
-        return MatMulRows(*l.down_exps, e * hidden, hidden, x, tokens, y);
-      default:
-        throw std::logic_error("qwen35: ApplyExpert takes expert stages only");
-    }
-  }
-
-private:
-  const Config& c_;
-  const Weights& w_;
-};
-
 Reference::Reference(const gguf::File& file)
-    : config_(ReadConfig(file)), weights_(std::make_unique<Weights>()) {
+    : config_(ReadConfig(file)),
+      weights_(std::make_unique<Weights>()),
+      gguf_projections_(std::make_unique<GgufProjections>(
+          file, GgufProjections::Precision::kDouble)) {
   LoadWeights(file);
-  gguf_projections_ = std::make_unique<GgufProjections>(config_, *weights_);
 }
 
 void Reference::LoadWeights(const gguf::File& file) {
   const Config& c = config_;
   auto& w = *weights_;
   w.embed = &file.Tensor("token_embd.weight");
-  CheckShape(*w.embed, c.hidden, c.vocab);
-  w.lm_head = c.tied_embeddings ? w.embed : &file.Tensor("output.weight");
-  CheckShape(*w.lm_head, c.hidden, c.vocab);
+  if (w.embed->RowElements() != static_cast<std::uint64_t>(c.hidden)) {
+    throw std::runtime_error("qwen35: token_embd rows are not hidden wide");
+  }
   w.output_norm = ToFloats(file.Tensor("output_norm.weight"));
 
-  const auto key_dim = static_cast<std::uint64_t>(c.LinearKeyDim());
-  const auto value_dim = static_cast<std::uint64_t>(c.LinearValueDim());
-  const auto attn_dim = static_cast<std::uint64_t>(c.heads * c.head_dim);
-  const auto kv_dim = static_cast<std::uint64_t>(c.kv_heads * c.head_dim);
   for (int il = 0; il < c.layers; ++il) {
     const std::string p = "blk." + std::to_string(il) + ".";
     auto tensor = [&](const char* name) -> const TensorInfo& {
@@ -270,52 +108,16 @@ void Reference::LoadWeights(const gguf::File& file) {
     Weights::Layer layer;
     layer.attn_norm = ToFloats(tensor("attn_norm.weight"));
     layer.post_attention_norm = ToFloats(tensor("post_attention_norm.weight"));
-    if (c.IsMoe()) {
-      layer.ffn_gate = &tensor("ffn_gate_shexp.weight");
-      layer.ffn_up = &tensor("ffn_up_shexp.weight");
-      layer.ffn_down = &tensor("ffn_down_shexp.weight");
-      layer.router = &tensor("ffn_gate_inp.weight");
-      layer.shared_gate = &tensor("ffn_gate_inp_shexp.weight");
-      layer.gate_exps = &tensor("ffn_gate_exps.weight");
-      layer.up_exps = &tensor("ffn_up_exps.weight");
-      layer.down_exps = &tensor("ffn_down_exps.weight");
-      CheckShape(*layer.router, c.hidden, c.experts);
-      CheckShape(*layer.shared_gate, c.hidden, 1);
-      CheckShape(*layer.gate_exps, c.hidden, c.expert_ffn, c.experts);
-      CheckShape(*layer.up_exps, c.hidden, c.expert_ffn, c.experts);
-      CheckShape(*layer.down_exps, c.expert_ffn, c.hidden, c.experts);
-    } else {
-      layer.ffn_gate = &tensor("ffn_gate.weight");
-      layer.ffn_up = &tensor("ffn_up.weight");
-      layer.ffn_down = &tensor("ffn_down.weight");
-    }
-    CheckShape(*layer.ffn_gate, c.hidden, c.FfnWidth());
-    CheckShape(*layer.ffn_up, c.hidden, c.FfnWidth());
-    CheckShape(*layer.ffn_down, c.FfnWidth(), c.hidden);
     if (c.IsFullAttention(il)) {
-      layer.q = &tensor("attn_q.weight");
-      layer.k = &tensor("attn_k.weight");
-      layer.v = &tensor("attn_v.weight");
-      layer.o = &tensor("attn_output.weight");
-      CheckShape(*layer.q, c.hidden, 2 * attn_dim);
-      CheckShape(*layer.k, c.hidden, kv_dim);
-      CheckShape(*layer.v, c.hidden, kv_dim);
-      CheckShape(*layer.o, attn_dim, c.hidden);
       layer.q_norm = ToFloats(tensor("attn_q_norm.weight"));
       layer.k_norm = ToFloats(tensor("attn_k_norm.weight"));
     } else {
-      layer.qkv = &tensor("attn_qkv.weight");
-      layer.gate = &tensor("attn_gate.weight");
-      layer.alpha = &tensor("ssm_alpha.weight");
-      layer.beta = &tensor("ssm_beta.weight");
-      layer.ssm_out = &tensor("ssm_out.weight");
-      CheckShape(*layer.qkv, c.hidden, 2 * key_dim + value_dim);
-      CheckShape(*layer.gate, c.hidden, value_dim);
-      CheckShape(*layer.alpha, c.hidden, c.linear_value_heads);
-      CheckShape(*layer.beta, c.hidden, c.linear_value_heads);
-      CheckShape(*layer.ssm_out, value_dim, c.hidden);
       const auto& conv = tensor("ssm_conv1d.weight");
-      CheckShape(conv, c.conv_kernel, c.ConvChannels());
+      if (conv.shape != std::vector<std::uint64_t>{
+                            static_cast<std::uint64_t>(c.conv_kernel),
+                            static_cast<std::uint64_t>(c.ConvChannels())}) {
+        throw std::runtime_error("qwen35: unexpected shape of " + conv.name);
+      }
       layer.conv = ToFloats(conv);
       layer.ssm_a = ToFloats(tensor("ssm_a"));
       layer.dt_bias = ToFloats(tensor("ssm_dt.bias"));
