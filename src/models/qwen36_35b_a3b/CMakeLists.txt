@@ -3,9 +3,9 @@
 # Its decode and the CPU side (config, reference, Mixer, routing, the
 # prefill mixers) are the family's shared gufo_npu_qwen35(_npu).
 
-add_library(gufo_npu_qwen36_35b_a3b STATIC npu_prefill.cpp)
+add_library(gufo_npu_qwen36_35b_a3b STATIC npu_prefill.cpp npu_experts.cpp)
 target_link_libraries(gufo_npu_qwen36_35b_a3b PUBLIC gufo_npu_qwen35_npu)
-set_source_files_properties(npu_prefill.cpp PROPERTIES
+set_source_files_properties(npu_prefill.cpp npu_experts.cpp PROPERTIES
   COMPILE_OPTIONS "-march=x86-64-v3;-O3")
 
 # Its measurement tools (tools/qwen36_35b_a3b; docs/research/NPU-MOE-PREFILL.md):
