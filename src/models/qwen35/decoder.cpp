@@ -8,6 +8,7 @@
 
 #include "core/quant.hpp"
 #include "core/thread_pool.hpp"
+#include "core/vec.hpp"
 
 namespace gufo_npu::qwen35 {
 namespace {
@@ -18,18 +19,8 @@ std::vector<float> ToFloats(const gguf::TensorInfo& t) {
   return out;
 }
 
-// out = RMS(x) * w over n values (out may alias x). The GGUF norm weights
-// already hold Qwen's +1 (except ssm_norm, which has none to add).
-void RmsNorm(const float* x, const float* w, int n, float eps, float* out) {
-  float sum = 0;
-  for (int i = 0; i < n; ++i) {
-    sum += x[i] * x[i];
-  }
-  const float inv = 1.0f / std::sqrt(sum / static_cast<float>(n) + eps);
-  for (int i = 0; i < n; ++i) {
-    out[i] = x[i] * inv * w[i];
-  }
-}
+using vec::Dot;
+using vec::RmsNorm;
 
 float Sigmoid(float x) {
   return 1.0f / (1.0f + std::exp(-x));
@@ -64,11 +55,11 @@ struct Mixer::Weights {
 };
 
 struct Mixer::Scratch {
-  std::vector<float> u;       // conv output
-  std::vector<float> query;   // one RoPE'd query head
-  std::vector<float> scores;  // attention weights
-  std::vector<float> delta;   // DeltaNet rank-1 update, per value head
-  int rope_position = -1;     // the position rope_cos/sin hold
+  std::vector<float> u;            // conv output
+  std::vector<float> delta;        // DeltaNet rank-1 update, per value head
+  std::vector<float> queries;      // RoPE'd query per head
+  std::vector<float> head_scores;  // attention weights per head
+  int rope_position = -1;          // the position rope_cos/sin hold
   std::vector<float> rope_cos, rope_sin;
   // DeltaNet heads run in parallel; a job is tens of microseconds.
   SpinPool pool{std::min<std::size_t>(
@@ -105,7 +96,6 @@ Mixer::Mixer(const gguf::File& file)
   }
   auto& s = *scratch_;
   s.u.resize(c.ConvChannels());
-  s.query.resize(c.head_dim);
   s.delta.resize(static_cast<std::size_t>(c.linear_value_heads) *
                  c.linear_head_dim);
 }
@@ -175,15 +165,11 @@ void Mixer::Linear(int il, const float* in, DecodeState::Layer& st, float* y,
   const float* v = k + key_dim;
   const float q_scale = 1.0f / std::sqrt(static_cast<float>(dk));
   for (int head = 0; head < hk; ++head) {
-    for (float* vec : {q + head * dk, k + head * dk}) {
-      float sum = 0;
+    for (float* x : {q + head * dk, k + head * dk}) {
+      const float inv = 1.0f / std::sqrt(Dot(x, x, dk) + 1e-6f);
+      const float scale = x == q + head * dk ? inv * q_scale : inv;
       for (int e = 0; e < dk; ++e) {
-        sum += vec[e] * vec[e];
-      }
-      const float inv = 1.0f / std::sqrt(sum + 1e-6f);
-      const float scale = vec == q + head * dk ? inv * q_scale : inv;
-      for (int e = 0; e < dk; ++e) {
-        vec[e] *= scale;
+        x[e] *= scale;
       }
     }
   }
@@ -286,32 +272,35 @@ void Mixer::Attention(int il, float* in, int position, DecodeState::Layer& st,
   // Every cached position (equals position + 1 for the decoder layers; the
   // MTP layer's cache can start later).
   const int length = static_cast<int>(st.keys.size() / kv);
-  s.scores.resize(length);
   const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
-  for (int qh = 0; qh < c.heads; ++qh) {
+  s.queries.resize(static_cast<std::size_t>(c.heads) * hd);
+  s.head_scores.resize(static_cast<std::size_t>(c.heads) * length);
+  // Query heads are independent: one pool job each.
+  s.pool.Run(static_cast<std::size_t>(c.heads), [&](std::size_t h) {
+    const int qh = static_cast<int>(h);
     const float* raw = qg + static_cast<std::size_t>(qh) * 2 * hd;
-    RmsNorm(raw, lw.q_norm.data(), hd, c.rms_eps, s.query.data());
-    rope(s.query.data());
+    float* query = s.queries.data() + static_cast<std::size_t>(qh) * hd;
+    float* scores =
+        s.head_scores.data() + static_cast<std::size_t>(qh) * length;
+    RmsNorm(raw, lw.q_norm.data(), hd, c.rms_eps, query);
+    rope(query);
     const int kh = qh / group;
     float max_score = -INFINITY;
     for (int j = 0; j < length; ++j) {
       const float* key = &st.keys[static_cast<std::size_t>(j) * kv + kh * hd];
-      float dot = 0;
-      for (int e = 0; e < hd; ++e) {
-        dot += s.query[e] * key[e];
-      }
-      s.scores[j] = dot * scale;
-      max_score = std::max(max_score, s.scores[j]);
+      scores[j] = Dot(query, key, hd) * scale;
+      max_score = std::max(max_score, scores[j]);
     }
     float total = 0;
-    for (auto& score : s.scores) {
-      score = std::exp(score - max_score);
-      total += score;
+    for (int j = 0; j < length; ++j) {
+      scores[j] = std::exp(scores[j] - max_score);
+      total += scores[j];
     }
+    const float inv_total = 1.0f / total;
     float* out = ctx + static_cast<std::size_t>(qh) * hd;
     std::fill_n(out, hd, 0.0f);
     for (int j = 0; j < length; ++j) {
-      const float p = s.scores[j] / total;
+      const float p = scores[j] * inv_total;
       const float* value =
           &st.values[static_cast<std::size_t>(j) * kv + kh * hd];
       for (int e = 0; e < hd; ++e) {
@@ -322,7 +311,7 @@ void Mixer::Attention(int il, float* in, int position, DecodeState::Layer& st,
     for (int e = 0; e < hd; ++e) {
       out[e] *= Sigmoid(gate[e]);
     }
-  }
+  });
 }
 
 struct Decoder::Weights {

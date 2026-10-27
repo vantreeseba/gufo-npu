@@ -11,6 +11,7 @@
 
 #include "core/q4nx.hpp"
 #include "core/quant.hpp"
+#include "core/vec.hpp"
 #include "npu/gemv.hpp"
 
 namespace gufo_npu::qwen35 {
@@ -21,6 +22,8 @@ using npu::Chain;
 using npu::Epilogue;
 using npu::Prologue;
 using npu::Q4nxGemv;
+using vec::Dot;
+using vec::RmsNorm;
 
 std::vector<float> ToFloats(const gguf::TensorInfo& t) {
   std::vector<float> out(t.num_elements);
@@ -56,17 +59,6 @@ void SetNormWeight(Buffer& region, const gguf::TensorInfo& t) {
     bits[i] = quant::FloatToBf16(w[i]);
   }
   region.ToDevice();
-}
-
-void RmsNorm(const float* x, const float* w, int n, float eps, float* out) {
-  float sum = 0;
-  for (int i = 0; i < n; ++i) {
-    sum += x[i] * x[i];
-  }
-  const float inv = 1.0f / std::sqrt(sum / static_cast<float>(n) + eps);
-  for (int i = 0; i < n; ++i) {
-    out[i] = x[i] * inv * w[i];
-  }
 }
 
 }  // namespace
@@ -305,11 +297,7 @@ struct NpuDecoder::Impl {
       for (int head = 0; head < 2 * heads; ++head) {
         const float* w = (head < heads ? b.alpha.data() : b.beta.data()) +
                          static_cast<std::size_t>(head % heads) * d;
-        float acc = 0;
-        for (int i = 0; i < d; ++i) {
-          acc += w[i] * normed[i];
-        }
-        ab[head] = acc;
+        ab[head] = Dot(w, normed.data(), d);
       }
       if (speculative && t == 1) {
         st.conv_saved = st.conv;

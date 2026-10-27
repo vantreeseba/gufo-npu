@@ -179,6 +179,42 @@ per-submission cost) and ~3.4 ms of CPU. A draft vocabulary restricted to
 the lowest token ids was tried and dropped: acceptance fell a few points on
 English and code and from 62% to 14% on Chinese (CJK tokens have high ids).
 
+### Step 3c: long context (CPU attention)
+
+At 2k tokens of context the CPU attention dominated: one thread, scalar
+dot products. Query heads now run on the spin pool and the score dot
+products use AVX2 (`vec::Dot`). Prompt of 2,120 tokens ("Item i: the quick
+brown fox…", then the sky question), 93 generated tokens, old and new
+binaries interleaved, warm, 2026-10-27:
+
+| | Before | After |
+|---|---|---|
+| Decode, `--draft none` | 24.28, 24.24 tok/s | **33.22, 33.13, 33.09** |
+| Decode, `--draft mtp` | 26.38, 26.38 | **41.32, 41.40, 41.13** |
+| Prompt (token by token), `--draft none` | 44.0 s | 33.7 s |
+| CPU mixer time, `--draft none` run | 16.2 s | 4.9 s |
+| Short prompt (sky), `--draft mtp` | 45.84, 45.80, 45.54 | 46.76, 46.83, 46.86 |
+
+A third pair of runs was disturbed by another process on the NPU and is
+left out. At 2k context, decode now runs ~6% below short context (no draft:
+30.2 vs 28.2 ms per token). The extra ~2 ms is mostly attention reading
+the fp32 K/V cache (6 layers x 2 KV heads x 256 x 2 x 4 B = 24.6 KB per
+position, 52 MB per token at 2,120), about 26 GB/s effective.
+
+The DeltaNet alpha/beta rows (32 x 2048 per token and layer, on the CPU)
+were a scalar loop with one running sum, which does not vectorize; they and
+the q/k L2 norms now use `vec::Dot`. Same binaries otherwise, warm,
+2026-10-27:
+
+| | Before | After |
+|---|---|---|
+| Short prompt (sky), `--draft none` | ~35.2 tok/s | **37.20, 37.18** (35.87 disturbed) |
+| Short prompt (sky), `--draft mtp` | 46.76, 46.83, 46.86 | **47.70, 47.91, 47.64** |
+| 2,120-token prompt, `--draft mtp` | 41.32, 41.40, 41.13 | 41.67, 41.37, 41.65 |
+
+The CPU side of a single-token step is now ~0.9 ms of ~26.9 ms (NPU waits
+~26 ms).
+
 ### NPU power mode
 
 `xrt-smi configure --pmode <mode>` (needs CAP_SYS_ADMIN; the box runs
