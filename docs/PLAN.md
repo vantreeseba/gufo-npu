@@ -126,3 +126,43 @@ Teacher-forced logits are checked against HF transformers / llama.cpp dumps (see
 3. The same firmware hardware-context failure as FLM #705 could hit us too. We'll need your firmware/driver versions early.
 4. Pinning all weights (~20 GB Q4) needs memlock unlimited.
 5. When you provide machine access: SSH details, kernel/firmware/XRT versions, and whether it can host a GitHub self-hosted runner.
+
+## Plan updates (2026-10-27)
+
+Measured and researched since the plan was approved; see
+`docs/models/qwen3.6-35b-a3b/BENCHMARKS.md` and
+`docs/research/STRIX-HALO-NPU.md`.
+
+**Second model: Qwen3.5-2B** (fast side-task model and bring-up target). Same
+family as the 35B: 24 layers in the same 3 DeltaNet : 1 gated attention
+pattern, hidden 2048, head dim 256, 248k vocab and tokenizer, tied
+embeddings, one MTP layer. It is dense, so it exercises everything except
+routing and experts. Est. ~1.1 GB read per token, ~45–50 tok/s NPU ceiling.
+
+- Phase 2 (CPU reference) and Phase 3 (NPU decode) bring up the 2B first,
+  then add router + experts for the 35B. Kernel shapes are shared where
+  hidden = 2048.
+- Docs under `docs/models/qwen3.5-2b/`; FLM baseline measured the same way.
+
+**Changes from research and measurements**
+
+- Dispatch: ~66 µs sync vs ~20 µs chained (measured). Fuse to ~2 dispatches
+  per layer using IRON's `flm.DecodeLayer` as the template, chain them in a
+  runlist, keep runtime-parameter words few (~2 µs each).
+- Expert selection: confirmed workable with one xclbin and mlir-aie
+  `DispatchTime` scalars for the 8 expert offsets (host builds the sequence
+  after top-8). FLM's pack stores each expert contiguously, so one linear DMA
+  per expert.
+- Bandwidth: weight layout matters ~5× (contiguous 128 KB runs vs strided).
+  Pre-pack weights at load/convert time; never stream strided.
+- MTP: FLM's Qwen3.6 pack has **no MTP tensors**, so FLM cannot speculate.
+  The GGUF path (which carries MTP) is the route to MTP speculative decode;
+  raise its priority.
+- LM head: FLM keeps it 8-bit (540 MB/token for the 35B, ~16% of reads at
+  4-bit). Try 4-bit with a quality check.
+- Power: keep one long-lived hardware context without QoS hints (max DPM),
+  and runtime PM `on`.
+- Greenfield kernels: router/top-k, MoE expert FFN, Gated DeltaNet. IRON
+  reusables: `GEMM` + `DequantBFP`, `PrefillAttention`, `LMHead`.
+- Next measurements: read-only NPU bandwidth; THP vs no-THP weight buffers;
+  NPU/iGPU contention.
