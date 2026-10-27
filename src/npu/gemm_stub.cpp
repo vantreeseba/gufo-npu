@@ -10,13 +10,14 @@ namespace {
 }
 }  // namespace
 
-std::string Bfp16GemmSequence(std::size_t m, std::size_t k, std::size_t n) {
-  return "bfp16_gemm_m" + std::to_string(m) + "_k" + std::to_string(k) + "_n" +
+std::string Bfp16GemmSequence(std::size_t m, std::size_t k, std::size_t n,
+                              const std::string& design) {
+  return design + "_m" + std::to_string(m) + "_k" + std::to_string(k) + "_n" +
          std::to_string(n);
 }
 
 struct GemmRuntime::Impl {};
-GemmRuntime::GemmRuntime(const std::filesystem::path&) {
+GemmRuntime::GemmRuntime(const std::filesystem::path&, const std::string&) {
   NoXrt();
 }
 GemmRuntime::~GemmRuntime() = default;

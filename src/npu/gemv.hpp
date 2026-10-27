@@ -33,6 +33,29 @@ inline constexpr std::size_t kGemvInputBytes =
 inline constexpr std::size_t kGemvResidualBytes =
     (kGemvSlot + kGemvHidden) * sizeof(float);
 
+// A compiled GEMV design: its xclbin and sequence-name prefix, and the
+// geometry its core program was built with. The default is
+// kernels/designs/q4nx_gemv.py (Qwen3.5-2B's shapes); a model with another
+// hidden size compiles its own copy (e.g. src/models/qwen35_4b/kernels) and
+// passes its own GemvDesign. The input and residual buffers follow the
+// layout above with `hidden` in place of kGemvHidden.
+struct GemvDesign {
+  std::string name = "q4nx_gemv";
+  std::size_t hidden = kGemvHidden;
+  std::size_t max_dim = kGemvMaxDim;
+
+  std::size_t slot() const { return 2 * hidden; }  // fp32
+  std::size_t norm_offset() const {
+    return kGemvTokens * slot() * sizeof(float);
+  }
+  std::size_t input_bytes() const {
+    return norm_offset() + hidden * sizeof(std::uint16_t);
+  }
+  std::size_t residual_bytes() const {
+    return (slot() + hidden) * sizeof(float);
+  }
+};
+
 enum class Prologue {
   kPlain,    // slot t: dim fp32
   kAct,      // dim bf16 per token, back to back (a compact SwiGLU output)
@@ -46,10 +69,11 @@ enum class Epilogue {
 };
 
 // The instruction sequence name, e.g.
-// "q4nx_gemv_k2048_n8192_resnorm_store_t2".
+// "q4nx_gemv_k2048_n8192_resnorm_store_t2" (`design` is the prefix).
 std::string Q4nxGemvSequence(std::size_t dim, std::size_t padded_rows,
                              Prologue prologue, Epilogue epilogue,
-                             std::size_t tokens);
+                             std::size_t tokens,
+                             const std::string& design = "q4nx_gemv");
 
 // How a runtime's calls reach the NPU. kElf runs each variant's instruction
 // ELF. kInstructionBuffer passes the variant's instruction words in a host
@@ -59,20 +83,23 @@ enum class Flow { kElf, kInstructionBuffer };
 
 class GemvRuntime {
 public:
-  // Loads q4nx_gemv.xclbin from `kernel_dir`. Throws when it is missing or
-  // the NPU cannot be opened.
+  // Loads <design.name>.xclbin from `kernel_dir` (the default design is
+  // q4nx_gemv, Qwen3.5-2B's). Throws when it is missing or the NPU cannot be
+  // opened.
   explicit GemvRuntime(const std::filesystem::path& kernel_dir,
-                       Flow flow = Flow::kElf);
+                       Flow flow = Flow::kElf, GemvDesign design = {});
   ~GemvRuntime();
   GemvRuntime(const GemvRuntime&) = delete;
   GemvRuntime& operator=(const GemvRuntime&) = delete;
 
   Flow flow() const;
+  const GemvDesign& design() const { return design_; }
 
   struct Impl;
   Impl& impl() { return *impl_; }
 
 private:
+  GemvDesign design_;
   std::unique_ptr<Impl> impl_;
 };
 
@@ -113,8 +140,9 @@ public:
   Q4nxGemv(const Q4nxGemv&) = delete;
   Q4nxGemv& operator=(const Q4nxGemv&) = delete;
 
-  // One call on device buffers for `tokens` (1 or 2): x (kGemvInputBytes),
-  // y (y_bytes()), residual (kGemvResidualBytes, written by kResNorm).
+  // One call on device buffers for `tokens` (1 or 2): x (the design's
+  // input_bytes()), y (y_bytes()), residual (its residual_bytes(), written by
+  // kResNorm).
   void Run(Buffer& x, Buffer& y, Buffer& residual, std::size_t tokens = 1);
 
   // Convenience for a plain/store GEMV on host memory: x has dim fp32
@@ -137,7 +165,8 @@ public:
   std::size_t weight_bytes() const;
   // Where token t's output starts in y: t * y_token_stride() fp32 (store) or
   // fp32 words of packed bf16 (SwiGLU). Calls that output a hidden vector
-  // put token t in slot t of the next input region (kGemvSlot apart).
+  // (rows() == the design's hidden) put token t in slot t of the next input
+  // region (the design's slot() apart).
   std::size_t y_token_stride() const { return y_token_stride_; }
   // Bytes a y buffer must span (both tokens' regions, and the SwiGLU
   // padding the design discards past them).

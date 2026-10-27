@@ -11,17 +11,20 @@
 
 namespace gufo_npu::npu {
 
-std::string Bfp16GemmSequence(std::size_t m, std::size_t k, std::size_t n) {
-  return "bfp16_gemm_m" + std::to_string(m) + "_k" + std::to_string(k) + "_n" +
+std::string Bfp16GemmSequence(std::size_t m, std::size_t k, std::size_t n,
+                              const std::string& design) {
+  return design + "_m" + std::to_string(m) + "_k" + std::to_string(k) + "_n" +
          std::to_string(n);
 }
 
 struct GemmRuntime::Impl {
   std::filesystem::path dir;
+  std::string design;
   HwContext hw;
   std::map<std::string, std::unique_ptr<Sequence>> sequences;
 
-  explicit Impl(const std::filesystem::path& d) : dir(d), hw(d, "bfp16_gemm") {}
+  Impl(const std::filesystem::path& d, const std::string& name)
+      : dir(d), design(name), hw(d, name) {}
 
   Sequence& Get(const std::string& name) {
     auto& slot = sequences[name];
@@ -36,8 +39,9 @@ struct GemmRuntime::Impl {
   }
 };
 
-GemmRuntime::GemmRuntime(const std::filesystem::path& kernel_dir)
-    : impl_(std::make_unique<Impl>(kernel_dir)) {}
+GemmRuntime::GemmRuntime(const std::filesystem::path& kernel_dir,
+                         const std::string& design)
+    : impl_(std::make_unique<Impl>(kernel_dir, design)) {}
 
 GemmRuntime::~GemmRuntime() = default;
 
@@ -79,7 +83,7 @@ struct Bfp16Gemm::Impl {
        std::size_t dim, std::size_t rows)
       : w_bytes(packed.size()), w(rt.hw.Buffer(w_bytes)) {
     for (const std::size_t m : kGemmChunks) {
-      sequences[m] = &rt.Get(Bfp16GemmSequence(m, dim, rows));
+      sequences[m] = &rt.Get(Bfp16GemmSequence(m, dim, rows, rt.design));
     }
     std::memcpy(w.map<void*>(), packed.data(), w_bytes);
     w.sync(XCL_BO_SYNC_BO_TO_DEVICE);

@@ -102,13 +102,16 @@ target_sources(gufo_npu_qwen35_npu PRIVATE src/models/qwen35/npu_prefill.cpp)
 set_source_files_properties(src/models/qwen35/npu_prefill.cpp PROPERTIES
   COMPILE_OPTIONS "-march=x86-64-v3;-O3")
 
-add_executable(gufo-npu src/cli/main.cpp)
-target_link_libraries(gufo-npu PRIVATE gufo_npu_qwen35_npu)
-install(TARGETS gufo-npu RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-
 if(GUFO_NPU_BUILD_KERNELS)
   add_subdirectory(kernels)
 endif()
+
+# Per-model packages: their own NPU programs and host wiring.
+add_subdirectory(src/models/qwen35_4b)
+
+add_executable(gufo-npu src/cli/main.cpp)
+target_link_libraries(gufo-npu PRIVATE gufo_npu_qwen35_npu gufo_npu_qwen35_4b)
+install(TARGETS gufo-npu RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 if(BUILD_TESTING)
   enable_testing()

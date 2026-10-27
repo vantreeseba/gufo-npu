@@ -27,3 +27,8 @@ gufo_npu_add_kernel(NAME q4nx_gemv DESIGN designs/q4nx_gemv.py
 # Prefill GEMMs (Qwen3.5-2B; designs/bfp16_gemm_variants.py).
 gufo_npu_add_kernel(NAME bfp16_gemm DESIGN designs/bfp16_gemm.py
                     MODEL qwen35_2b)
+
+# Per-model kernel packages (src/models/<model>/kernels), registered in this
+# scope so they share the settings above.
+add_subdirectory("${PROJECT_SOURCE_DIR}/src/models/qwen35_4b/kernels"
+                 "${CMAKE_CURRENT_BINARY_DIR}/qwen35_4b")

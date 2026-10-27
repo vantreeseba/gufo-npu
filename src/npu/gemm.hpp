@@ -18,14 +18,19 @@ namespace gufo_npu::npu {
 inline constexpr std::size_t kGemmChunks[] = {256, 512, 1024};
 inline constexpr std::size_t kGemmMaxChunk = 1024;
 
-// The instruction sequence name, e.g. "bfp16_gemm_m256_k2048_n8192".
-std::string Bfp16GemmSequence(std::size_t m, std::size_t k, std::size_t n);
+// The instruction sequence name, e.g. "bfp16_gemm_m256_k2048_n8192"
+// (`design` is the prefix).
+std::string Bfp16GemmSequence(std::size_t m, std::size_t k, std::size_t n,
+                              const std::string& design = "bfp16_gemm");
 
 class GemmRuntime {
 public:
-  // Loads bfp16_gemm.xclbin from `kernel_dir`. Throws when it is missing or
+  // Loads <design>.xclbin from `kernel_dir`: kernels/designs/bfp16_gemm.py
+  // by default, or a model's own copy of it (same core program, its own
+  // shapes, e.g. src/models/qwen35_4b/kernels). Throws when it is missing or
   // the NPU cannot be opened.
-  explicit GemmRuntime(const std::filesystem::path& kernel_dir);
+  explicit GemmRuntime(const std::filesystem::path& kernel_dir,
+                       const std::string& design = "bfp16_gemm");
   ~GemmRuntime();
   GemmRuntime(const GemmRuntime&) = delete;
   GemmRuntime& operator=(const GemmRuntime&) = delete;
