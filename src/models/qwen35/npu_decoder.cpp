@@ -107,6 +107,7 @@ struct NpuDecoder::Impl {
   std::vector<float> one_logits;  // Step(token)'s result
   double npu_seconds = 0;
   long submissions = 0;
+  double cpu_seconds = 0;
 
   Block MakeBlock(const gguf::File& file, int il) {
     const Config& c = config;
@@ -265,6 +266,15 @@ struct NpuDecoder::Impl {
   // state goes to ssm_spec and the conv window before it to conv_saved.
   void Mix(Block& b, int il, int count, int position, DecodeState::Layer& st,
            bool speculative) {
+    const auto start = std::chrono::steady_clock::now();
+    MixTimed(b, il, count, position, st, speculative);
+    cpu_seconds +=
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+            .count();
+  }
+
+  void MixTimed(Block& b, int il, int count, int position,
+                DecodeState::Layer& st, bool speculative) {
     const Config& c = config;
     const int d = c.hidden;
     b.in_y->FromDevice();
@@ -337,6 +347,10 @@ double NpuDecoder::npu_seconds() const {
 
 long NpuDecoder::submissions() const {
   return impl_->submissions;
+}
+
+double NpuDecoder::cpu_seconds() const {
+  return impl_->cpu_seconds;
 }
 
 const float* NpuDecoder::hidden(int t) const {

@@ -63,9 +63,10 @@ add_library(gufo_npu_qwen35 STATIC
   src/models/qwen35/reference.cpp
 )
 target_link_libraries(gufo_npu_qwen35 PUBLIC gufo_npu_core)
-# The decode step's CPU math vectorizes with AVX2 + FMA (Zen 5 has more; the
+# The decode steps' CPU math vectorizes with AVX2 + FMA (Zen 5 has more; the
 # hosted CI runners have at least this).
-set_source_files_properties(src/models/qwen35/decoder.cpp PROPERTIES
+set_source_files_properties(src/models/qwen35/decoder.cpp
+  src/models/qwen35/npu_decoder.cpp PROPERTIES
   COMPILE_OPTIONS "-march=x86-64-v3;-O3")
 
 # NPU runtime: XRT when enabled, otherwise a stub that reports it is absent.

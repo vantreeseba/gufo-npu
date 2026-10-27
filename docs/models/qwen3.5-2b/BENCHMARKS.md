@@ -161,6 +161,24 @@ two tokens per pass. Warm runs, 2026-10-27:
   heads alike. RoPE position and whether h goes through output_norm first
   make no difference (a constant RoPE shift cancels in attention).
 
+### Step 3a: CPU mixer
+
+Profiling the CPU side of a step (DeltaNet, attention, alpha/beta for two
+tokens over 25 blocks): buffer syncs and copies are ~3% of it; the math is
+the rest. DeltaNet heads and the conv now run on a persistent spin pool, RoPE
+cos/sin are computed once per position, and the decoder's host code is
+built with AVX2 + FMA. Same prompt as above (sky), three runs:
+
+| | tok/s | CPU mixer time (whole run) |
+|---|---|---|
+| Before | 43.6–44.0 | 0.32 s |
+| After | **45.6–45.8** | 0.21 s |
+
+A step is now ~34 ms of NPU waits (~27.5 ms streaming, the rest per-call and
+per-submission cost) and ~3.4 ms of CPU. A draft vocabulary restricted to
+the lowest token ids was tried and dropped: acceptance fell a few points on
+English and code and from 62% to 14% on Chinese (CJK tokens have high ids).
+
 ### NPU power mode
 
 `xrt-smi configure --pmode <mode>` (needs CAP_SYS_ADMIN; the box runs

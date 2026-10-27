@@ -60,9 +60,11 @@ public:
                      int position, DecodeState& state);
   DecodeState NewMtpState() const;
 
-  // Wall time inside NPU submissions since construction, and their count.
+  // Wall time inside NPU submissions since construction, and their count;
+  // CPU time in the mixers and draft input (including buffer syncs).
   double npu_seconds() const;
   long submissions() const;
+  double cpu_seconds() const;
 
 private:
   struct Impl;

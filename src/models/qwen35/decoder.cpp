@@ -7,6 +7,7 @@
 #include <string>
 
 #include "core/quant.hpp"
+#include "core/thread_pool.hpp"
 
 namespace gufo_npu::qwen35 {
 namespace {
@@ -66,7 +67,12 @@ struct Mixer::Scratch {
   std::vector<float> u;       // conv output
   std::vector<float> query;   // one RoPE'd query head
   std::vector<float> scores;  // attention weights
-  std::vector<float> delta;   // DeltaNet rank-1 update
+  std::vector<float> delta;   // DeltaNet rank-1 update, per value head
+  int rope_position = -1;     // the position rope_cos/sin hold
+  std::vector<float> rope_cos, rope_sin;
+  // DeltaNet heads run in parallel; a job is tens of microseconds.
+  SpinPool pool{std::min<std::size_t>(
+      7, std::max<std::size_t>(std::thread::hardware_concurrency(), 1) - 1)};
 };
 
 Mixer::Mixer(const gguf::File& file)
@@ -100,7 +106,8 @@ Mixer::Mixer(const gguf::File& file)
   auto& s = *scratch_;
   s.u.resize(c.ConvChannels());
   s.query.resize(c.head_dim);
-  s.delta.resize(c.linear_head_dim);
+  s.delta.resize(static_cast<std::size_t>(c.linear_value_heads) *
+                 c.linear_head_dim);
 }
 
 Mixer::~Mixer() = default;
@@ -139,15 +146,24 @@ void Mixer::Linear(int il, const float* in, DecodeState::Layer& st, float* y,
   const float* alpha = z + value_dim;
   const float* beta = alpha + hv;
 
-  // Causal depthwise conv over [3 previous inputs, current], then SiLU.
-  for (int ch = 0; ch < channels; ++ch) {
-    const float* kw = &lw.conv[static_cast<std::size_t>(ch) * c.conv_kernel];
-    float acc = kw[window] * x[ch];
-    for (int t = 0; t < window; ++t) {
-      acc += kw[t] * st.conv[static_cast<std::size_t>(t) * channels + ch];
-    }
-    s.u[ch] = Silu(acc);
-  }
+  // Causal depthwise conv over [3 previous inputs, current], then SiLU, in
+  // chunks across the pool.
+  constexpr int kConvChunk = 512;
+  s.pool.Run(
+      static_cast<std::size_t>((channels + kConvChunk - 1) / kConvChunk),
+      [&](std::size_t chunk) {
+        const int end =
+            std::min(channels, (static_cast<int>(chunk) + 1) * kConvChunk);
+        for (int ch = static_cast<int>(chunk) * kConvChunk; ch < end; ++ch) {
+          const float* kw =
+              &lw.conv[static_cast<std::size_t>(ch) * c.conv_kernel];
+          float acc = kw[window] * x[ch];
+          for (int t = 0; t < window; ++t) {
+            acc += kw[t] * st.conv[static_cast<std::size_t>(t) * channels + ch];
+          }
+          s.u[ch] = Silu(acc);
+        }
+      });
   std::memmove(st.conv.data(), st.conv.data() + channels,
                static_cast<std::size_t>(window - 1) * channels * sizeof(float));
   std::copy_n(x, channels,
@@ -172,8 +188,11 @@ void Mixer::Linear(int il, const float* in, DecodeState::Layer& st, float* y,
     }
   }
 
-  float* delta = s.delta.data();
-  for (int head = 0; head < hv; ++head) {
+  // Heads are independent: run them across the pool, each with its own
+  // delta scratch.
+  s.pool.Run(static_cast<std::size_t>(hv), [&](std::size_t h) {
+    const int head = static_cast<int>(h);
+    float* delta = s.delta.data() + static_cast<std::size_t>(head) * dk;
     const int kh = head % hk;  // GGUF order: value heads tile key heads
     const float* qh = q + kh * dk;
     const float* kvec = k + kh * dk;
@@ -217,7 +236,7 @@ void Mixer::Linear(int il, const float* in, DecodeState::Layer& st, float* y,
     for (int j = 0; j < dk; ++j) {
       yh[j] *= Silu(zh[j]);
     }
-  }
+  });
 }
 
 void Mixer::Attention(int il, float* in, int position, DecodeState::Layer& st,
@@ -233,12 +252,23 @@ void Mixer::Attention(int il, float* in, int position, DecodeState::Layer& st,
   float* k = qg + 2 * c.heads * hd;
   const float* v = k + kv;
 
-  auto rope = [&](float* x) {
+  // cos/sin for this position, computed once and shared by every head and
+  // layer at the same position.
+  if (s.rope_position != position) {
+    s.rope_cos.resize(half);
+    s.rope_sin.resize(half);
     for (int i = 0; i < half; ++i) {
       const double angle =
           static_cast<double>(position) * weights_->rope_inv_freq[i];
-      const auto cs = static_cast<float>(std::cos(angle));
-      const auto sn = static_cast<float>(std::sin(angle));
+      s.rope_cos[i] = static_cast<float>(std::cos(angle));
+      s.rope_sin[i] = static_cast<float>(std::sin(angle));
+    }
+    s.rope_position = position;
+  }
+  auto rope = [&](float* x) {
+    for (int i = 0; i < half; ++i) {
+      const float cs = s.rope_cos[i];
+      const float sn = s.rope_sin[i];
       const float a = x[i];
       const float b = x[i + half];
       x[i] = a * cs - b * sn;

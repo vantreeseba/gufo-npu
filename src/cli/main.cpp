@@ -352,6 +352,33 @@ int BenchMtp(const std::vector<std::string_view>& args) {
   std::printf("%zu prompt tokens, %zu generated\n", prompt_len,
               seq.size() - prompt_len);
 
+  // Draft vocabulary subsets: the NPU MTP head's argmax over token ids
+  // below K only (one position per draft).
+  {
+    const int vocab = npu.config().vocab;
+    const int sizes[] = {8192, 16384, 32768, 65536, vocab};
+    std::size_t hits[5] = {};
+    std::size_t total = 0;
+    auto state = npu.NewMtpState();
+    for (std::size_t i = 0; i + 2 < seq.size(); ++i) {
+      const float* hs[1] = {hidden[i].data()};
+      const float* logits =
+          npu.Draft(hs, &seq[i + 1], 1, static_cast<int>(i + 1), state);
+      if (i + 2 < prompt_len) {
+        continue;
+      }
+      ++total;
+      for (int s = 0; s < 5; ++s) {
+        const int k = std::min(sizes[s], vocab);
+        hits[s] += std::max_element(logits, logits + k) - logits == seq[i + 2];
+      }
+    }
+    for (int s = 0; s < 5; ++s) {
+      std::printf("draft vocabulary ids < %6d: accepted %zu/%zu (%.1f%%)\n",
+                  std::min(sizes[s], vocab), hits[s], total,
+                  total ? 100.0 * hits[s] / total : 0.0);
+    }
+  }
   // The NPU MTP head over the same pairs, one and two positions per draft.
   for (const int per_draft : {1, 2}) {
     auto state = npu.NewMtpState();
@@ -481,10 +508,10 @@ int Generate(const std::vector<std::string_view>& args) {
                  draft == "mtp" ? "MTP draft" : "no draft");
     std::fprintf(stderr,
                  "[%d decode steps, %d drafts accepted (%.0f%%); %ld NPU "
-                 "submissions, %.2f s waiting on them]\n",
+                 "submissions, %.2f s waiting on them; %.2f s in CPU mixers]\n",
                  stats.steps, stats.accepted,
                  stats.steps ? 100.0 * stats.accepted / stats.steps : 0.0,
-                 npu.submissions(), npu.npu_seconds());
+                 npu.submissions(), npu.npu_seconds(), npu.cpu_seconds());
     return 0;
   }
 
