@@ -33,44 +33,15 @@ from aie.utils.compile.utils import (
 )
 from iron.operators.flm.gemm import design as flm
 
-XCLBIN = "bfp16_gemm"
+# Shapes, sequence names and outputs: pure data, also read by CMake.
+from bfp16_gemm_variants import CHUNKS, OUTPUTS, SHAPES, XCLBIN, sequence_name, sequences  # noqa: E402,F401
+
 TILE_N = 64
 K_TILE = flm.K_TILE
 CT_K = flm.CT_MAX_K_FOR_N[TILE_N]
 M_CHUNK = 1
 # bfp16ebs8: 9 bytes per 8 values.
 B_BYTES_PER_VALUE = flm.BFP16_GROUP_BYTES / flm.BFP16_GROUP
-
-# Prompt tokens per call (rows of A), each a multiple of 256.
-CHUNKS = [256, 512, 1024]
-# Qwen3.5-2B prefill projections as (K, N): DeltaNet input (qkv + z),
-# attention input (q + gate, k, v), mixer output (ssm_out / attn_output),
-# gate + up, down, and the MTP head's eh_proj.
-SHAPES = [
-    (2048, 8192),
-    (2048, 5120),
-    (2048, 2048),
-    (2048, 12288),
-    (6144, 2048),
-    (4096, 2048),
-]
-
-
-def sequence_name(m, k, n) -> str:
-    return f"{XCLBIN}_m{m}_k{k}_n{n}"
-
-
-def _sequences():
-    for m in CHUNKS:
-        for k, n in SHAPES:
-            yield m, k, n
-
-
-# build.py checks these: the xclbin, then one instruction ELF per shape.
-OUTPUTS = [f"{XCLBIN}.xclbin"] + [
-    f"{sequence_name(m, k, n)}.insts.elf" for m, k, n in _sequences()
-]
-
 
 def _kernel(tile_ma):
     return fused_mm(
@@ -122,7 +93,7 @@ def compile_to(out_dir: Path, dev: str) -> None:
     )
     kernel = _kernel(tile_ma)
     first = None
-    for m, k, n in _sequences():
+    for m, k, n in sequences():
         name = sequence_name(m, k, n)
         # IRON reuses any kernel object already in the work dir, even when
         # its source changed, so every build starts from an empty one.

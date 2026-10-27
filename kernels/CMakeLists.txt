@@ -1,84 +1,29 @@
-# NPU kernels: IRON / mlir-aie designs compiled to .xclbin + instruction ELF.
-# Compiling targets the npu2 (XDNA2) family and needs no NPU attached.
+# NPU kernels: IRON / mlir-aie designs compiled to .xclbin + instruction
+# sequences. Compiling targets the npu2 (XDNA2) family and needs no NPU.
+# Each design is registered with gufo_npu_add_kernel
+# (cmake/GufoNpuKernels.cmake), naming the models it serves.
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 set(GUFO_NPU_KERNEL_DEVICE "npu2" CACHE STRING "mlir-aie device family")
 set(GUFO_NPU_KERNEL_OUT "${CMAKE_BINARY_DIR}/kernels")
+set(GUFO_NPU_KERNEL_BUILD_PY "${CMAKE_CURRENT_SOURCE_DIR}/build.py")
 
-# One entry per design in designs/<name>.py.
-set(GUFO_NPU_KERNEL_DESIGNS smoke_add_one bw_memcpy bw_read q4nx_gemv bfp16_gemm)
-# Designs that write other files than <name>.xclbin + <name>.insts.elf list
-# them here (must match OUTPUTS in the design); <name>_SOURCES are extra
-# inputs.
-# q4nx_gemv: one sequence per variant (VARIANTS and MOE_VARIANTS in the
-# design) and token count, each as an instruction ELF (the ELF flow) and as
-# raw instruction words (the instruction-buffer flow, src/npu/gemv.hpp).
-set(q4nx_gemv_SEQUENCES
-  q4nx_gemv_k2048_n2048_plain_store
-  q4nx_gemv_k4096_n2048_plain_store
-  q4nx_gemv_k2048_n5120_resnorm_store
-  q4nx_gemv_k2048_n8192_resnorm_store
-  q4nx_gemv_k2048_n12288_resnorm_swiglu
-  q4nx_gemv_k6144_n2048_act_store
-  q4nx_gemv_k2048_n248832_resnorm_store
-  q4nx_gemv_k2048_n32768_resnorm_store
-  q4nx_gemv_k2048_n1024_resnorm_swiglu
-  q4nx_gemv_k512_n2048_act_store
-  q4nx_gemv_k2048_n9216_resnorm_swiglu_scaled_rounds9
-  q4nx_gemv_k4608_n2048_act_store_k9
-  q4nx_gemv_k2048_n12288_resnorm_store
-  q4nx_gemv_k2048_n9216_resnorm_store)
-set(q4nx_gemv_OUTPUTS q4nx_gemv.xclbin)
-foreach(sequence IN LISTS q4nx_gemv_SEQUENCES)
-  foreach(tokens 1 2)
-    list(APPEND q4nx_gemv_OUTPUTS ${sequence}_t${tokens}.insts.elf
-         ${sequence}_t${tokens}.insts.bin)
-  endforeach()
-endforeach()
-set(q4nx_gemv_SOURCES aie/q4nx_gemv.cc)
-set(bfp16_gemm_OUTPUTS
-  bfp16_gemm.xclbin
-  bfp16_gemm_m256_k2048_n8192.insts.elf
-  bfp16_gemm_m256_k2048_n5120.insts.elf
-  bfp16_gemm_m256_k2048_n2048.insts.elf
-  bfp16_gemm_m256_k2048_n12288.insts.elf
-  bfp16_gemm_m256_k6144_n2048.insts.elf
-  bfp16_gemm_m256_k4096_n2048.insts.elf
-  bfp16_gemm_m512_k2048_n8192.insts.elf
-  bfp16_gemm_m512_k2048_n5120.insts.elf
-  bfp16_gemm_m512_k2048_n2048.insts.elf
-  bfp16_gemm_m512_k2048_n12288.insts.elf
-  bfp16_gemm_m512_k6144_n2048.insts.elf
-  bfp16_gemm_m512_k4096_n2048.insts.elf
-  bfp16_gemm_m1024_k2048_n8192.insts.elf
-  bfp16_gemm_m1024_k2048_n5120.insts.elf
-  bfp16_gemm_m1024_k2048_n2048.insts.elf
-  bfp16_gemm_m1024_k2048_n12288.insts.elf
-  bfp16_gemm_m1024_k6144_n2048.insts.elf
-  bfp16_gemm_m1024_k4096_n2048.insts.elf)
+add_custom_target(gufo_npu_kernels ALL)
+include(GufoNpuKernels)
 
-set(kernel_outputs)
-foreach(design IN LISTS GUFO_NPU_KERNEL_DESIGNS)
-  set(files ${design}.xclbin ${design}.insts.elf)
-  if(DEFINED ${design}_OUTPUTS)
-    set(files ${${design}_OUTPUTS})
-  endif()
-  set(outputs)
-  foreach(file IN LISTS files)
-    list(APPEND outputs "${GUFO_NPU_KERNEL_OUT}/${file}")
-  endforeach()
-  add_custom_command(
-    OUTPUT ${outputs}
-    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/build.py"
-            --dev "${GUFO_NPU_KERNEL_DEVICE}"
-            --out "${GUFO_NPU_KERNEL_OUT}" ${design}
-    DEPENDS build.py "designs/${design}.py" ${${design}_SOURCES}
-    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
-    COMMENT "Compiling NPU kernel ${design}"
-    VERBATIM)
-  list(APPEND kernel_outputs ${outputs})
-endforeach()
+# Diagnostics: the smoke kernel and the bandwidth probes.
+gufo_npu_add_kernel(NAME smoke_add_one DESIGN designs/smoke_add_one.py MODEL common)
+gufo_npu_add_kernel(NAME bw_memcpy DESIGN designs/bw_memcpy.py MODEL common)
+gufo_npu_add_kernel(NAME bw_read DESIGN designs/bw_read.py MODEL common)
 
-add_custom_target(gufo_npu_kernels ALL DEPENDS ${kernel_outputs})
-install(FILES ${kernel_outputs} DESTINATION "${GUFO_NPU_KERNEL_INSTALL_DIR}")
+# Decode GEMVs: one core program and xclbin for the 2B's and the 35B's calls,
+# including the 35B's MoE gathers (designs/q4nx_gemv_variants.py lists the
+# shapes; each sequence as an instruction ELF and as raw instruction words).
+gufo_npu_add_kernel(NAME q4nx_gemv DESIGN designs/q4nx_gemv.py
+                    SOURCES aie/q4nx_gemv.cc
+                    MODEL qwen35_2b qwen36_35b_a3b)
+
+# Prefill GEMMs (Qwen3.5-2B; designs/bfp16_gemm_variants.py).
+gufo_npu_add_kernel(NAME bfp16_gemm DESIGN designs/bfp16_gemm.py
+                    MODEL qwen35_2b)
