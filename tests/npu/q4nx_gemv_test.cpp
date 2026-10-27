@@ -99,8 +99,8 @@ std::vector<Case> Build(npu::GemvRuntime& rt, const Variant& v,
     c.name = npu::Q4nxGemvSequence(v.dim, packed.padded_rows, v.prologue,
                                    v.epilogue, tokens);
     if (tokens == 1) {
-      c.gemv = std::make_unique<npu::Q4nxGemv>(rt, packed, v.prologue,
-                                               v.epilogue);
+      c.gemv =
+          std::make_unique<npu::Q4nxGemv>(rt, packed, v.prologue, v.epilogue);
     }
     // act reads a SwiGLU output buffer: make it as large as one.
     const std::size_t x_bytes = std::max<std::size_t>(
@@ -202,9 +202,9 @@ int Check(Case& c, npu::Q4nxGemv& gemv, const char* how) {
     double worst = 0;
     double scale = 0;
     for (std::size_t i = 0; i < c.want_r[t].size(); ++i) {
-      worst = std::fmax(worst,
-                        std::fabs(c.r->as<float>()[t * npu::kGemvSlot + i] -
-                                  c.want_r[t][i]));
+      worst = std::fmax(
+          worst,
+          std::fabs(c.r->as<float>()[t * npu::kGemvSlot + i] - c.want_r[t][i]));
       scale = std::fmax(scale, std::fabs(c.want_r[t][i]));
     }
     r_err = std::fmax(r_err, scale > 0 ? worst / scale : 0);

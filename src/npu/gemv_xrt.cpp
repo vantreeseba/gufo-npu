@@ -140,7 +140,8 @@ struct Q4nxGemv::Impl {
 
 Q4nxGemv::Q4nxGemv(GemvRuntime& runtime, const q4nx::Matrix& weights,
                    Prologue prologue, Epilogue epilogue)
-    : impl_(std::make_unique<Impl>(runtime.impl(), weights, prologue, epilogue)),
+    : impl_(
+          std::make_unique<Impl>(runtime.impl(), weights, prologue, epilogue)),
       dim_(weights.dim),
       rows_(weights.rows),
       padded_rows_(weights.padded_rows),
