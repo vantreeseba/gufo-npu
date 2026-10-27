@@ -58,7 +58,9 @@ struct Mixer::Scratch {
   std::vector<float> u;            // conv output
   std::vector<float> delta;        // DeltaNet rank-1 update, per value head
   std::vector<float> queries;      // RoPE'd query per head
-  std::vector<float> head_scores;  // attention weights per head
+  std::vector<float> head_scores;  // attention weights per job and head
+  std::vector<float> partials;     // per job and head: weighted values, max,
+                                   // sum
   int rope_position = -1;          // the position rope_cos/sin hold
   std::vector<float> rope_cos, rope_sin;
   // DeltaNet heads run in parallel; a job is tens of microseconds.
@@ -274,44 +276,100 @@ void Mixer::Attention(int il, float* in, int position, DecodeState::Layer& st,
   const int length = static_cast<int>(st.keys.size() / kv);
   const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
   s.queries.resize(static_cast<std::size_t>(c.heads) * hd);
-  s.head_scores.resize(static_cast<std::size_t>(c.heads) * length);
-  // Query heads are independent: one pool job each.
-  s.pool.Run(static_cast<std::size_t>(c.heads), [&](std::size_t h) {
-    const int qh = static_cast<int>(h);
-    const float* raw = qg + static_cast<std::size_t>(qh) * 2 * hd;
+  for (int qh = 0; qh < c.heads; ++qh) {
     float* query = s.queries.data() + static_cast<std::size_t>(qh) * hd;
-    float* scores =
-        s.head_scores.data() + static_cast<std::size_t>(qh) * length;
-    RmsNorm(raw, lw.q_norm.data(), hd, c.rms_eps, query);
+    RmsNorm(qg + static_cast<std::size_t>(qh) * 2 * hd, lw.q_norm.data(), hd,
+            c.rms_eps, query);
     rope(query);
-    const int kh = qh / group;
-    float max_score = -INFINITY;
-    for (int j = 0; j < length; ++j) {
+  }
+
+  // Split-K (flash decoding): a job takes one KV head and a slice of the
+  // positions, reads each key and value once for the `group` query heads
+  // that share them, and leaves a partial softmax (max, sum, weighted
+  // values) per query head; the slices are merged after. Reading the cache
+  // is the cost at long context, and enough slices keep several cores'
+  // worth of bandwidth busy.
+  constexpr int kMinSlice = 128;
+  const int slices =
+      std::clamp(length / kMinSlice, 1, static_cast<int>(s.pool.size()));
+  const int slice_len = (length + slices - 1) / slices;
+  const int jobs = c.kv_heads * slices;
+  const std::size_t partial = static_cast<std::size_t>(hd) + 2;  // acc, m, l
+  s.head_scores.resize(static_cast<std::size_t>(jobs) * group * slice_len);
+  s.partials.resize(static_cast<std::size_t>(jobs) * group * partial);
+  s.pool.Run(static_cast<std::size_t>(jobs), [&](std::size_t job) {
+    const int kh = static_cast<int>(job) / slices;
+    const int begin = static_cast<int>(job) % slices * slice_len;
+    const int end = std::min(length, begin + slice_len);
+    float* scores = s.head_scores.data() + job * group * slice_len;
+    float* out = s.partials.data() + job * group * partial;
+    const float* queries =
+        s.queries.data() + static_cast<std::size_t>(kh) * group * hd;
+    for (int j = begin; j < end; ++j) {
       const float* key = &st.keys[static_cast<std::size_t>(j) * kv + kh * hd];
-      scores[j] = Dot(query, key, hd) * scale;
-      max_score = std::max(max_score, scores[j]);
-    }
-    float total = 0;
-    for (int j = 0; j < length; ++j) {
-      scores[j] = std::exp(scores[j] - max_score);
-      total += scores[j];
-    }
-    const float inv_total = 1.0f / total;
-    float* out = ctx + static_cast<std::size_t>(qh) * hd;
-    std::fill_n(out, hd, 0.0f);
-    for (int j = 0; j < length; ++j) {
-      const float p = scores[j] * inv_total;
-      const float* value =
-          &st.values[static_cast<std::size_t>(j) * kv + kh * hd];
-      for (int e = 0; e < hd; ++e) {
-        out[e] += p * value[e];
+      for (int g = 0; g < group; ++g) {
+        scores[g * slice_len + (j - begin)] =
+            Dot(queries + static_cast<std::size_t>(g) * hd, key, hd) * scale;
       }
     }
-    const float* gate = raw + hd;
-    for (int e = 0; e < hd; ++e) {
-      out[e] *= Sigmoid(gate[e]);
+    for (int g = 0; g < group; ++g) {
+      float* sc = scores + g * slice_len;
+      float max_score = -INFINITY;
+      for (int j = 0; j < end - begin; ++j) {
+        max_score = std::max(max_score, sc[j]);
+      }
+      float total = 0;
+      for (int j = 0; j < end - begin; ++j) {
+        sc[j] = std::exp(sc[j] - max_score);
+        total += sc[j];
+      }
+      float* acc = out + g * partial;
+      std::fill_n(acc, hd, 0.0f);
+      acc[hd] = max_score;
+      acc[hd + 1] = total;
+    }
+    for (int j = begin; j < end; ++j) {
+      const float* value =
+          &st.values[static_cast<std::size_t>(j) * kv + kh * hd];
+      for (int g = 0; g < group; ++g) {
+        const float p = scores[g * slice_len + (j - begin)];
+        float* acc = out + g * partial;
+        for (int e = 0; e < hd; ++e) {
+          acc[e] += p * value[e];
+        }
+      }
     }
   });
+
+  // Merge the slices per query head, then the output gate.
+  for (int qh = 0; qh < c.heads; ++qh) {
+    const int kh = qh / group;
+    const int g = qh % group;
+    auto slice = [&](int sl) {
+      return s.partials.data() +
+             (static_cast<std::size_t>(kh * slices + sl) * group + g) * partial;
+    };
+    float max_score = -INFINITY;
+    for (int sl = 0; sl < slices; ++sl) {
+      max_score = std::max(max_score, slice(sl)[hd]);
+    }
+    float* out = ctx + static_cast<std::size_t>(qh) * hd;
+    std::fill_n(out, hd, 0.0f);
+    float total = 0;
+    for (int sl = 0; sl < slices; ++sl) {
+      const float* acc = slice(sl);
+      const float w = std::exp(acc[hd] - max_score);
+      total += w * acc[hd + 1];
+      for (int e = 0; e < hd; ++e) {
+        out[e] += w * acc[e];
+      }
+    }
+    const float inv_total = 1.0f / total;
+    const float* gate = qg + static_cast<std::size_t>(qh) * 2 * hd + hd;
+    for (int e = 0; e < hd; ++e) {
+      out[e] *= inv_total * Sigmoid(gate[e]);
+    }
+  }
 }
 
 struct Decoder::Weights {

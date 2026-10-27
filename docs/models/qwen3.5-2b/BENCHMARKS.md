@@ -60,6 +60,11 @@ DRAM. A hot 16 MiB buffer reads no faster, so NPU reads are not served from
 the Infinity Cache (which only GPU traffic fills). **56 GB/s is the decode
 ceiling**: decode only reads weights.
 
+For comparison, the CPU (AVX2 loads over a 1 GiB buffer, best of five,
+2026-10-27) reads 39.8 GB/s on one thread, 62.1 on two and 113–116 GB/s
+on 4 to 32 threads: twice the NPU. Work that is all reads of state rather
+than weights (the attention K/V cache) is better done on the CPU.
+
 ## NPU q4nx GEMV
 
 `gufo-npu bench gemv --model Qwen3.5-2B-UD-Q4_K_XL.gguf`: one stacked q4nx
@@ -214,6 +219,20 @@ the q/k L2 norms now use `vec::Dot`. Same binaries otherwise, warm,
 
 The CPU side of a single-token step is now ~0.9 ms of ~26.9 ms (NPU waits
 ~26 ms).
+
+Attention then went split-K (flash decoding): a job takes one KV head and a
+slice of at least 128 positions, reads each key and value once for the 4
+query heads that share it, and leaves a partial softmax; the slices are
+merged per head. Same 2,120-token prompt, `--draft none`, warm:
+
+| | Per query head | Split-K |
+|---|---|---|
+| Decode | 33.22, 33.13, 33.09 tok/s | **34.23, 34.59, 34.59** |
+| Prompt (token by token) | 33.7 s | 32.3–32.5 s |
+| CPU mixer time | 4.9 s | 3.5–3.6 s |
+
+Decode at 2k context is now ~2% below short context (no draft: 28.9 vs
+26.9 ms per token).
 
 ### NPU power mode
 
