@@ -399,7 +399,8 @@ int BenchGemv(const std::vector<std::string_view>& args) {
     const std::size_t dim = file->Tensor(c.tensors[0]).RowElements();
     const auto packed = q4nx::PackRows(segments, dim);
     npu::Q4nxGemv gemv(runtime, packed, c.prologue, c.epilogue);
-    // Unit inputs: timing only (tests/npu/q4nx_gemv_test.cpp checks values).
+    // Unit inputs: timing only (tests/models/qwen35_2b/q4nx_gemv_test.cpp
+    // checks values).
     npu::Buffer x(runtime, std::max<std::size_t>(npu::kGemvInputBytes,
                                                  4 * dim * sizeof(float)));
     std::fill_n(x.as<float>(), x.size() / sizeof(float), 1.0f);
