@@ -95,6 +95,31 @@ are dequantized once per prompt), one token at a time 1.2 tok/s. Peak RSS
 (only the experts the prompts touch are read); nothing is dequantized ahead
 of use. The full test takes ~60 s.
 
+## Decoder vs reference
+
+`tests/models/qwen36/decoder_test.cpp` (label `model`, same variables): the
+one-token decode step (`Decoder`, fp32 with an fp16 K/V cache, the MoE
+routing of `moe.hpp`) against the reference, token by token over the chat
+prompt, both on the reference's GGUF projections, so only the non-matrix
+math differs. 2026-10-27:
+
+| Check | Pass | Measured |
+|---|---|---|
+| Logits rel. L2 up to the first token routed differently | < 2e-3 | 3.6e-4 (2B decoder: 4.3e-4) |
+| Reference's 8th/9th expert gap where routing first differs | < 1e-3 | 1.3e-4 (position 13, layer 36) |
+| Argmax | 17/17 | 17/17 |
+
+Top-k routing is discontinuous. In 17 tokens × 40 layers the reference saw
+7 routings whose 8th and 9th expert probabilities were within 0.1% of each
+other; at one of them (position 13, layer 36) the decoder's fp32 and fp16
+rounding picked the other expert. That changes the layer output by a few
+percent, which the later layers (layer 39 then routes differently too, gap
+2.2e-2) and the DeltaNet state carry on: logits rel. err 4.9e-2 at position
+13 and 1e-3–3e-2 after, top-1 unchanged. Any two implementations will
+disagree like this somewhere (llama.cpp included), so MoE decode checks
+compare closely only up to the first routing difference and require it to
+be at a near tie.
+
 ## GGUF load
 
 `tests/models/qwen36/gguf_load_test.cpp` (label `model`): ReadConfig gives
