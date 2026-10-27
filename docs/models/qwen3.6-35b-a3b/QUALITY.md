@@ -8,6 +8,8 @@ Planned contracts (see [the plan](../../PLAN.md)):
 | Each NPU op vs CPU reference | relative error < 1e-2 | |
 | NPU model vs CPU reference, teacher-forced | greedy argmax match | |
 | Prefill vs one-token decode | identical next token | reference: identical logits |
+| CPU decoder vs reference | see below | enforced |
+| MTP head (reference) vs main model's top-1 | ≥ 50% of drafts | enforced (69%) |
 | MTP head vs reference | cosine > 0.999 | |
 
 There is no HF transformers oracle for this model here (the BF16 weights are
@@ -122,6 +124,29 @@ percent, which the later layers (layer 39 then routes differently too, gap
 disagree like this somewhere (llama.cpp included), so MoE decode checks
 compare closely only up to the first routing difference and require it to
 be at a near tie.
+
+## MTP head
+
+`tests/models/qwen36/mtp_test.cpp` (label `model`, same variables).
+Neither oracle runs this model's MTP layer (llama.cpp's MTP context API is
+experimental), so the reference's head (`Reference::Mtp`, the `blk.40`
+nextn layer with its MoE FFN) is checked against the main model: teacher
+forced, the draft for position p + 1 (from the main model's last hidden
+state at p - 1 and the token at p) against the main model's top-1 for
+p + 1. 2026-10-27:
+
+| Prompt | Drafts matching the main model's top-1 |
+|---|---|
+| chat | 10/15 |
+| code | 12/13 |
+| prose | 23/37 |
+| all (pass ≥ 50%) | 45/65 (69%); 31/65 match the text itself |
+
+A miswired head (swapped or unnormalized inputs, the wrong norm or head)
+drafts next to nothing right. Drafting one token at a time gives the same
+logits as all at once (rel. err 0). RoPE starting at the token's position
+or at the hidden state's gives identical drafts (only position differences
+matter inside the MTP block's own cache).
 
 ## GGUF load
 

@@ -98,4 +98,7 @@ and `nextn.shared_head_norm`. It has no embedding or head of its own:
 llama.cpp uses `token_embd` and `output`. As on the 2B,
 `x = eh_proj · [RMS(embed(token)) * enorm ; RMS(h) * hnorm]` with h the main
 model's last hidden state after `output_norm` (llama.cpp's `t_h_nextn`), then
-the block, then `output · (RMS(x) * shared_head_norm)`.
+the block, then `output · (RMS(x) * shared_head_norm)`. `Reference::Mtp`
+implements it. The block attends only to its own K/V cache, and RoPE scores
+depend only on position differences, so where its positions start does not
+matter as long as each draft step advances by one.
