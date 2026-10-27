@@ -59,6 +59,12 @@ Compiling NPU kernels needs no NPU; running them does. Run NPU work with
 - Successful optimizations become the default, without extra switches.
 - IRON reuses any kernel object already in a compile work dir, even when the
   source changed; designs clear their work dir before compiling.
+- In a runtime sequence, waiting on a DMA task (`wait=True`, a task group's
+  `finish()`) takes the next completion token of that task's shim channel,
+  whichever task sent it. Await the tasks of one channel in the order they
+  were queued, or a wait returns early and a reused BD can overwrite a
+  transfer still in flight (see `kernels/designs/q4nx_gemv.py`;
+  `q4nx_gemv_chain_test` runs the chain 60,000 times to catch this).
 - A core starts in floor (truncating) rounding mode; kernels that narrow to
   bf16 set round-to-nearest-even first (see `kernels/aie/q4nx_gemv.cc`).
 - One xclbin per kernel family, one instruction sequence per shape (shape

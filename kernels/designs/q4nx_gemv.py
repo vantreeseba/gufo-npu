@@ -332,10 +332,25 @@ def gemv_program(dev, dim, n_out, prologue, epilogue, y_stride, tokens):
         # One broadcast sends the token to every core; it has no completion
         # token, so its BD is freed at the end.
         x_task = x_prod.fill(X, x_tap, wait=False, managed=False)
+        # A wait takes the next completion token of its channel, whichever
+        # task sent it, so waits on a channel must come in the order its
+        # tasks were queued. The residual drain is queued first on RES_COL's
+        # channel, so it is awaited before any Y drain there: awaited later,
+        # its token satisfied the wait for round 0's Y drain, whose BD the
+        # SwiGLU window then reused while round 0 could still be in flight
+        # (about 1 call in 30,000 put round 0's values into round 3 or 4).
+        r_group = None
         if prologue == "resnorm":
             # Queued first, so the residual column's first objects go to R.
             r_group = TaskGroup()
             y_conses[RES_COL].drain(R, r_tap, wait=True, group=r_group)
+
+        def finish_residual():
+            nonlocal r_group
+            if r_group is not None:
+                r_group.finish()
+                r_group = None
+
         tg = TaskGroup()
         for col in range(COLS):
             w_prods[col].fill(W, w_taps[col], wait=False, group=tg)
@@ -348,15 +363,16 @@ def gemv_program(dev, dim, n_out, prologue, epilogue, y_stride, tokens):
                     y_conses[col].drain(Y, y_taps[rnd * COLS + col], wait=True, group=dg)
                 window.append(dg)
                 if len(window) > DEPTH:
+                    finish_residual()
                     window.pop(0).finish()
+            finish_residual()
             for dg in window:
                 dg.finish()
         else:
             for col in range(COLS):
                 y_conses[col].drain(Y, y_taps[col], wait=True, group=tg)
+            finish_residual()
         tg.finish()
-        if prologue == "resnorm":
-            r_group.finish()
         x_task.free()
 
     rt = Runtime(

@@ -113,6 +113,24 @@ and 19 with the full one). A rejected draft rolls back the DeltaNet state
 attention caches. The draft vocabulary only changes which drafts are
 proposed; acceptance per prompt and vocabulary size is in BENCHMARKS.md.
 
+## Determinism
+
+Greedy output on the NPU must be the same on every run.
+`q4nx_gemv_chain_test` (label `npu`) runs one decoder layer's chain of
+GEMVs 60,000 times with the same inputs, alternating 1 and 2 tokens, and
+requires every output to be bit-identical.
+
+2026-10-27: about one sweep run in ten (long prompts: one call in ~30,000)
+gave a different reply. The chain test (200,000 runs) found 6 runs whose
+gate + up output differed, always in column 1 (the residual column), round 3
+or 4. The cause was the wait order in the GEMV's runtime sequence: the
+residual drain, queued first on that column's output channel, was awaited
+last, so its completion token satisfied the wait for round 0's output, and
+the SwiGLU drain window reused round 0's BD while it could still be in
+flight. Awaiting the residual first fixed it: 0 differing runs in 200,000.
+CPU load, DDR load, memory compaction and a second process on the NPU did
+not change the output (175 runs).
+
 ## Fast decoder vs reference
 
 `qwen35_decoder_test` (label `model`; needs `GUFO_NPU_QWEN35_2B_Q4_GGUF` and
