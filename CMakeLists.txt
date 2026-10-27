@@ -44,6 +44,7 @@ target_include_directories(nlohmann_json SYSTEM INTERFACE
 add_library(gufo_npu_core STATIC
   src/core/diagnose.cpp
   src/core/gguf.cpp
+  src/core/q4nx.cpp
   src/core/quant.cpp
   src/core/tokenizer.cpp
 )
@@ -56,23 +57,39 @@ target_include_directories(gufo_npu_core PUBLIC
 add_library(gufo_npu_qwen35 STATIC
   src/models/qwen35/chat.cpp
   src/models/qwen35/config.cpp
+  src/models/qwen35/decoder.cpp
+  src/models/qwen35/draft_vocab.cpp
   src/models/qwen35/generate.cpp
+  src/models/qwen35/mtp.cpp
   src/models/qwen35/reference.cpp
 )
 target_link_libraries(gufo_npu_qwen35 PUBLIC gufo_npu_core)
+# The decode steps' CPU math vectorizes with AVX2 + FMA (Zen 5 has more; the
+# hosted CI runners have at least this).
+set_source_files_properties(src/models/qwen35/decoder.cpp
+  src/models/qwen35/npu_decoder.cpp PROPERTIES
+  COMPILE_OPTIONS "-march=x86-64-v3;-O3")
 
 # NPU runtime: XRT when enabled, otherwise a stub that reports it is absent.
 if(GUFO_NPU_ENABLE_XRT)
   find_package(XRT REQUIRED)
-  add_library(gufo_npu_runtime STATIC src/npu/device_xrt.cpp)
+  add_library(gufo_npu_runtime STATIC src/npu/device_xrt.cpp
+                                     src/npu/gemv_xrt.cpp)
   target_link_libraries(gufo_npu_runtime PUBLIC gufo_npu_core XRT::xrt_coreutil)
 else()
-  add_library(gufo_npu_runtime STATIC src/npu/device_stub.cpp)
+  add_library(gufo_npu_runtime STATIC src/npu/device_stub.cpp
+                                     src/npu/gemv_stub.cpp)
   target_link_libraries(gufo_npu_runtime PUBLIC gufo_npu_core)
 endif()
 
+# Qwen3.5 decode on the NPU, and the same q4nx weights on the CPU for tests.
+add_library(gufo_npu_qwen35_npu STATIC src/models/qwen35/npu_decoder.cpp
+                                       src/models/qwen35/q4nx_projections.cpp)
+target_link_libraries(gufo_npu_qwen35_npu PUBLIC gufo_npu_qwen35
+                      gufo_npu_runtime)
+
 add_executable(gufo-npu src/cli/main.cpp)
-target_link_libraries(gufo-npu PRIVATE gufo_npu_runtime gufo_npu_qwen35)
+target_link_libraries(gufo-npu PRIVATE gufo_npu_qwen35_npu)
 install(TARGETS gufo-npu RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 if(GUFO_NPU_BUILD_KERNELS)

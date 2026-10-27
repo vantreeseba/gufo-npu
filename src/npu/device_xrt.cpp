@@ -7,21 +7,11 @@
 #include <optional>
 
 #include "npu/device.hpp"
-#include "xrt/experimental/xrt_elf.h"
-#include "xrt/experimental/xrt_ext.h"
-#include "xrt/experimental/xrt_kernel.h"
-#include "xrt/experimental/xrt_module.h"
-#include "xrt/xrt_bo.h"
-#include "xrt/xrt_device.h"
-#include "xrt/xrt_kernel.h"
+#include "npu/xrt_kernel.hpp"
 
 namespace gufo_npu::npu {
 namespace {
 
-// Kernel names in mlir-aie xclbins start with this prefix.
-constexpr char kKernelPrefix[] = "MLIR_AIE";
-// Opcode for "run the instruction stream" in mlir-aie's NPU kernels.
-constexpr unsigned int kOpcodeRun = 3;
 // Must match PROBLEM_SIZE in kernels/designs/smoke_add_one.py.
 constexpr std::size_t kSmokeElements = 4096;
 constexpr std::size_t kSmokeBytes = kSmokeElements * sizeof(std::int32_t);
@@ -30,60 +20,14 @@ constexpr std::size_t kBandwidthElements = 16ULL * 1024 * 1024;
 constexpr std::size_t kBandwidthBytes =
     kBandwidthElements * sizeof(std::int32_t);
 
-using Clock = std::chrono::steady_clock;
+// Must match SIZE in kernels/designs/bw_read.py.
+constexpr std::size_t kReadElements = 64ULL * 1024 * 1024;
+constexpr std::size_t kReadBytes = kReadElements * sizeof(std::int32_t);
 
-double MicrosSince(Clock::time_point start) {
-  return std::chrono::duration<double, std::micro>(Clock::now() - start)
-      .count();
+xrt::run SmokeRun(LoadedKernel& kernel, const xrt::bo& input,
+                  const xrt::bo& output) {
+  return kernel.Run({&input, &output});
 }
-
-std::string KernelName(const xrt::xclbin& xclbin) {
-  for (const auto& kernel : xclbin.get_kernels()) {
-    const auto name = kernel.get_name();
-    if (name.rfind(kKernelPrefix, 0) == 0) {
-      return name;
-    }
-  }
-  return {};
-}
-
-// One compiled design (<dir>/<name>.xclbin + .insts.elf) loaded into its own
-// hardware context.
-struct LoadedKernel {
-  xrt::device device{0U};
-  xrt::xclbin xclbin;
-  std::optional<xrt::hw_context> context;
-  std::optional<xrt::elf> elf;
-  std::optional<xrt::module> module;
-  xrt::kernel kernel;
-
-  LoadedKernel(const std::filesystem::path& dir, const std::string& design)
-      : xclbin((dir / (design + ".xclbin")).string()) {
-    const auto name = KernelName(xclbin);
-    if (name.empty()) {
-      throw std::runtime_error("no MLIR_AIE kernel in " + design + ".xclbin");
-    }
-    device.register_xclbin(xclbin);
-    context.emplace(device, xclbin.get_uuid());
-    elf.emplace((dir / (design + ".insts.elf")).string());
-    module.emplace(*elf);
-    kernel = xrt::ext::kernel(*context, *module, name);
-  }
-
-  xrt::bo Buffer(std::size_t bytes = kSmokeBytes) {
-    return xrt::ext::bo{device, bytes};
-  }
-
-  xrt::run Run(const xrt::bo& input, const xrt::bo& output) {
-    xrt::run run(kernel);
-    run.set_arg(0, kOpcodeRun);
-    run.set_arg(1, 0);
-    run.set_arg(2, 0);
-    run.set_arg(3, input);
-    run.set_arg(4, output);
-    return run;
-  }
-};
 
 void Fill(xrt::bo& bo) {
   auto* data = bo.map<std::int32_t*>();
@@ -134,10 +78,10 @@ SmokeResult RunSmoke(const std::filesystem::path& kernel_dir, int iterations) {
   result.iterations = std::max(iterations, 1);
   try {
     LoadedKernel smoke(kernel_dir, "smoke_add_one");
-    auto input = smoke.Buffer();
-    auto output = smoke.Buffer();
+    auto input = smoke.Buffer(kSmokeBytes);
+    auto output = smoke.Buffer(kSmokeBytes);
     Fill(input);
-    auto run = smoke.Run(input, output);
+    auto run = SmokeRun(smoke, input, output);
 
     double total_us = 0;
     result.min_us = std::numeric_limits<double>::max();
@@ -168,13 +112,13 @@ DispatchBenchResult BenchDispatch(const std::filesystem::path& kernel_dir,
   rounds = std::max(rounds, 1);
   try {
     LoadedKernel smoke(kernel_dir, "smoke_add_one");
-    auto input = smoke.Buffer();
+    auto input = smoke.Buffer(kSmokeBytes);
     Fill(input);
 
     // Warm up: wakes the NPU and loads the context.
     {
-      auto output = smoke.Buffer();
-      auto run = smoke.Run(input, output);
+      auto output = smoke.Buffer(kSmokeBytes);
+      auto run = SmokeRun(smoke, input, output);
       for (int i = 0; i < 20; ++i) {
         run.start();
         run.wait();
@@ -182,8 +126,8 @@ DispatchBenchResult BenchDispatch(const std::filesystem::path& kernel_dir,
     }
 
     {
-      auto output = smoke.Buffer();
-      auto run = smoke.Run(input, output);
+      auto output = smoke.Buffer(kSmokeBytes);
+      auto run = SmokeRun(smoke, input, output);
       const auto start = Clock::now();
       for (int i = 0; i < rounds; ++i) {
         run.start();
@@ -202,10 +146,10 @@ DispatchBenchResult BenchDispatch(const std::filesystem::path& kernel_dir,
         std::vector<xrt::bo> outputs;
         std::vector<xrt::run> runs;
         for (int i = 0; i < depth; ++i) {
-          outputs.push_back(smoke.Buffer());
+          outputs.push_back(smoke.Buffer(kSmokeBytes));
         }
         for (int i = 0; i < depth; ++i) {
-          runs.push_back(smoke.Run(input, outputs[i]));
+          runs.push_back(SmokeRun(smoke, input, outputs[i]));
         }
         const auto start = Clock::now();
         for (int r = 0; r < rounds; ++r) {
@@ -228,13 +172,14 @@ DispatchBenchResult BenchDispatch(const std::filesystem::path& kernel_dir,
       {
         std::vector<xrt::bo> chain;
         for (int i = 0; i < depth; ++i) {
-          chain.push_back(smoke.Buffer());
+          chain.push_back(smoke.Buffer(kSmokeBytes));
           Clear(chain.back());
         }
-        xrt::runlist runlist(*smoke.context);
+        xrt::runlist runlist = smoke.Runlist();
         std::vector<xrt::run> runs;
         for (int i = 0; i < depth; ++i) {
-          runs.push_back(smoke.Run(i == 0 ? input : chain[i - 1], chain[i]));
+          runs.push_back(
+              SmokeRun(smoke, i == 0 ? input : chain[i - 1], chain[i]));
         }
         for (auto& run : runs) {
           runlist.add(run);
@@ -277,7 +222,7 @@ BandwidthResult BenchBandwidth(const std::filesystem::path& kernel_dir,
     std::memset(output.map<void*>(), 0, kBandwidthBytes);
     output.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-    auto run = copy.Run(input, output);
+    auto run = SmokeRun(copy, input, output);
     for (int i = 0; i < 3; ++i) {
       run.start();
       run.wait();
@@ -305,6 +250,32 @@ BandwidthResult BenchBandwidth(const std::filesystem::path& kernel_dir,
       result.error = "copied buffer differs from the input";
       return result;
     }
+
+    LoadedKernel read(kernel_dir, "bw_read");
+    auto source = read.Buffer(kReadBytes);
+    auto sink = read.Buffer(4096);
+    std::memset(source.map<void*>(), 1, kReadBytes);
+    source.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    auto read_run = read.Run({&source, &sink});
+    for (int i = 0; i < 3; ++i) {
+      read_run.start();
+      read_run.wait();
+    }
+    double read_total_us = 0;
+    double read_best_us = std::numeric_limits<double>::max();
+    for (int i = 0; i < iterations; ++i) {
+      const auto start = Clock::now();
+      read_run.start();
+      read_run.wait();
+      const double us = MicrosSince(start);
+      read_total_us += us;
+      read_best_us = std::min(read_best_us, us);
+    }
+    result.read_bytes_per_run = kReadBytes;
+    result.read_mean_gb_s =
+        static_cast<double>(kReadBytes) / (read_total_us / iterations) / 1e3;
+    result.read_best_gb_s =
+        static_cast<double>(kReadBytes) / read_best_us / 1e3;
     result.ok = true;
   } catch (const std::exception& error) {
     result.error = error.what();

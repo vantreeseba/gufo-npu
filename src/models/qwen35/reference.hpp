@@ -5,6 +5,7 @@
 
 #include "core/gguf.hpp"
 #include "models/qwen35/config.hpp"
+#include "models/qwen35/projections.hpp"
 
 // fp32 CPU reference forward pass for dense Qwen3.5 (GGUF arch `qwen35`).
 // Slow by design: weights are dequantized row by row and dot products
@@ -46,14 +47,19 @@ public:
   State NewState() const;
 
   // Runs `tokens` after whatever `state` already holds and advances it.
+  // `projections` replaces the reference's own GGUF matrix products (for
+  // example with the NPU); the rest of the pass stays on the CPU.
   ForwardOutput Forward(const std::vector<int>& tokens, State& state,
-                        bool want_logits = true,
-                        bool want_hidden = false) const;
+                        bool want_logits = true, bool want_hidden = false,
+                        const Projections* projections = nullptr) const;
 
 private:
   struct Weights;
+  class GgufProjections;
+  void LoadWeights(const gguf::File& file);
   Config config_;
   std::unique_ptr<Weights> weights_;
+  std::unique_ptr<GgufProjections> gguf_projections_;
 };
 
 }  // namespace gufo_npu::qwen35

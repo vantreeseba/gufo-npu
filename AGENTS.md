@@ -41,7 +41,9 @@ Compiling NPU kernels needs no NPU; running them does. Run NPU work with
   main, with the same prompts and toolchain. Record them in `BENCHMARKS.md`.
 - Model tests (CTest label `model`) need, for Qwen3.5-2B:
   `GUFO_NPU_QWEN35_2B_GGUF` (the BF16 GGUF for the HF-oracle tests) and
-  `GUFO_NPU_QWEN35_2B_ORACLE` (output of `tools/reference/qwen35_oracle.py`).
+  `GUFO_NPU_QWEN35_2B_ORACLE` (output of `tools/reference/qwen35_oracle.py`),
+  plus `GUFO_NPU_QWEN35_2B_Q4_GGUF` (UD-Q4_K_XL) for the decoder and NPU
+  decode tests.
   Run them from a Release build; the CPU reference is slow in Debug.
 - Before committing C++: `python3 tools/ci/check-format.py` (`--fix` to apply).
 
@@ -50,10 +52,25 @@ Compiling NPU kernels needs no NPU; running them does. Run NPU work with
 - Designs live in `kernels/designs/<name>.py` and expose
   `compile_to(out_dir, dev)`. Add each to `GUFO_NPU_KERNEL_DESIGNS` in
   `kernels/CMakeLists.txt`.
-- Decode is bound by NPU DMA bandwidth (~54 GB/s) and by per-dispatch cost.
+- Decode is bound by NPU read bandwidth (~56 GB/s; `bench bandwidth`) and
+  by per-dispatch cost.
   Chain dependent dispatches in one `xrt::runlist` and fuse ops so a token
   needs few commands (`gufo-npu bench dispatch` measures this).
 - Successful optimizations become the default, without extra switches.
+- IRON reuses any kernel object already in a compile work dir, even when the
+  source changed; designs clear their work dir before compiling.
+- In a runtime sequence, waiting on a DMA task (`wait=True`, a task group's
+  `finish()`) takes the next completion token of that task's shim channel,
+  whichever task sent it. Await the tasks of one channel in the order they
+  were queued, or a wait returns early and a reused BD can overwrite a
+  transfer still in flight (see `kernels/designs/q4nx_gemv.py`;
+  `q4nx_gemv_chain_test` runs the chain 60,000 times to catch this).
+- A core starts in floor (truncating) rounding mode; kernels that narrow to
+  bf16 set round-to-nearest-even first (see `kernels/aie/q4nx_gemv.cc`).
+- One xclbin per kernel family, one instruction sequence per shape (shape
+  in runtime parameters), so every call runs in one hardware context and
+  can join a runlist. `kernels/designs/q4nx_gemv.py` checks that all its
+  shapes build the same array configuration.
 
 ## Development
 

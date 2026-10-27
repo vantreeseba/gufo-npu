@@ -23,6 +23,57 @@ HTTP range requests). "Inferred" marks conclusions not read directly.
   Strix Halo despite half the DRAM bandwidth, so the limit is NPU-side.
 - Our own copy test reaches ~80 GB/s read + write combined
   (`docs/models/qwen3.6-35b-a3b/BENCHMARKS.md`).
+- Measured (2026-10-27, `docs/models/qwen3.5-2b/BENCHMARKS.md`): reads alone
+  stop at ~56 GB/s. They scale ~14 GB/s per column to 4 columns, then
+  flatten; a second shim channel per column changes nothing. A 16 MiB buffer
+  (fits the 32 MB Infinity Cache/MALL) reads no faster than 256 MiB.
+- The MALL is filled only by GPU requests (Chips and Cheese,
+  https://chipsandcheese.com/p/evaluating-the-infinity-cache-in and
+  https://chipsandcheese.com/p/strix-halos-memory-subsystem-tackling); no XRT
+  BO flag routes NPU traffic through it. A GPU-warmed buffer read by the NPU
+  is untested, but the ceiling looks like the NPU's port into the fabric,
+  which cache hits would not widen.
+- Shim BD knobs in mlir-aie v1.4.4: `burst_length` (npu2: 64/128/256/512 B;
+  0 = largest, the default) and `axcache` (default 2, "upsizing in the
+  NoC"). Neither is expected to move the read ceiling; AxCACHE is untested.
+- DMA zero-compression exists on core and memtile DMAs, not the shim, and
+  4-bit weights have few zero bytes: no use for weights.
+
+## System RAM vs the GPU carve-out
+
+- The test box has 128 GB of LPDDR5X; the BIOS reserves 64 GiB as GPU
+  "VRAM" (`mem_info_vram_total`) and Linux sees ~61 GiB. Both halves are the
+  same DRAM behind the same memory controllers (~256 GB/s peak).
+- Everything gufo-npu loads for the NPU lives in system RAM: the GGUF is
+  mmapped by the host, and NPU buffers are amdxdna BOs (`xrt::ext::bo`,
+  shmem or pinned user pages), never amdgpu VRAM. XRT cannot allocate from
+  the GPU carve-out.
+- Which half a buffer sits in does not change its speed: same DRAM, and the
+  NPU's ~56 GB/s read limit is on its own side of the fabric. What matters
+  when the GPU and NPU run at once is total DRAM traffic: the NPU's 56 GB/s
+  plus whatever the GPU reads share ~256 GB/s. A GPU job near the DRAM limit
+  would slow NPU decode; untested.
+- Footprint: the carve-out leaves ~61 GiB for the OS, the GGUF page cache
+  and the NPU's pinned weights (~1.2 GB for Qwen3.5-2B, ~20 GB for the 35B).
+  Shrinking the carve-out in the BIOS frees system RAM if the GPU is not
+  needed.
+
+## On-chip memory
+
+- Core tiles: 64 KB data memory in 8 banks (allocator models 4); a core can
+  also address its west, north and south neighbours (256 KB reach), not
+  memtiles. An ObjectFifo between adjacent cores is shared memory, no DMA.
+- Memtiles: 512 KB each, 16 banks; their DMAs reach the east and west
+  neighbours' memory and locks.
+- Within one loaded design, runtime sequences only rewrite BDs, RTPs and
+  addresses; core and memtile memory should persist across calls of the same
+  hardware context (not documented; needs a canary test across runs and with
+  a second context active). Reloading a design (`load_pdi`) costs milliseconds
+  (4.9 ms measured in arXiv 2512.13282) and resets tiles.
+- Each core column's 4 cores use all 4 southbound stream channels between
+  the core rows and the memtile for their outputs; an extra core-to-shim
+  stream does not route (we send the GEMV's residual down the existing
+  output streams instead).
 
 ## Clocks and power
 
@@ -69,6 +120,8 @@ HTTP range requests). "Inferred" marks conclusions not read directly.
 `PrefillAttention` (head dim 256 GQA), `LMHead` (fused RMS norm),
 `DecodeLayer` (fusion template). IRON's Gemma q4nx uses 32×256 blocks with
 bf16 scale and minimum per 32 values (5 bits/weight), not FLM's Qwen layout.
+gufo-npu's q4nx keeps the 32×256 blocks with 8-bit sub-scales and minima and
+a bf16 d/dmin per row (4.625 bits/weight; `src/core/q4nx.hpp`).
 **No MoE/router/top-k and no Gated DeltaNet / SSM kernels exist** in IRON or
 mlir-aie: both are new work.
 

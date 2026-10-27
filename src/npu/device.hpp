@@ -52,8 +52,9 @@ struct DispatchBenchResult {
 DispatchBenchResult BenchDispatch(const std::filesystem::path& kernel_dir,
                                   int rounds, const std::vector<int>& depths);
 
-// DDR bandwidth seen by the NPU: copies a 64 MiB buffer through all eight
-// columns (read + write) and reports GB/s over both directions.
+// DDR bandwidth seen by the NPU, two ways: copying a 64 MiB buffer through
+// all eight columns (bytes read + written), and reading a 256 MiB buffer
+// alone (the ceiling for decode, which only reads weights).
 struct BandwidthResult {
   bool ok = false;
   std::string error;
@@ -61,6 +62,9 @@ struct BandwidthResult {
   double mean_us = 0;
   double mean_gb_s = 0;
   double best_gb_s = 0;
+  std::size_t read_bytes_per_run = 0;
+  double read_mean_gb_s = 0;
+  double read_best_gb_s = 0;
 };
 
 BandwidthResult BenchBandwidth(const std::filesystem::path& kernel_dir,

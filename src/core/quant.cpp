@@ -19,18 +19,6 @@ std::uint16_t LoadU16(const std::uint8_t* p) {
   return v;
 }
 
-// 6-bit scale and min for sub-block j of a Q4_K/Q5_K super-block.
-void ScaleMinK4(std::size_t j, const std::uint8_t* q, std::uint8_t* scale,
-                std::uint8_t* min) {
-  if (j < 4) {
-    *scale = q[j] & 63;
-    *min = q[j + 4] & 63;
-  } else {
-    *scale = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
-    *min = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
-  }
-}
-
 void DequantQ8_0(const std::uint8_t* src, float* dst, std::size_t blocks) {
   for (std::size_t b = 0; b < blocks; ++b, src += 2 + kQ8, dst += kQ8) {
     const float d = HalfToFloat(LoadU16(src));
@@ -166,11 +154,33 @@ float HalfToFloat(std::uint16_t h) {
   return out;
 }
 
+// 6-bit scale and min for sub-block j of a Q4_K/Q5_K super-block.
+void ScaleMinK4(std::size_t j, const std::uint8_t* q, std::uint8_t* scale,
+                std::uint8_t* min) {
+  if (j < 4) {
+    *scale = q[j] & 63;
+    *min = q[j + 4] & 63;
+  } else {
+    *scale = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+    *min = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+  }
+}
+
 float Bf16ToFloat(std::uint16_t h) {
   const std::uint32_t bits = static_cast<std::uint32_t>(h) << 16;
   float out;
   std::memcpy(&out, &bits, sizeof(out));
   return out;
+}
+
+std::uint16_t FloatToBf16(float f) {
+  std::uint32_t bits;
+  std::memcpy(&bits, &f, sizeof(bits));
+  if ((bits & 0x7FFFFFFFU) > 0x7F800000U) {
+    return static_cast<std::uint16_t>((bits >> 16) | 0x40);  // quiet NaN
+  }
+  bits += 0x7FFFU + ((bits >> 16) & 1U);
+  return static_cast<std::uint16_t>(bits >> 16);
 }
 
 std::size_t BlockElements(GgmlType type) {

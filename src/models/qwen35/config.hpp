@@ -40,8 +40,9 @@ struct Config {
 
   bool tied_embeddings = false;
 
+  // MTP layers (index >= layers) are full attention.
   bool IsFullAttention(int layer) const {
-    return (layer + 1) % full_attention_interval == 0;
+    return layer >= layers || (layer + 1) % full_attention_interval == 0;
   }
   int LinearKeyDim() const { return linear_key_heads * linear_head_dim; }
   int LinearValueDim() const { return linear_value_heads * linear_head_dim; }
