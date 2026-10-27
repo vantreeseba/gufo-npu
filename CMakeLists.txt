@@ -61,6 +61,8 @@ add_library(gufo_npu_qwen35 STATIC
   src/models/qwen35/decoder.cpp
   src/models/qwen35/draft_vocab.cpp
   src/models/qwen35/generate.cpp
+  src/models/qwen35/gguf_projections.cpp
+  src/models/qwen35/moe.cpp
   src/models/qwen35/mtp.cpp
   src/models/qwen35/reference.cpp
 )
@@ -68,6 +70,7 @@ target_link_libraries(gufo_npu_qwen35 PUBLIC gufo_npu_core)
 # The decode steps' CPU math vectorizes with AVX2 + FMA (Zen 5 has more; the
 # hosted CI runners have at least this).
 set_source_files_properties(src/models/qwen35/decoder.cpp
+  src/models/qwen35/gguf_projections.cpp
   src/models/qwen35/npu_decoder.cpp PROPERTIES
   COMPILE_OPTIONS "-march=x86-64-v3;-O3")
 

@@ -5,14 +5,16 @@
 #include <thread>
 #include <vector>
 
+#include "core/cpus.hpp"
+
 namespace gufo_npu {
 
 // Runs fn(begin, end) over [0, n) split into contiguous chunks, one per
-// hardware thread. Blocks until all chunks finish.
+// usable CPU. Blocks until all chunks finish.
 template<typename Fn>
 void ParallelFor(std::size_t n, Fn&& fn) {
-  const std::size_t threads = std::max<std::size_t>(
-      1, std::min<std::size_t>(std::thread::hardware_concurrency(), n));
+  const std::size_t threads =
+      std::max<std::size_t>(1, std::min<std::size_t>(UsableCpus(), n));
   if (threads == 1) {
     fn(std::size_t{0}, n);
     return;

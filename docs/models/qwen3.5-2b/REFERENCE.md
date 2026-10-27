@@ -3,7 +3,9 @@
 The math `src/models/qwen35/reference.cpp` implements, with GGUF tensor
 layouts. Cross-checked against gufo's CPU reference, llama.cpp
 (`conversion/qwen.py`, `src/models/qwen35.cpp`, `delta-net-base.cpp`) and HF
-transformers `modeling_qwen3_5.py` (5.21.0).
+transformers `modeling_qwen3_5.py` (5.21.0). The MoE FFN and untied LM head
+of arch `qwen35moe` are in
+[../qwen3.6-35b-a3b/README.md](../qwen3.6-35b-a3b/README.md).
 
 GGUF matrices `[ne0, ne1]` are ne1 rows of ne0 contiguous elements:
 `y[r] = Σ_c W[r][c] x[c]`. `RMS(x) = x / sqrt(mean(x²) + eps)`, eps = 1e-6.
@@ -38,7 +40,8 @@ nextn.enorm/hnorm/shared_head_norm). So every norm is `RMS(x) * w_gguf`;
    for x > 20.
 4. `k̂ = k / sqrt(Σk² + 1e-6)`, `q̂ = q / sqrt(Σq² + 1e-6) / sqrt(128)`.
 5. Value head h uses key head `h % Hk` (GGUF tiled order; the converter
-   reorders V-side tensors, so stay in GGUF order end to end).
+   reorders V-side tensors, so stay in GGUF order end to end). The 2B has
+   Hv = Hk; Qwen3.6-35B-A3B (Hv = 2 Hk) checks this order against llama.cpp.
 6. State `S[i][j]` (key i, value j), per value head:
    `S ← exp(g) S`; `u = Sᵀ k̂`; `S += k̂ ⊗ β (v − u)`; `o = Sᵀ q̂`.
 7. `y_h = RMS(o_h) * ssm_norm * silu(z_h)`; `out = ssm_out · y`.

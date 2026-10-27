@@ -1,0 +1,10 @@
+# llama.cpp oracle for the Qwen3.6-35B-A3B CPU reference
+# (tools/reference/qwen36_llama_oracle.py). llama-cpp-python 0.3.36 vendors
+# llama.cpp 0c1e57098bba43ac29e6e3b677cdceebdd22334f (2026-10-01). Build it
+# from source, CPU only, with fixed instruction sets (see docs/TOOLCHAIN.md):
+#   CMAKE_ARGS="-DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON
+#     -DGGML_BMI2=ON -DGGML_AVX512=OFF -DGGML_BLAS=OFF -DLLAMA_CURL=OFF"
+#   pip install --no-binary llama-cpp-python -r requirements-llama.txt
+llama-cpp-python==0.3.36
+numpy==2.3.4
+jinja2==3.1.6

@@ -1,5 +1,6 @@
 #include "models/qwen35/q4nx_projections.hpp"
 
+#include <stdexcept>
 #include <string>
 
 #include "core/quant.hpp"
@@ -30,7 +31,7 @@ q4nx::Segment SegmentOf(const gguf::TensorInfo& t) {
 }  // namespace
 
 Q4nxProjections::Q4nxProjections(const gguf::File& file)
-    : config_(ReadConfig(file)) {
+    : config_(RequireDenseTied(ReadConfig(file), "qwen35 Q4nxProjections")) {
   const Config& c = config_;
   const auto hidden = static_cast<std::size_t>(c.hidden);
   for (int il = 0; il < c.layers; ++il) {
@@ -113,6 +114,12 @@ void Q4nxProjections::Apply(Stage stage, int layer, const float* x, int tokens,
         break;
       case Stage::kLmHead:
         break;
+      case Stage::kRouter:
+      case Stage::kExpertIn:
+      case Stage::kExpertDown:
+      case Stage::kMtpIn:
+        throw std::logic_error(
+            "q4nx projections: dense decoder layers and LM head only");
     }
   }
 }

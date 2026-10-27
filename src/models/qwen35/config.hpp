@@ -32,13 +32,20 @@ struct Config {
   int linear_value_heads = 0;
   int linear_head_dim = 0;  // key and value head dim
 
-  // MoE (qwen35moe only).
+  // MoE (qwen35moe only): `experts_used` of `experts` routed SwiGLU experts
+  // (softmax over all router logits, top-k, weights renormalized to sum 1)
+  // plus one shared expert scaled by sigmoid(ffn_gate_inp_shexp . x).
   int experts = 0;
   int experts_used = 0;
   int expert_ffn = 0;
   int shared_expert_ffn = 0;
 
+  // Without output.weight the LM head is token_embd.
   bool tied_embeddings = false;
+
+  bool IsMoe() const { return experts > 0; }
+  // Width of the dense FFN, or of the MoE shared expert.
+  int FfnWidth() const { return IsMoe() ? shared_expert_ffn : ffn; }
 
   // MTP layers (index >= layers) are full attention.
   bool IsFullAttention(int layer) const {
@@ -52,5 +59,14 @@ struct Config {
 
 // Throws std::runtime_error when required keys are missing or inconsistent.
 Config ReadConfig(const gguf::File& file);
+
+// True when the GGUF declares MTP layers and holds the first one's nextn
+// tensors (only that one is used). Without them the main model still loads.
+bool HasMtpLayer(const gguf::File& file, const Config& c);
+
+// Returns `c` if it is a dense model with tied embeddings (token_embd is the
+// LM head; ffn_gate/up/down per layer), else throws std::runtime_error naming
+// `who`. For the paths that only support Qwen3.5-2B-like models.
+Config RequireDenseTied(Config c, const char* who);
 
 }  // namespace gufo_npu::qwen35
