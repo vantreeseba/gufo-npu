@@ -29,10 +29,10 @@
 #include "models/qwen35/npu_decoder.hpp"
 #include "models/qwen35/npu_prefill.hpp"
 #include "models/qwen35/reference.hpp"
-#include "models/qwen36_35b_a3b/npu_prefill.hpp"
 #include "models/qwen35_4b/npu/gemv.hpp"
 #include "models/qwen35_4b/npu_decoder.hpp"
 #include "models/qwen35_4b/npu_prefill.hpp"
+#include "models/qwen36_35b_a3b/npu_prefill.hpp"
 #include "npu/device.hpp"
 #include "npu/gemv.hpp"
 
