@@ -25,6 +25,9 @@
 #include "models/qwen35/npu_decoder.hpp"
 #include "models/qwen35/npu_prefill.hpp"
 #include "models/qwen35/reference.hpp"
+#include "models/qwen35_4b/npu/gemv.hpp"
+#include "models/qwen35_4b/npu_decoder.hpp"
+#include "models/qwen35_4b/npu_prefill.hpp"
 #include "npu/device.hpp"
 #include "npu/gemv.hpp"
 
@@ -581,6 +584,35 @@ int Generate(const std::vector<std::string_view>& args) {
     }
   };
 
+  // Qwen3.5-4B runs on its own NPU program (src/models/qwen35_4b), picked by
+  // arch and hidden size until a model registry replaces this.
+  const auto config = qwen35::ReadConfig(*file);
+  if (device == "npu" && config.architecture == "qwen35" &&
+      static_cast<std::size_t>(config.hidden) ==
+          gufo_npu::qwen35_4b::npu::kHidden) {
+    gufo_npu::qwen35_4b::NpuDecoder npu(*file, KernelDir(kernels));
+    gufo_npu::qwen35_4b::NpuPrefill prefill(*file, KernelDir(kernels));
+    qwen35::SpeculativeStats stats;
+    gufo_npu::qwen35_4b::SpeculativeGenerate(
+        npu, ids, max_tokens, stop, draft == "mtp", print, &stats,
+        gufo_npu::qwen35_4b::PrefillPrompt(prefill));
+    std::fprintf(stderr,
+                 "\n[%d prompt tokens in %.2f s; %d generated in %.2f s, "
+                 "%.2f tok/s; NPU (Qwen3.5-4B), %s]\n",
+                 stats.prompt_tokens, stats.prefill_seconds,
+                 stats.generated_tokens, stats.decode_seconds,
+                 stats.decode_seconds > 0
+                     ? stats.generated_tokens / stats.decode_seconds
+                     : 0.0,
+                 draft == "mtp" ? "MTP draft" : "no draft");
+    std::fprintf(stderr,
+                 "[%d decode steps, %d drafts accepted (%.0f%%); %ld NPU "
+                 "submissions, %.2f s waiting on them; %.2f s in CPU mixers]\n",
+                 stats.steps, stats.accepted,
+                 stats.steps ? 100.0 * stats.accepted / stats.steps : 0.0,
+                 npu.submissions(), npu.npu_seconds(), npu.cpu_seconds());
+    return 0;
+  }
   if (device == "npu") {
     qwen35::NpuDecoder npu(*file, KernelDir(kernels));
     qwen35::NpuPrefill prefill(*file, KernelDir(kernels));
