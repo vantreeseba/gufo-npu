@@ -11,20 +11,21 @@ toolchain so every bottleneck can be fixed. See [docs/PLAN.md](docs/PLAN.md).
 
 **Status: Phase 3 started.** The toolchain, CI and NPU runtime path work end
 to end, and an fp32 CPU reference of Qwen3.5-2B (GGUF) matches HF
-transformers. `gufo-npu generate --device npu` decodes at 52–61 tok/s on
-short prompts and ~47 tok/s at 2k context (FLM: 28.5): q4nx GEMVs stream
+transformers. `gufo-npu generate --device npu` decodes at 54–63 tok/s on
+short prompts (English, code), ~48 tok/s at 2k context and 33 tok/s at 9k
+without drafting (FLM: 28.5): q4nx GEMVs (4.625 bits per weight) stream
 weights at the NPU's 56 GB/s read ceiling and also run the norms, residual
 adds and SwiGLU, chained so a step needs 25 NPU submissions; the model's MTP
 head drafts a token (scoring a 32k draft vocabulary) that a 2-token pass
 verifies (same output as plain greedy). DeltaNet and attention run in fp32
-on the CPU, threaded and vectorized.
+on the CPU, threaded and vectorized, with an fp16 K/V cache.
 
 | Phase | Scope | State |
 |---|---|---|
 | 0 | Repo, CI, pinned toolchain, smoke kernel | done |
 | 1 | Hardware microbenchmarks (dispatch, DMA bandwidth, int4 GEMV) | dispatch, copy bandwidth, FLM baseline done |
 | 2 | CPU reference model (GGUF): forward pass, tokenizer, chat, greedy generate; matches HF | done (MTP and FLM pack: later) |
-| 3 | NPU decode | chained NPU decode with MTP speculation and a draft vocabulary, 52–61 tok/s, 73/73 top-1 vs CPU |
+| 3 | NPU decode | chained NPU decode with MTP speculation and a draft vocabulary, 54–63 tok/s, 72/73 top-1 vs CPU |
 | 4 | NPU prefill | |
 | 5 | OpenAI-compatible server | |
 

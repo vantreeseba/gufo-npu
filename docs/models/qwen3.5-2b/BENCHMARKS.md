@@ -332,6 +332,28 @@ instead of d * sc moves the weights slightly, so the greedy replies differ
 a little: the sky reply runs to 95 tokens instead of 87, with 61% of its
 drafts accepted instead of 65%, which eats most of that prompt's gain.
 
+### fp16 K/V cache and compact scales together
+
+The `3549ab2` build (fp32 K/V cache, 5-bit q4nx) against fp16 K/V plus
+compact scales, interleaved, warm, three runs each, 2026-10-27:
+
+| Prompt | Before | After |
+|---|---|---|
+| Sky, `--draft none` | 36.75, 37.01, 37.04 tok/s | **39.33, 39.29, 39.20** |
+| Sky, `--draft mtp` | 52.73, 53.26, 52.99 | **53.95, 53.66, 53.90** |
+| Fibonacci, `--draft mtp` | 61.04, 60.86, 61.10 | **63.35, 63.30, 63.23** |
+| Chinese sky, `--draft mtp` | 44.90, 44.94, 44.41 | **48.89, 48.83, 48.74** |
+| 2,120-token prompt, `--draft mtp` | 46.82, 47.05, 46.48 | **48.47, 48.34, 48.44** |
+| 9,050-token prompt, `--draft none` | 28.89, 28.78, 28.82 | **33.22, 33.14, 33.24** |
+| 9,050-token prompt, time to first token | 159.7–160.2 s | 140.6–140.8 s |
+
+The compact scales move the weights slightly, so replies differ from the
+old build (sky: 95 tokens instead of 87, 61% of drafts accepted instead of
+65%; Chinese: 70 instead of 42 tokens, 46% instead of 40%). Every run
+printed the same reply as the other runs of its build, except one of the
+three 9k runs of the new build: a DMA wait-order bug in the GEMV, since
+fixed (QUALITY.md, Determinism).
+
 ### NPU power mode
 
 `xrt-smi configure --pmode <mode>` (needs CAP_SYS_ADMIN; the box runs
