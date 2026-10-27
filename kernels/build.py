@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Compile gufo-npu NPU designs to an xclbin plus an instruction ELF.
 
-Each designs/<name>.py exposes ``compile_to(out_dir: Path, dev: str)`` and,
-when it emits more than one shape, ``ARTIFACTS`` (the names it writes).
+Each designs/<name>.py exposes ``compile_to(out_dir: Path, dev: str)``. It
+writes <name>.xclbin and <name>.insts.elf unless it lists other files in
+``OUTPUTS``.
 Compiling needs mlir-aie and llvm-aie (Peano) but no NPU.
 """
 
@@ -37,13 +38,11 @@ def main() -> int:
     for name in args.designs:
         design = load_design(name)
         design.compile_to(args.out, args.dev)
-        # A design may emit several shapes; ARTIFACTS lists their names.
-        for artifact_name in getattr(design, "ARTIFACTS", [name]):
-            for suffix in (".xclbin", ".insts.elf"):
-                artifact = args.out / f"{artifact_name}{suffix}"
-                if not artifact.is_file():
-                    print(f"FAIL: {name} did not produce {artifact}", file=sys.stderr)
-                    return 1
+        outputs = getattr(design, "OUTPUTS", [f"{name}.xclbin", f"{name}.insts.elf"])
+        for output in outputs:
+            if not (args.out / output).is_file():
+                print(f"FAIL: {name} did not produce {args.out / output}", file=sys.stderr)
+                return 1
         print(f"compiled {name} -> {args.out}")
     return 0
 

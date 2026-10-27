@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <random>
 #include <string>
@@ -20,6 +21,7 @@
 #include "core/tokenizer.hpp"
 #include "models/qwen35/chat.hpp"
 #include "models/qwen35/generate.hpp"
+#include "models/qwen35/q4nx_projections.hpp"
 #include "models/qwen35/reference.hpp"
 #include "npu/device.hpp"
 #include "npu/gemv.hpp"
@@ -39,11 +41,13 @@ constexpr char kUsage[] =
     "  bench dispatch [--rounds N] [--depths 1,8,32] [--kernels DIR]\n"
     "                           per-dispatch cost: sync, async and runlist\n"
     "  bench bandwidth [--iters N] [--kernels DIR]\n"
-    "                           DDR bandwidth through all NPU columns\n"
+    "                           NPU DDR bandwidth: copy, and read only\n"
     "  bench gemv --model GGUF [--iters N] [--kernels DIR]\n"
     "                           q4nx GEMV on real Qwen3.5-2B decode shapes\n"
     "  generate --model GGUF --prompt TEXT [--system TEXT] [--max-tokens N]\n"
-    "           [--think]       greedy chat completion on the CPU reference\n"
+    "           [--think] [--device cpu|npu] [--kernels DIR]\n"
+    "                           greedy chat completion; cpu is the reference,\n"
+    "                           npu runs the matrix products on the NPU\n"
     "  version                  print the version\n";
 
 void PrintChecks(const std::vector<Check>& checks) {
@@ -192,16 +196,19 @@ int BenchBandwidth(const std::vector<std::string_view>& args) {
       "mean %.1f GB/s, best %.1f GB/s\n",
       static_cast<double>(result.bytes_per_run) / (1 << 20), result.mean_us,
       result.mean_gb_s, result.best_gb_s);
+  std::printf("read only: %.0f MiB per run; mean %.1f GB/s, best %.1f GB/s\n",
+              static_cast<double>(result.read_bytes_per_run) / (1 << 20),
+              result.read_mean_gb_s, result.read_best_gb_s);
   return 0;
 }
 
 // Relative L2 error of the NPU output over the first `rows` values.
-double RelativeError(const std::vector<std::uint16_t>& y,
+double RelativeError(const std::vector<float>& y,
                      const std::vector<double>& ref, std::size_t rows) {
   double err2 = 0;
   double ref2 = 0;
   for (std::size_t r = 0; r < rows; ++r) {
-    const double e = gufo_npu::quant::Bf16ToFloat(y[r]) - ref[r];
+    const double e = y[r] - ref[r];
     err2 += e * e;
     ref2 += ref[r] * ref[r];
   }
@@ -231,79 +238,69 @@ int BenchGemv(const std::vector<std::string_view>& args) {
   }
   namespace q4nx = gufo_npu::q4nx;
   namespace quant = gufo_npu::quant;
-  const auto dir = KernelDir(kernels);
   const auto file = gufo_npu::gguf::File::Open(model);
+  gufo_npu::npu::GemvRuntime runtime(KernelDir(kernels));
 
   struct Case {
-    const char* tensor;
-    const char* norm;  // RMS norm weight folded into the kernel, if any
+    const char* label;
+    std::vector<const char*> tensors;  // stacked in order
   };
-  // One tensor per compiled decode shape.
+  // One stack per decode stage of Qwen3.5-2B (layer 0 DeltaNet, layer 3
+  // full attention).
   const Case cases[] = {
-      {"blk.0.ssm_out.weight", nullptr},
-      {"blk.0.ffn_gate.weight", nullptr},
-      {"blk.0.ffn_down.weight", nullptr},
-      {"token_embd.weight", "output_norm.weight"},
+      {"DeltaNet in (qkv+z)",
+       {"blk.0.attn_qkv.weight", "blk.0.attn_gate.weight"}},
+      {"attention in (q+k+v)",
+       {"blk.3.attn_q.weight", "blk.3.attn_k.weight", "blk.3.attn_v.weight"}},
+      {"mixer out (ssm_out)", {"blk.0.ssm_out.weight"}},
+      {"ffn in (gate+up)", {"blk.0.ffn_gate.weight", "blk.0.ffn_up.weight"}},
+      {"ffn down", {"blk.0.ffn_down.weight"}},
+      {"LM head", {"token_embd.weight"}},
   };
-  std::printf("%-22s %-5s %6s %7s %8s %9s %9s %7s %9s %9s\n", "tensor", "type",
-              "dim", "rows", "MB", "mean us", "best us", "GB/s", "err npu",
-              "err total");
+  std::printf("%-22s %6s %7s %8s %9s %9s %7s %9s %9s\n", "stage", "dim", "rows",
+              "MB", "mean us", "best us", "GB/s", "err npu", "err total");
   std::mt19937 rng(42);
   std::normal_distribution<float> normal(0.0f, 1.0f);
   for (const auto& c : cases) {
-    const auto& t = file->Tensor(c.tensor);
-    const std::size_t dim = t.RowElements();
-    const std::size_t rows = t.Rows();
-    const bool norm = c.norm != nullptr;
-    const auto packed = q4nx::Pack(t.type, t.data, rows, dim);
+    std::vector<q4nx::Segment> segments;
+    for (const char* name : c.tensors) {
+      const auto& t = file->Tensor(name);
+      segments.push_back({t.type, t.data, static_cast<std::size_t>(t.Rows())});
+    }
+    const std::size_t dim = file->Tensor(c.tensors[0]).RowElements();
+    const auto packed = q4nx::PackRows(segments, dim);
+    const std::size_t rows = packed.rows;
 
-    std::vector<std::uint16_t> x_bits((norm ? 2 : 1) * dim);
-    std::vector<float> operand(dim);
+    std::vector<std::uint16_t> x_bits(dim);
+    std::vector<float> x(dim);
     for (std::size_t i = 0; i < dim; ++i) {
       x_bits[i] = quant::FloatToBf16(normal(rng));
+      x[i] = quant::Bf16ToFloat(x_bits[i]);
     }
-    if (norm) {
-      std::vector<float> w(dim);
-      const auto& nt = file->Tensor(c.norm);
-      quant::Dequantize(nt.type, nt.data, w.data(), dim);
-      double sq = 0;
-      for (std::size_t i = 0; i < dim; ++i) {
-        const double v = quant::Bf16ToFloat(x_bits[i]);
-        sq += v * v;
-      }
-      const double inv = 1.0 / std::sqrt(sq / dim + 1e-6);
-      for (std::size_t i = 0; i < dim; ++i) {
-        x_bits[dim + i] = quant::FloatToBf16(w[i]);
-        operand[i] = quant::Bf16ToFloat(quant::FloatToBf16(
-            static_cast<float>(quant::Bf16ToFloat(x_bits[i]) * inv *
-                               quant::Bf16ToFloat(x_bits[dim + i]))));
-      }
-    } else {
-      for (std::size_t i = 0; i < dim; ++i) {
-        operand[i] = quant::Bf16ToFloat(x_bits[i]);
-      }
-    }
-
-    gufo_npu::npu::Q4nxGemv gemv(dir, packed, norm);
-    std::vector<std::uint16_t> y(packed.padded_rows);
+    gufo_npu::npu::Q4nxGemv gemv(runtime, packed);
+    std::vector<float> y(packed.padded_rows);
     gemv.Run(x_bits.data(), y.data());
     gemv.Time(20);  // warm up
     const auto timing = gemv.Time(iterations);
 
     const double err_npu = RelativeError(
-        y, q4nx::Reference(q4nx::Unpack(packed), packed, operand.data()), rows);
-    // Against the GGUF weights themselves: kernel error plus requantization.
+        y, q4nx::Reference(q4nx::Unpack(packed), packed, x.data()), rows);
+    // Against the GGUF weights: kernel error plus requantization.
     std::vector<float> original(rows * dim);
-    quant::Dequantize(t.type, t.data, original.data(), original.size());
+    std::size_t row = 0;
+    for (const auto& seg : segments) {
+      quant::Dequantize(seg.type, seg.data, &original[row * dim],
+                        seg.rows * dim);
+      row += seg.rows;
+    }
     q4nx::Matrix shape = packed;
     shape.padded_rows = rows;
-    const double err_total = RelativeError(
-        y, q4nx::Reference(original, shape, operand.data()), rows);
+    const double err_total =
+        RelativeError(y, q4nx::Reference(original, shape, x.data()), rows);
 
     const double mb = static_cast<double>(gemv.weight_bytes()) / 1e6;
-    std::printf("%-22s %-5s %6zu %7zu %8.1f %9.1f %9.1f %7.1f %9.2e %9.2e\n",
-                c.tensor, std::string(gufo_npu::gguf::TypeName(t.type)).c_str(),
-                dim, rows, mb, timing.mean_us, timing.best_us,
+    std::printf("%-22s %6zu %7zu %8.1f %9.1f %9.1f %7.1f %9.2e %9.2e\n",
+                c.label, dim, rows, mb, timing.mean_us, timing.best_us,
                 mb * 1e6 / timing.mean_us / 1e3, err_npu, err_total);
   }
   return 0;
@@ -315,6 +312,8 @@ int Generate(const std::vector<std::string_view>& args) {
   std::string system;
   int max_tokens = 128;
   bool thinking = false;
+  std::string device = "cpu";
+  std::optional<std::string> kernels;
   for (std::size_t i = 0; i < args.size(); ++i) {
     const bool has_value = i + 1 < args.size();
     if (args[i] == "--model" && has_value) {
@@ -327,12 +326,16 @@ int Generate(const std::vector<std::string_view>& args) {
       max_tokens = std::atoi(std::string(args[++i]).c_str());
     } else if (args[i] == "--think") {
       thinking = true;
+    } else if (args[i] == "--device" && has_value) {
+      device = std::string(args[++i]);
+    } else if (args[i] == "--kernels" && has_value) {
+      kernels = std::string(args[++i]);
     } else {
       std::cerr << kUsage;
       return 2;
     }
   }
-  if (model.empty() || prompt.empty()) {
+  if (model.empty() || prompt.empty() || (device != "cpu" && device != "npu")) {
     std::cerr << kUsage;
     return 2;
   }
@@ -340,6 +343,11 @@ int Generate(const std::vector<std::string_view>& args) {
   const auto file = gufo_npu::gguf::File::Open(model);
   const gufo_npu::Tokenizer tokenizer(*file);
   const qwen35::Reference reference(*file);
+  std::unique_ptr<qwen35::Q4nxProjections> npu;
+  if (device == "npu") {
+    npu = std::make_unique<qwen35::Q4nxProjections>(
+        *file, qwen35::Q4nxProjections::Backend::kNpu, KernelDir(kernels));
+  }
 
   std::vector<qwen35::Message> messages;
   if (!system.empty()) {
@@ -359,15 +367,20 @@ int Generate(const std::vector<std::string_view>& args) {
           std::fflush(stdout);
         }
       },
-      &stats);
+      &stats, npu.get());
   std::fprintf(stderr,
                "\n[%d prompt tokens in %.2f s; %d generated in %.2f s, "
-               "%.2f tok/s; CPU reference]\n",
+               "%.2f tok/s; %s]\n",
                stats.prompt_tokens, stats.prefill_seconds,
                stats.generated_tokens, stats.decode_seconds,
                stats.decode_seconds > 0
                    ? stats.generated_tokens / stats.decode_seconds
-                   : 0.0);
+                   : 0.0,
+               npu ? "NPU projections" : "CPU reference");
+  if (npu) {
+    std::fprintf(stderr, "[%ld GEMVs, %.2f s on the NPU including copies]\n",
+                 npu->gemv_calls(), npu->gemv_seconds());
+  }
   return 0;
 }
 

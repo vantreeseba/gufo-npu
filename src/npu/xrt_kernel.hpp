@@ -26,43 +26,51 @@ inline double MicrosSince(Clock::time_point start) {
       .count();
 }
 
-// One compiled design (<dir>/<name>.xclbin + .insts.elf) loaded into its own
-// hardware context.
-struct LoadedKernel {
+// Opcode for "run the instruction stream" in mlir-aie's NPU kernels.
+inline constexpr unsigned int kOpcodeRun = 3;
+
+// An xclbin (<dir>/<name>.xclbin) loaded into its own hardware context.
+// Instruction sequences built for it run in that context.
+struct HwContext {
   // Kernel names in mlir-aie xclbins start with this prefix.
   static constexpr char kKernelPrefix[] = "MLIR_AIE";
-  // Opcode for "run the instruction stream" in mlir-aie's NPU kernels.
-  static constexpr unsigned int kOpcodeRun = 3;
 
   xrt::device device{0U};
   xrt::xclbin xclbin;
   std::optional<xrt::hw_context> context;
-  std::optional<xrt::elf> elf;
-  std::optional<xrt::module> module;
-  xrt::kernel kernel;
+  std::string kernel_name;
 
-  LoadedKernel(const std::filesystem::path& dir, const std::string& design)
-      : xclbin((dir / (design + ".xclbin")).string()) {
-    std::string name;
+  HwContext(const std::filesystem::path& dir, const std::string& name)
+      : xclbin((dir / (name + ".xclbin")).string()) {
     for (const auto& k : xclbin.get_kernels()) {
       if (k.get_name().rfind(kKernelPrefix, 0) == 0) {
-        name = k.get_name();
+        kernel_name = k.get_name();
         break;
       }
     }
-    if (name.empty()) {
-      throw std::runtime_error("no MLIR_AIE kernel in " + design + ".xclbin");
+    if (kernel_name.empty()) {
+      throw std::runtime_error("no MLIR_AIE kernel in " + name + ".xclbin");
     }
     device.register_xclbin(xclbin);
     context.emplace(device, xclbin.get_uuid());
-    elf.emplace((dir / (design + ".insts.elf")).string());
-    module.emplace(*elf);
-    kernel = xrt::ext::kernel(*context, *module, name);
   }
 
   xrt::bo Buffer(std::size_t bytes) { return xrt::ext::bo{device, bytes}; }
+};
 
-  // A run with the design's runtime-sequence arguments in order.
+// One instruction sequence (<dir>/<name>.insts.elf) of a loaded xclbin.
+struct Sequence {
+  xrt::elf elf;
+  xrt::module module;
+  xrt::kernel kernel;
+
+  Sequence(HwContext& hw, const std::filesystem::path& dir,
+           const std::string& name)
+      : elf((dir / (name + ".insts.elf")).string()),
+        module(elf),
+        kernel(xrt::ext::kernel(*hw.context, module, hw.kernel_name)) {}
+
+  // A run with the sequence's arguments in order.
   xrt::run Run(std::initializer_list<const xrt::bo*> args) {
     xrt::run run(kernel);
     run.set_arg(0, kOpcodeRun);
@@ -73,6 +81,21 @@ struct LoadedKernel {
       run.set_arg(index++, *bo);
     }
     return run;
+  }
+};
+
+// A design whose xclbin and sequence share a name, in its own context.
+struct LoadedKernel {
+  HwContext hw;
+  Sequence sequence;
+
+  LoadedKernel(const std::filesystem::path& dir, const std::string& design)
+      : hw(dir, design), sequence(hw, dir, design) {}
+
+  xrt::bo Buffer(std::size_t bytes) { return hw.Buffer(bytes); }
+  xrt::runlist Runlist() { return xrt::runlist(*hw.context); }
+  xrt::run Run(std::initializer_list<const xrt::bo*> args) {
+    return sequence.Run(args);
   }
 };
 

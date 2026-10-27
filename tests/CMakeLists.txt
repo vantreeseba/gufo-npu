@@ -57,6 +57,13 @@ if(GUFO_NPU_ENABLE_XRT AND GUFO_NPU_BUILD_KERNELS)
                    --kernels "${CMAKE_BINARY_DIR}/kernels")
   set_tests_properties(npu_smoke PROPERTIES LABELS npu)
 
+  add_executable(qwen35_npu_decode_test models/qwen35/npu_decode_test.cpp)
+  target_link_libraries(qwen35_npu_decode_test PRIVATE gufo_npu_qwen35_npu)
+  add_test(NAME qwen35_npu_decode_test
+           COMMAND qwen35_npu_decode_test "${CMAKE_BINARY_DIR}/kernels")
+  set_tests_properties(qwen35_npu_decode_test PROPERTIES LABELS "npu;model"
+                       SKIP_RETURN_CODE 77)
+
   add_executable(q4nx_gemv_test npu/q4nx_gemv_test.cpp)
   target_link_libraries(q4nx_gemv_test PRIVATE gufo_npu_runtime)
   add_test(NAME q4nx_gemv_test

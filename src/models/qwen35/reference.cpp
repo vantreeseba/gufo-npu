@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <initializer_list>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include "core/parallel.hpp"
 #include "core/quant.hpp"
@@ -65,6 +67,44 @@ void MatMul(const TensorInfo& w, const float* x, int tokens, float* y) {
   });
 }
 
+// Splits `tokens` rows of concatenated outputs into one buffer per part.
+void Split(const std::vector<float>& fused, int tokens,
+           std::initializer_list<std::pair<std::vector<float>*, int>> parts) {
+  std::size_t stride = 0;
+  for (const auto& part : parts) {
+    stride += static_cast<std::size_t>(part.second);
+  }
+  std::size_t offset = 0;
+  for (const auto& [out, width] : parts) {
+    for (int t = 0; t < tokens; ++t) {
+      std::copy_n(&fused[static_cast<std::size_t>(t) * stride + offset], width,
+                  out->data() + static_cast<std::size_t>(t) * width);
+    }
+    offset += static_cast<std::size_t>(width);
+  }
+}
+
+// Writes `tokens` rows of W x for each of `weights` side by side, in order.
+void MatMulFused(std::initializer_list<const TensorInfo*> weights,
+                 const float* x, int tokens, float* y) {
+  std::size_t stride = 0;
+  for (const auto* w : weights) {
+    stride += w->Rows();
+  }
+  std::size_t offset = 0;
+  std::vector<float> part;
+  for (const auto* w : weights) {
+    const std::size_t rows = w->Rows();
+    part.resize(static_cast<std::size_t>(tokens) * rows);
+    MatMul(*w, x, tokens, part.data());
+    for (int t = 0; t < tokens; ++t) {
+      std::copy_n(&part[static_cast<std::size_t>(t) * rows], rows,
+                  y + static_cast<std::size_t>(t) * stride + offset);
+    }
+    offset += rows;
+  }
+}
+
 void CheckShape(const TensorInfo& t, std::uint64_t cols, std::uint64_t rows) {
   if (t.RowElements() != cols || t.Rows() != rows) {
     throw std::runtime_error("qwen35: tensor " + t.name + " has shape [" +
@@ -108,8 +148,41 @@ struct Reference::Weights {
   std::vector<float> rope_inv_freq;  // rope_dim / 2 entries
 };
 
+// The reference's own projections: the GGUF weights, dequantized per row.
+class Reference::GgufProjections : public Projections {
+public:
+  explicit GgufProjections(const Weights& w) : w_(w) {}
+
+  void Apply(Stage stage, int layer, const float* x, int tokens,
+             float* y) const override {
+    const auto& l = w_.layers[static_cast<std::size_t>(layer)];
+    switch (stage) {
+      case Stage::kLinearIn:
+        return MatMulFused({l.qkv, l.gate, l.alpha, l.beta}, x, tokens, y);
+      case Stage::kAttentionIn:
+        return MatMulFused({l.q, l.k, l.v}, x, tokens, y);
+      case Stage::kMixerOut:
+        return MatMul(l.o != nullptr ? *l.o : *l.ssm_out, x, tokens, y);
+      case Stage::kFfnIn:
+        return MatMulFused({l.ffn_gate, l.ffn_up}, x, tokens, y);
+      case Stage::kFfnDown:
+        return MatMul(*l.ffn_down, x, tokens, y);
+      case Stage::kLmHead:
+        return MatMul(*w_.embed, x, tokens, y);
+    }
+  }
+
+private:
+  const Weights& w_;
+};
+
 Reference::Reference(const gguf::File& file)
     : config_(ReadConfig(file)), weights_(std::make_unique<Weights>()) {
+  LoadWeights(file);
+  gguf_projections_ = std::make_unique<GgufProjections>(*weights_);
+}
+
+void Reference::LoadWeights(const gguf::File& file) {
   const Config& c = config_;
   if (c.experts != 0) {
     throw std::runtime_error("qwen35 reference: MoE models are not supported");
@@ -201,9 +274,12 @@ State Reference::NewState() const {
 }
 
 ForwardOutput Reference::Forward(const std::vector<int>& tokens, State& state,
-                                 bool want_logits, bool want_hidden) const {
+                                 bool want_logits, bool want_hidden,
+                                 const Projections* projections) const {
   const Config& c = config_;
   const auto& w = *weights_;
+  const Projections& proj =
+      projections != nullptr ? *projections : *gguf_projections_;
   const int n = static_cast<int>(tokens.size());
   const int d = c.hidden;
   const auto nd = static_cast<std::size_t>(n) * d;
@@ -241,9 +317,12 @@ ForwardOutput Reference::Forward(const std::vector<int>& tokens, State& state,
       std::vector<float> qg(static_cast<std::size_t>(n) * 2 * c.heads * hd);
       std::vector<float> k(static_cast<std::size_t>(n) * kv);
       std::vector<float> v(static_cast<std::size_t>(n) * kv);
-      MatMul(*layer.q, normed.data(), n, qg.data());
-      MatMul(*layer.k, normed.data(), n, k.data());
-      MatMul(*layer.v, normed.data(), n, v.data());
+      {
+        std::vector<float> fused(static_cast<std::size_t>(n) *
+                                 StageOutputs(c, Stage::kAttentionIn, il));
+        proj.Apply(Stage::kAttentionIn, il, normed.data(), n, fused.data());
+        Split(fused, n, {{&qg, 2 * c.heads * hd}, {&k, kv}, {&v, kv}});
+      }
 
       auto rope = [&](float* x, int pos) {
         const int half = c.rope_dim / 2;
@@ -309,8 +388,8 @@ ForwardOutput Reference::Forward(const std::vector<int>& tokens, State& state,
             out[e] = static_cast<float>(acc / total) * Sigmoid(gate[e]);
           }
         }
-        MatMul(*layer.o, ctx.data(), 1,
-               &mixed[static_cast<std::size_t>(t) * d]);
+        proj.Apply(Stage::kMixerOut, il, ctx.data(), 1,
+                   &mixed[static_cast<std::size_t>(t) * d]);
       }
     } else {
       const int hk = c.linear_key_heads;
@@ -324,10 +403,13 @@ ForwardOutput Reference::Forward(const std::vector<int>& tokens, State& state,
       std::vector<float> z(static_cast<std::size_t>(n) * value_dim);
       std::vector<float> alpha(static_cast<std::size_t>(n) * hv);
       std::vector<float> beta(static_cast<std::size_t>(n) * hv);
-      MatMul(*layer.qkv, normed.data(), n, qkv.data());
-      MatMul(*layer.gate, normed.data(), n, z.data());
-      MatMul(*layer.alpha, normed.data(), n, alpha.data());
-      MatMul(*layer.beta, normed.data(), n, beta.data());
+      {
+        std::vector<float> fused(static_cast<std::size_t>(n) *
+                                 StageOutputs(c, Stage::kLinearIn, il));
+        proj.Apply(Stage::kLinearIn, il, normed.data(), n, fused.data());
+        Split(fused, n,
+              {{&qkv, channels}, {&z, value_dim}, {&alpha, hv}, {&beta, hv}});
+      }
 
       auto& st = state.linear[il];
       std::vector<float> u(channels);
@@ -421,8 +503,8 @@ ForwardOutput Reference::Forward(const std::vector<int>& tokens, State& state,
             yh[j] *= Silu(zh[j]);
           }
         }
-        MatMul(*layer.ssm_out, y.data(), 1,
-               &mixed[static_cast<std::size_t>(t) * d]);
+        proj.Apply(Stage::kMixerOut, il, y.data(), 1,
+                   &mixed[static_cast<std::size_t>(t) * d]);
       }
     }
 
@@ -439,13 +521,16 @@ ForwardOutput Reference::Forward(const std::vector<int>& tokens, State& state,
     const auto nf = static_cast<std::size_t>(n) * c.ffn;
     std::vector<float> gate(nf);
     std::vector<float> up(nf);
-    MatMul(*layer.ffn_gate, normed.data(), n, gate.data());
-    MatMul(*layer.ffn_up, normed.data(), n, up.data());
+    {
+      std::vector<float> fused(2 * nf);
+      proj.Apply(Stage::kFfnIn, il, normed.data(), n, fused.data());
+      Split(fused, n, {{&gate, c.ffn}, {&up, c.ffn}});
+    }
     for (std::size_t i = 0; i < nf; ++i) {
       gate[i] = Silu(gate[i]) * up[i];
     }
     std::vector<float> down(nd);
-    MatMul(*layer.ffn_down, gate.data(), n, down.data());
+    proj.Apply(Stage::kFfnDown, il, gate.data(), n, down.data());
     for (std::size_t i = 0; i < nd; ++i) {
       h[i] += down[i];
     }
@@ -461,9 +546,40 @@ ForwardOutput Reference::Forward(const std::vector<int>& tokens, State& state,
               c.rms_eps, &normed[static_cast<std::size_t>(t) * d]);
     }
     result.logits.resize(static_cast<std::size_t>(n) * c.vocab);
-    MatMul(*w.embed, normed.data(), n, result.logits.data());
+    proj.Apply(Stage::kLmHead, -1, normed.data(), n, result.logits.data());
   }
   return result;
+}
+
+std::size_t StageInputs(const Config& c, Stage stage, int layer) {
+  switch (stage) {
+    case Stage::kMixerOut:
+      return static_cast<std::size_t>(
+          c.IsFullAttention(layer) ? c.heads * c.head_dim : c.LinearValueDim());
+    case Stage::kFfnDown:
+      return static_cast<std::size_t>(c.ffn);
+    default:
+      return static_cast<std::size_t>(c.hidden);
+  }
+}
+
+std::size_t StageOutputs(const Config& c, Stage stage, int /*layer*/) {
+  switch (stage) {
+    case Stage::kLinearIn:
+      return static_cast<std::size_t>(c.ConvChannels() + c.LinearValueDim() +
+                                      2 * c.linear_value_heads);
+    case Stage::kAttentionIn:
+      return static_cast<std::size_t>(2 * c.heads * c.head_dim +
+                                      2 * c.kv_heads * c.head_dim);
+    case Stage::kMixerOut:
+    case Stage::kFfnDown:
+      return static_cast<std::size_t>(c.hidden);
+    case Stage::kFfnIn:
+      return static_cast<std::size_t>(2 * c.ffn);
+    case Stage::kLmHead:
+      return static_cast<std::size_t>(c.vocab);
+  }
+  return 0;
 }
 
 }  // namespace gufo_npu::qwen35

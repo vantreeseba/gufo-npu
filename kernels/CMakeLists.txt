@@ -7,26 +7,29 @@ set(GUFO_NPU_KERNEL_DEVICE "npu2" CACHE STRING "mlir-aie device family")
 set(GUFO_NPU_KERNEL_OUT "${CMAKE_BINARY_DIR}/kernels")
 
 # One entry per design in designs/<name>.py.
-set(GUFO_NPU_KERNEL_DESIGNS smoke_add_one bw_memcpy q4nx_gemv)
-# Designs that emit several shapes list them (must match their ARTIFACTS).
-set(q4nx_gemv_ARTIFACTS
-  q4nx_gemv_k2048_n2048
-  q4nx_gemv_k2048_n6144
-  q4nx_gemv_k6144_n2048
-  q4nx_gemv_k2048_n248832_norm)
+set(GUFO_NPU_KERNEL_DESIGNS smoke_add_one bw_memcpy bw_read q4nx_gemv)
+# Designs that write other files than <name>.xclbin + <name>.insts.elf list
+# them here (must match OUTPUTS in the design); <name>_SOURCES are extra
+# inputs.
+set(q4nx_gemv_OUTPUTS
+  q4nx_gemv.xclbin
+  q4nx_gemv_k2048_n2048.insts.elf
+  q4nx_gemv_k2048_n5120.insts.elf
+  q4nx_gemv_k2048_n8192.insts.elf
+  q4nx_gemv_k2048_n12288.insts.elf
+  q4nx_gemv_k6144_n2048.insts.elf
+  q4nx_gemv_k2048_n248832.insts.elf)
 set(q4nx_gemv_SOURCES aie/q4nx_gemv.cc)
 
 set(kernel_outputs)
 foreach(design IN LISTS GUFO_NPU_KERNEL_DESIGNS)
-  set(artifacts ${design})
-  if(DEFINED ${design}_ARTIFACTS)
-    set(artifacts ${${design}_ARTIFACTS})
+  set(files ${design}.xclbin ${design}.insts.elf)
+  if(DEFINED ${design}_OUTPUTS)
+    set(files ${${design}_OUTPUTS})
   endif()
   set(outputs)
-  foreach(artifact IN LISTS artifacts)
-    list(APPEND outputs
-      "${GUFO_NPU_KERNEL_OUT}/${artifact}.xclbin"
-      "${GUFO_NPU_KERNEL_OUT}/${artifact}.insts.elf")
+  foreach(file IN LISTS files)
+    list(APPEND outputs "${GUFO_NPU_KERNEL_OUT}/${file}")
   endforeach()
   add_custom_command(
     OUTPUT ${outputs}

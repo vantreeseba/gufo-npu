@@ -112,9 +112,12 @@ void PackGroup(const float* w, std::uint8_t* block, std::size_t m,
   }
 }
 
-// Requantizes the rows of one tile from fp32 rows produced by `row_fn`.
+// Packs every row of `out`. row_fn(r, buffer) returns row r's Q4_K data when
+// it can be copied code for code, or fills `buffer` with its fp32 weights and
+// returns nullptr. Tiles run in parallel; the rows of a tile share code bytes,
+// so one thread packs a whole tile.
 template<typename RowFn>
-void PackTilesFloat(Matrix& out, RowFn&& row_fn) {
+void PackTiles(Matrix& out, RowFn&& row_fn) {
   const std::size_t tiles = (out.rows + kMTile - 1) / kMTile;
   ParallelFor(tiles, [&](std::size_t begin, std::size_t end) {
     std::vector<float> row(out.dim);
@@ -124,9 +127,13 @@ void PackTilesFloat(Matrix& out, RowFn&& row_fn) {
         if (r >= out.rows) {
           break;
         }
-        row_fn(r, row.data());
+        const std::uint8_t* q4k = row_fn(r, row.data());
         for (std::size_t kb = 0; kb < out.dim / kKTile; ++kb) {
           std::uint8_t* block = Block(out, tile, kb);
+          if (q4k != nullptr) {
+            PackQ4KSuper(q4k + kb * kQ4KBytes, block, m);
+            continue;
+          }
           for (std::size_t g = 0; g < kGroups; ++g) {
             PackGroup(row.data() + kb * kKTile + g * kGroup, block, m, g);
           }
@@ -142,39 +149,46 @@ std::size_t PaddedRows(std::size_t rows) {
   return (rows + kOutPerRound - 1) / kOutPerRound * kOutPerRound;
 }
 
-Matrix Pack(gguf::GgmlType type, const std::uint8_t* data, std::size_t rows,
-            std::size_t dim) {
-  Matrix out = Allocate(rows, dim);
-  const std::size_t row_bytes = quant::RowBytes(type, dim);
-  if (type == gguf::GgmlType::kQ4_K) {
-    out.exact = true;
-    const std::size_t tiles = (rows + kMTile - 1) / kMTile;
-    ParallelFor(tiles, [&](std::size_t begin, std::size_t end) {
-      for (std::size_t tile = begin; tile < end; ++tile) {
-        for (std::size_t m = 0; m < kMTile; ++m) {
-          const std::size_t r = tile * kMTile + m;
-          if (r >= rows) {
-            break;
-          }
-          const std::uint8_t* src = data + r * row_bytes;
-          for (std::size_t kb = 0; kb < dim / kKTile; ++kb) {
-            PackQ4KSuper(src + kb * kQ4KBytes, Block(out, tile, kb), m);
-          }
-        }
-      }
-    });
-    return out;
+Matrix PackRows(const std::vector<Segment>& segments, std::size_t dim) {
+  std::size_t rows = 0;
+  bool exact = true;
+  for (const auto& seg : segments) {
+    rows += seg.rows;
+    exact = exact && seg.type == gguf::GgmlType::kQ4_K;
   }
-  PackTilesFloat(out, [&](std::size_t r, float* row) {
-    quant::Dequantize(type, data + r * row_bytes, row, dim);
+  Matrix out = Allocate(rows, dim);
+  out.exact = exact;
+  // First row of each segment.
+  std::vector<std::size_t> starts;
+  std::size_t start = 0;
+  for (const auto& seg : segments) {
+    starts.push_back(start);
+    start += seg.rows;
+  }
+  PackTiles(out, [&](std::size_t r, float* row) -> const std::uint8_t* {
+    const auto it = std::upper_bound(starts.begin(), starts.end(), r) - 1;
+    const auto& seg = segments[static_cast<std::size_t>(it - starts.begin())];
+    const std::uint8_t* src =
+        seg.data + (r - *it) * quant::RowBytes(seg.type, dim);
+    if (seg.type == gguf::GgmlType::kQ4_K) {
+      return src;
+    }
+    quant::Dequantize(seg.type, src, row, dim);
+    return nullptr;
   });
   return out;
 }
 
+Matrix Pack(gguf::GgmlType type, const std::uint8_t* data, std::size_t rows,
+            std::size_t dim) {
+  return PackRows({{type, data, rows}}, dim);
+}
+
 Matrix PackFloat(const float* weights, std::size_t rows, std::size_t dim) {
   Matrix out = Allocate(rows, dim);
-  PackTilesFloat(out, [&](std::size_t r, float* row) {
+  PackTiles(out, [&](std::size_t r, float* row) -> const std::uint8_t* {
     std::memcpy(row, weights + r * dim, dim * sizeof(float));
+    return nullptr;
   });
   return out;
 }
@@ -205,6 +219,57 @@ std::vector<float> Unpack(const Matrix& matrix) {
     }
   });
   return w;
+}
+
+void Gemv(const Matrix& matrix, const float* x, float* y) {
+  const std::size_t tiles = (matrix.rows + kMTile - 1) / kMTile;
+  const std::size_t k_blocks = matrix.dim / kKTile;
+  // Per-32 sums of x fold each group's minimum into one multiply.
+  std::vector<double> sums(matrix.dim / kGroup);
+  for (std::size_t g = 0; g < sums.size(); ++g) {
+    for (std::size_t l = 0; l < kGroup; ++l) {
+      sums[g] += x[g * kGroup + l];
+    }
+  }
+  ParallelFor(tiles, [&](std::size_t begin, std::size_t end) {
+    for (std::size_t tile = begin; tile < end; ++tile) {
+      double acc[kMTile] = {};
+      for (std::size_t kb = 0; kb < k_blocks; ++kb) {
+        const std::uint8_t* block = Block(matrix, tile, kb);
+        const std::uint8_t* codes = block + 2 * kScaleBytes;
+        const float* xk = x + kb * kKTile;
+        for (std::size_t g = 0; g < kGroups; ++g) {
+          // Codes of group g: [m / 16][g][l][m % 16], two per byte.
+          for (std::size_t half = 0; half < kMTile / 16; ++half) {
+            double dot[16] = {};
+            const std::uint8_t* q = codes + ((half * kGroups + g) * 32) * 8;
+            for (std::size_t l = 0; l < 32; ++l) {
+              const double xv = xk[g * 32 + l];
+              for (std::size_t i = 0; i < 8; ++i) {
+                const std::uint8_t byte = q[l * 8 + i];
+                dot[2 * i] += (byte & 0xF) * xv;
+                dot[2 * i + 1] += (byte >> 4) * xv;
+              }
+            }
+            for (std::size_t i = 0; i < 16; ++i) {
+              const std::size_t m = half * 16 + i;
+              const float scale =
+                  quant::Bf16ToFloat(LoadU16(block + (g * kMTile + m) * 2));
+              const float min = quant::Bf16ToFloat(
+                  LoadU16(block + kScaleBytes + (g * kMTile + m) * 2));
+              acc[m] += scale * dot[i] + min * sums[kb * kGroups + g];
+            }
+          }
+        }
+      }
+      for (std::size_t m = 0; m < kMTile; ++m) {
+        const std::size_t r = tile * kMTile + m;
+        if (r < matrix.rows) {
+          y[r] = static_cast<float>(acc[m]);
+        }
+      }
+    }
+  });
 }
 
 std::vector<double> Reference(const std::vector<float>& unpacked,

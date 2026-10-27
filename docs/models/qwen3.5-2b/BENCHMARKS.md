@@ -33,34 +33,63 @@ table is the mean of both (6 requests per row).
 | Decode, 1k context | 28.0 tok/s | ≥ 38 tok/s (ceiling ~45–50) |
 | TTFT, short prompt | 0.60 s | < 0.3 s |
 
-## NPU q4nx GEMV (Phase 3, step 1)
+## NPU DDR bandwidth
 
-`gufo-npu bench gemv --model Qwen3.5-2B-UD-Q4_K_XL.gguf`: one real tensor per
-decode shape, packed to q4nx, resident on the device; random bf16 token.
-20 warm-up dispatches, then the mean over 200 (start + wait, no host copies).
-Three runs agree within 1%. Measured 2026-10-27.
+`gufo-npu bench bandwidth`, 2026-10-27, two runs:
 
-| Tensor | GGUF type | dim → rows | MB (q4nx) | Mean µs | GB/s | Err NPU | Err total |
+| Probe | Mean | Best |
+|---|---|---|
+| Copy 64 MiB through all columns (read + write counted) | 79.0 GB/s | 79.9 GB/s |
+| Read 256 MiB only, 2 shim channels per column | 55.9 GB/s | 56.4 GB/s |
+| Read only, 1 channel per column (one-off probe) | 55.5 GB/s | 55.9 GB/s |
+
+The copy's 79 GB/s is ~40 GB/s each way at once. Reads alone stop at ~56 GB/s
+however many channels issue them, so **56 GB/s is the decode ceiling**:
+decode only reads weights.
+
+## NPU q4nx GEMV
+
+`gufo-npu bench gemv --model Qwen3.5-2B-UD-Q4_K_XL.gguf`: one stacked q4nx
+matrix per decode stage, resident on the device; random bf16 token. 20
+warm-up dispatches, then the mean over 200 (start + wait, no host copies).
+Runs agree within 2%. All shapes share one xclbin and hardware context.
+Measured 2026-10-27.
+
+| Stage | GGUF types | dim → rows | MB | Mean µs | GB/s | Err NPU | Err total |
 |---|---|---|---|---|---|---|---|
-| blk.0.ssm_out | Q8_0 | 2048 → 2048 | 2.6 | 108 | 24.4 | 0.56% | 8.2% |
-| blk.0.ffn_gate | Q4_K | 2048 → 6144 | 7.9 | 202 | 38.8 | 0.48% | 0.70% |
-| blk.0.ffn_down | Q6_K | 6144 → 2048 | 7.9 | 202 | 38.8 | 0.41% | 7.6% |
-| token_embd (LM head, RMS norm fused) | Q6_K | 2048 → 248320 | 318.5 | 5,690 | 56.0 | 0.51% | 9.2% |
+| DeltaNet in (qkv + z) | Q6_K, Q5_K | 2048 → 8192 | 10.5 | 253 | 41.4 | 4.1e-6 | 7.1% |
+| Attention in (q + k + v) | Q5_K, Q5_K, Q6_K | 2048 → 5120 | 6.6 | 187 | 35.1 | 6.2e-6 | 8.1% |
+| Mixer out (ssm_out) | Q8_0 | 2048 → 2048 | 2.6 | 117 | 22.3 | 5.9e-6 | 8.4% |
+| FFN in (gate + up) | Q4_K, Q4_K | 2048 → 12288 | 15.7 | 349 | 45.0 | 7.2e-6 | 0.50% |
+| FFN down | Q6_K | 6144 → 2048 | 7.9 | 211 | 37.3 | 5.9e-6 | 8.0% |
+| LM head (token_embd) | Q6_K | 2048 → 248320 | 318.5 | 5,702 | 55.9 | 6.2e-6 | 7.3% |
 
-- "Err NPU" is the relative L2 error of the NPU output against a
-  double-precision GEMV over the same packed weights: the kernel's own error.
-  "Err total" compares against the GGUF weights, so it adds requantization.
-- **Streaming runs at the DMA ceiling.** The LM head reads 318 MB at 56 GB/s.
-- **Small matrices pay the dispatch.** A dispatch costs ~66 µs on its own
-  (`bench dispatch`); 7.9 MB at 56 GB/s is ~140 µs, which with that overhead
-  matches the 202 µs measured. Chaining dispatches in a runlist (~20 µs
-  each) and fusing projections that share an input is the next step.
-- **Q4_K converts exactly** (codes kept, scales and minima rounded to bf16):
-  0.7% total error. Tensors that Unsloth kept at 5–8 bits lose ~8% when
-  requantized to 4 bits with a min/max fit. Whether that costs model quality
-  is measured with the teacher-forced argmax match once decode runs end to
-  end; an 8-bit variant of the kernel is the fallback.
-- The kernel rounds to nearest even. A core starts in floor (truncating)
-  mode, which biased the sum to ~1.3% error at dim 2048.
-- Per-token ceiling for an all-q4nx 2B (~1.2 GB at 5 bits per weight) at
-  56 GB/s: ~21 ms, ~47 tok/s before dispatch and non-GEMV costs.
+- "Err NPU": relative L2 error against a double-precision GEMV over the same
+  packed weights and bf16 token. "Err total" compares against the GGUF
+  weights, so it adds requantization (and the bf16 rounding of Q4_K scales).
+- The LM head streams at the read ceiling. Small matrices pay a fixed
+  ~66 µs per dispatch (`bench dispatch`).
+- The kernel rounds to nearest even (a core starts in floor mode: 1.3%
+  error), carries each block's dot product and each per-32 token sum as two
+  bf16 halves, and writes fp32. That took its error from 4.5e-3 to 6e-6 at
+  the same speed.
+
+## NPU decode, end to end (Phase 3, step 2)
+
+`gufo-npu generate --device npu --model Qwen3.5-2B-UD-Q4_K_XL.gguf --prompt
+"Name three primary colors, briefly." --max-tokens 48`: every matrix product
+on the NPU (97 GEMVs per token), everything else in the CPU reference.
+2026-10-27.
+
+| | Decode tok/s | ms per token |
+|---|---|---|
+| CPU reference (GGUF weights) | 5.55 | 180 |
+| NPU projections | 22.4 | 44.8 |
+| FLM (Lemonade), for reference | 28.5 | 35 |
+
+- Of the 44.8 ms: ~29 ms in GEMV calls (~21 ms streaming 1.2 GB at 56 GB/s,
+  ~8 ms fixed per-call cost and copies), ~16 ms in the CPU reference's
+  DeltaNet, attention and norms (fp32/double, one thread).
+- Next: a fast CPU decode step (multi-threaded fp32, ~1–2 ms), then fewer
+  host round trips (runlists, ops moved onto the NPU).
+- Prompts run through the same per-token path for now (prefill is Phase 4).

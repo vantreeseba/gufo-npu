@@ -11,15 +11,16 @@ toolchain so every bottleneck can be fixed. See [docs/PLAN.md](docs/PLAN.md).
 
 **Status: Phase 3 started.** The toolchain, CI and NPU runtime path work end
 to end, and an fp32 CPU reference of Qwen3.5-2B (GGUF) matches HF
-transformers. `gufo-npu generate` chats on the CPU. The first NPU kernel, a
-q4nx GEMV, streams weights at 56 GB/s (`gufo-npu bench gemv`).
+transformers. `gufo-npu generate --device npu` decodes at 22 tok/s with every
+matrix product on the NPU (a q4nx GEMV that streams weights at the NPU's
+56 GB/s read ceiling); norms, DeltaNet and attention still run on the CPU.
 
 | Phase | Scope | State |
 |---|---|---|
 | 0 | Repo, CI, pinned toolchain, smoke kernel | done |
 | 1 | Hardware microbenchmarks (dispatch, DMA bandwidth, int4 GEMV) | dispatch, copy bandwidth, FLM baseline done |
 | 2 | CPU reference model (GGUF): forward pass, tokenizer, chat, greedy generate; matches HF | done (MTP and FLM pack: later) |
-| 3 | NPU decode | q4nx GEMV (Q4_K packs exactly) done; fusion, runlists, DeltaNet and attention next |
+| 3 | NPU decode | q4nx GEMVs end to end (22 tok/s, 73/73 top-1 vs CPU); fast CPU step, runlists, DeltaNet and attention on the NPU next |
 | 4 | NPU prefill | |
 | 5 | OpenAI-compatible server | |
 

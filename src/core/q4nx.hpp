@@ -44,11 +44,25 @@ std::size_t PaddedRows(std::size_t rows);
 // a min/max fit per 32 in-features. Padding rows are zero.
 Matrix Pack(gguf::GgmlType type, const std::uint8_t* data, std::size_t rows,
             std::size_t dim);
+// One GGUF weight in a fused matrix.
+struct Segment {
+  gguf::GgmlType type;
+  const std::uint8_t* data;
+  std::size_t rows;
+};
+// Stacks several weights with the same `dim` into one matrix, rows in order,
+// so projections that share an input run as one GEMV. Exact when every
+// segment is Q4_K.
+Matrix PackRows(const std::vector<Segment>& segments, std::size_t dim);
 // Requantizes fp32 weights (row-major `rows` x `dim`).
 Matrix PackFloat(const float* weights, std::size_t rows, std::size_t dim);
 
 // The weights the NPU computes with, row-major padded_rows x dim.
 std::vector<float> Unpack(const Matrix& matrix);
+
+// y = W x on the CPU from the packed matrix, `rows` outputs: the weights the
+// NPU uses, accumulated in double.
+void Gemv(const Matrix& matrix, const float* x, float* y);
 
 // y = W x in double, over the padded rows, from Unpack(matrix).
 std::vector<double> Reference(const std::vector<float>& unpacked,

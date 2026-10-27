@@ -25,7 +25,8 @@ std::vector<int> GreedyGenerate(const Reference& model,
                                 const std::vector<int>& prompt, int max_tokens,
                                 const std::vector<int>& stop,
                                 const std::function<void(int)>& on_token,
-                                GenerateStats* stats) {
+                                GenerateStats* stats,
+                                const Projections* projections) {
   if (prompt.empty()) {
     throw std::invalid_argument("generate: empty prompt");
   }
@@ -36,7 +37,7 @@ std::vector<int> GreedyGenerate(const Reference& model,
   local.prompt_tokens = static_cast<int>(prompt.size());
 
   auto start = std::chrono::steady_clock::now();
-  auto out = model.Forward(prompt, state);
+  auto out = model.Forward(prompt, state, true, false, projections);
   local.prefill_seconds = SecondsSince(start);
   int next = Argmax(out.logits, (prompt.size() - 1) * vocab, vocab);
 
@@ -50,7 +51,7 @@ std::vector<int> GreedyGenerate(const Reference& model,
         static_cast<int>(generated.size()) == max_tokens) {
       break;
     }
-    out = model.Forward({next}, state);
+    out = model.Forward({next}, state, true, false, projections);
     next = Argmax(out.logits, 0, vocab);
   }
   local.decode_seconds = SecondsSince(start);

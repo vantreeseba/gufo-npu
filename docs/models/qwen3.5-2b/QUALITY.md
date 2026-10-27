@@ -33,18 +33,40 @@ prompts (chat template, code, prose; 73 tokens). Measured 2026-10-27.
 random bf16 token, NPU output against a double-precision GEMV over the same
 packed weights. Pass: relative L2 error < 1e-2. 2026-10-27, on the NPU:
 
-| Design | Relative error |
+| Sequence | Relative error |
 |---|---|
-| q4nx_gemv_k2048_n2048 | 7.8e-3 |
-| q4nx_gemv_k2048_n6144 | 4.7e-3 |
-| q4nx_gemv_k6144_n2048 | 4.5e-3 |
-| q4nx_gemv_k2048_n248832_norm (RMS norm fused) | 6.1e-3 |
+| q4nx_gemv_k2048_n2048 | 5.9e-6 |
+| q4nx_gemv_k2048_n5120 | 5.4e-6 |
+| q4nx_gemv_k2048_n8192 | 6.0e-6 |
+| q4nx_gemv_k2048_n12288 | 5.4e-6 |
+| q4nx_gemv_k6144_n2048 | 6.3e-6 |
+| q4nx_gemv_k2048_n248832 | 4.7e-6 |
 
-The error comes from the kernel's bf16 narrowings: each 32-wide dot product of
-codes and token, the per-32 token sums and the output. Real tensors give
-0.4–0.6% (BENCHMARKS.md). `q4nx_test` (hosted CI) checks the packing: Q4_K
-codes carry over unchanged, and requantized weights stay within half a 4-bit
-step.
+The kernel carries its dot products and token sums in two bf16 halves and
+writes fp32; with single bf16 (IRON's q4nx_accumulate) the same test gave
+4–8e-3. `q4nx_test` (hosted CI) checks the packing: Q4_K codes carry over
+unchanged, requantized weights stay within half a 4-bit step, fused stacks
+equal their parts, and the CPU q4nx GEMV matches the reference.
+
+## NPU decode, teacher-forced
+
+`qwen35_npu_decode_test` (labels `npu`, `model`; needs
+`GUFO_NPU_QWEN35_2B_Q4_GGUF` and `GUFO_NPU_QWEN35_2B_ORACLE`): the oracle
+prompts through Qwen3.5-2B UD-Q4_K_XL with every projection on the NPU,
+against the same q4nx weights on the CPU. Pass: top-1 agreement >= 95% over
+all prompts, logits relative error < 1e-2 per prompt. 2026-10-27:
+
+| Prompt | Tokens | NPU vs q4nx CPU: argmax | Logits rel err | Argmax vs HF: NPU | q4nx CPU | GGUF CPU |
+|---|---|---|---|---|---|---|
+| chat | 19 | 100% | 5.4e-3 | 84.2% | 84.2% | 84.2% |
+| code | 15 | 100% | 4.3e-3 | 100% | 100% | 100% |
+| prose | 39 | 100% | 3.0e-3 | 84.6% | 84.6% | 89.7% |
+
+- The NPU adds no top-1 changes over its own weights (73/73). The logits gap
+  is mostly the bf16 rounding of each GEMV's input.
+- Requantizing the 5–8-bit tensors to q4nx costs 2 of 73 top-1 matches
+  against HF here (GGUF CPU vs q4nx CPU), on short prompts. A longer quality
+  run decides whether an 8-bit kernel variant is needed.
 
 ## Planned
 

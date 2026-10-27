@@ -20,6 +20,10 @@ constexpr std::size_t kBandwidthElements = 16ULL * 1024 * 1024;
 constexpr std::size_t kBandwidthBytes =
     kBandwidthElements * sizeof(std::int32_t);
 
+// Must match SIZE in kernels/designs/bw_read.py.
+constexpr std::size_t kReadElements = 64ULL * 1024 * 1024;
+constexpr std::size_t kReadBytes = kReadElements * sizeof(std::int32_t);
+
 xrt::run SmokeRun(LoadedKernel& kernel, const xrt::bo& input,
                   const xrt::bo& output) {
   return kernel.Run({&input, &output});
@@ -171,7 +175,7 @@ DispatchBenchResult BenchDispatch(const std::filesystem::path& kernel_dir,
           chain.push_back(smoke.Buffer(kSmokeBytes));
           Clear(chain.back());
         }
-        xrt::runlist runlist(*smoke.context);
+        xrt::runlist runlist = smoke.Runlist();
         std::vector<xrt::run> runs;
         for (int i = 0; i < depth; ++i) {
           runs.push_back(
@@ -246,6 +250,32 @@ BandwidthResult BenchBandwidth(const std::filesystem::path& kernel_dir,
       result.error = "copied buffer differs from the input";
       return result;
     }
+
+    LoadedKernel read(kernel_dir, "bw_read");
+    auto source = read.Buffer(kReadBytes);
+    auto sink = read.Buffer(4096);
+    std::memset(source.map<void*>(), 1, kReadBytes);
+    source.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    auto read_run = read.Run({&source, &sink});
+    for (int i = 0; i < 3; ++i) {
+      read_run.start();
+      read_run.wait();
+    }
+    double read_total_us = 0;
+    double read_best_us = std::numeric_limits<double>::max();
+    for (int i = 0; i < iterations; ++i) {
+      const auto start = Clock::now();
+      read_run.start();
+      read_run.wait();
+      const double us = MicrosSince(start);
+      read_total_us += us;
+      read_best_us = std::min(read_best_us, us);
+    }
+    result.read_bytes_per_run = kReadBytes;
+    result.read_mean_gb_s =
+        static_cast<double>(kReadBytes) / (read_total_us / iterations) / 1e3;
+    result.read_best_gb_s =
+        static_cast<double>(kReadBytes) / read_best_us / 1e3;
     result.ok = true;
   } catch (const std::exception& error) {
     result.error = error.what();

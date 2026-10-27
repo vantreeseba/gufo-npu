@@ -20,18 +20,15 @@ namespace quant = gufo_npu::quant;
 struct Shape {
   std::size_t dim;
   std::size_t rows;
-  bool norm;
 };
 
 // Must match SHAPES in kernels/designs/q4nx_gemv.py (rows before padding).
 constexpr Shape kShapes[] = {
-    {2048, 2048, false},
-    {2048, 6144, false},
-    {6144, 2048, false},
-    {2048, 248320, true},
+    {2048, 2048},  {2048, 5120}, {2048, 8192},
+    {2048, 12288}, {6144, 2048}, {2048, 248320},
 };
 
-int CheckShape(const std::filesystem::path& kernels, const Shape& s,
+int CheckShape(gufo_npu::npu::GemvRuntime& runtime, const Shape& s,
                std::mt19937& rng) {
   std::normal_distribution<float> weight(0.0f, 0.02f);
   std::normal_distribution<float> activation(0.0f, 1.0f);
@@ -43,48 +40,31 @@ int CheckShape(const std::filesystem::path& kernels, const Shape& s,
   w.clear();
   w.shrink_to_fit();
 
-  // The token (plus its norm weight) in bf16, and the vector the kernel
-  // multiplies: the token itself, or its RMS norm rounded to bf16.
-  std::vector<std::uint16_t> x_bits((s.norm ? 2 : 1) * s.dim);
-  std::vector<float> x(x_bits.size());
-  for (std::size_t i = 0; i < x.size(); ++i) {
-    const float v =
-        i < s.dim ? activation(rng) * 4.0f : 1.0f + 0.1f * activation(rng);
-    x_bits[i] = quant::FloatToBf16(v);
+  // The token in bf16.
+  std::vector<std::uint16_t> x_bits(s.dim);
+  std::vector<float> x(s.dim);
+  for (std::size_t i = 0; i < s.dim; ++i) {
+    x_bits[i] = quant::FloatToBf16(activation(rng) * 4.0f);
     x[i] = quant::Bf16ToFloat(x_bits[i]);
   }
-  std::vector<float> operand(x.begin(), x.begin() + s.dim);
-  if (s.norm) {
-    double sq = 0;
-    for (std::size_t i = 0; i < s.dim; ++i) {
-      sq += static_cast<double>(x[i]) * x[i];
-    }
-    const double inv = 1.0 / std::sqrt(sq / s.dim + 1e-6);
-    for (std::size_t i = 0; i < s.dim; ++i) {
-      operand[i] = quant::Bf16ToFloat(
-          quant::FloatToBf16(static_cast<float>(x[i] * inv * x[s.dim + i])));
-    }
-  }
-  const auto ref =
-      q4nx::Reference(q4nx::Unpack(packed), packed, operand.data());
+  const auto ref = q4nx::Reference(q4nx::Unpack(packed), packed, x.data());
 
-  gufo_npu::npu::Q4nxGemv gemv(kernels, packed, s.norm);
-  std::vector<std::uint16_t> y(packed.padded_rows);
+  gufo_npu::npu::Q4nxGemv gemv(runtime, packed);
+  std::vector<float> y(packed.padded_rows);
   gemv.Run(x_bits.data(), y.data());
 
   double err2 = 0;
   double ref2 = 0;
   double max_err = 0;
   for (std::size_t r = 0; r < packed.rows; ++r) {
-    const double e = quant::Bf16ToFloat(y[r]) - ref[r];
+    const double e = y[r] - ref[r];
     err2 += e * e;
     ref2 += ref[r] * ref[r];
     max_err = std::fmax(max_err, std::fabs(e));
   }
-  const auto name =
-      gufo_npu::npu::Q4nxGemvDesign(s.dim, packed.padded_rows, s.norm);
+  const auto name = gufo_npu::npu::Q4nxGemvSequence(s.dim, packed.padded_rows);
   for (std::size_t r = packed.rows; r < packed.padded_rows; ++r) {
-    if (y[r] != 0 && y[r] != 0x8000) {
+    if (y[r] != 0.0f) {
       std::fprintf(stderr, "FAIL: %s: padding row %zu is not zero\n",
                    name.c_str(), r);
       return 1;
@@ -114,9 +94,11 @@ int main(int argc, char** argv) {
     return 77;
   }
   std::mt19937 rng(1234);
+  // Every shape runs in the one hardware context.
+  gufo_npu::npu::GemvRuntime runtime(argv[1]);
   int failures = 0;
   for (const auto& shape : kShapes) {
-    failures += CheckShape(argv[1], shape, rng);
+    failures += CheckShape(runtime, shape, rng);
   }
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

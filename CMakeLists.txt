@@ -74,8 +74,13 @@ else()
   target_link_libraries(gufo_npu_runtime PUBLIC gufo_npu_core)
 endif()
 
+# Qwen3.5 projections on q4nx weights (NPU, or the same weights on the CPU).
+add_library(gufo_npu_qwen35_npu STATIC src/models/qwen35/q4nx_projections.cpp)
+target_link_libraries(gufo_npu_qwen35_npu PUBLIC gufo_npu_qwen35
+                      gufo_npu_runtime)
+
 add_executable(gufo-npu src/cli/main.cpp)
-target_link_libraries(gufo-npu PRIVATE gufo_npu_runtime gufo_npu_qwen35)
+target_link_libraries(gufo-npu PRIVATE gufo_npu_qwen35_npu)
 install(TARGETS gufo-npu RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 if(GUFO_NPU_BUILD_KERNELS)

@@ -1,5 +1,6 @@
 #include "core/q4nx.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -158,7 +159,46 @@ int CheckReference() {
       return Fail("reference GEMV");
     }
   }
-  std::puts("ok: reference GEMV");
+  std::vector<float> fast(kRows);
+  q4nx::Gemv(packed, x.data(), fast.data());
+  for (std::size_t r = 0; r < kRows; ++r) {
+    if (std::fabs(fast[r] - y[r]) > 1e-4 * (1 + std::fabs(y[r]))) {
+      return Fail("Gemv differs from the reference");
+    }
+  }
+  std::puts("ok: reference GEMV and Gemv");
+  return 0;
+}
+
+int CheckPackRows() {
+  std::mt19937 rng(5);
+  constexpr std::size_t kDim = 256;
+  const auto a = RandomQ4K(40, kDim, rng);
+  std::vector<float> fb(24 * kDim);
+  std::normal_distribution<float> normal(0.0f, 0.05f);
+  for (auto& v : fb) {
+    v = normal(rng);
+  }
+  std::vector<std::uint16_t> b(fb.size());
+  for (std::size_t i = 0; i < fb.size(); ++i) {
+    b[i] = quant::FloatToBf16(fb[i]);
+  }
+  const auto* b_bytes = reinterpret_cast<const std::uint8_t*>(b.data());
+  const auto fused = q4nx::PackRows(
+      {{GgmlType::kQ4_K, a.data(), 40}, {GgmlType::kBF16, b_bytes, 24}}, kDim);
+  const auto alone_a = q4nx::Pack(GgmlType::kQ4_K, a.data(), 40, kDim);
+  const auto alone_b = q4nx::Pack(GgmlType::kBF16, b_bytes, 24, kDim);
+  if (fused.rows != 64 || fused.exact) {
+    return Fail("PackRows: rows or exact flag");
+  }
+  const auto uf = q4nx::Unpack(fused);
+  const auto ua = q4nx::Unpack(alone_a);
+  const auto ub = q4nx::Unpack(alone_b);
+  if (!std::equal(ua.begin(), ua.begin() + 40 * kDim, uf.begin()) ||
+      !std::equal(ub.begin(), ub.begin() + 24 * kDim, uf.begin() + 40 * kDim)) {
+    return Fail("PackRows: fused rows differ from packing each alone");
+  }
+  std::puts("ok: PackRows stacks segments");
   return 0;
 }
 
@@ -190,5 +230,6 @@ int main() {
   failures += CheckQ4KExact();
   failures += CheckRequant();
   failures += CheckReference();
+  failures += CheckPackRows();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
