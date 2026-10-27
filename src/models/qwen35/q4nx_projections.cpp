@@ -117,7 +117,9 @@ void Q4nxProjections::Apply(Stage stage, int layer, const float* x, int tokens,
       case Stage::kRouter:
       case Stage::kExpertIn:
       case Stage::kExpertDown:
-        throw std::logic_error("q4nx projections: dense models only");
+      case Stage::kMtpIn:
+        throw std::logic_error(
+            "q4nx projections: dense decoder layers and LM head only");
     }
   }
 }

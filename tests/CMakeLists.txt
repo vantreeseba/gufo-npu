@@ -81,6 +81,12 @@ add_test(NAME qwen36_reference_llama_test COMMAND qwen36_reference_llama_test)
 set_tests_properties(qwen36_reference_llama_test PROPERTIES
                      SKIP_RETURN_CODE 77 LABELS model TIMEOUT 3600)
 
+add_executable(qwen36_mtp_test models/qwen36/mtp_test.cpp)
+target_link_libraries(qwen36_mtp_test PRIVATE gufo_npu_qwen35)
+add_test(NAME qwen36_mtp_test COMMAND qwen36_mtp_test)
+set_tests_properties(qwen36_mtp_test PROPERTIES SKIP_RETURN_CODE 77
+                     LABELS model TIMEOUT 3600)
+
 add_executable(qwen36_decoder_test models/qwen36/decoder_test.cpp)
 target_link_libraries(qwen36_decoder_test PRIVATE gufo_npu_qwen35)
 add_test(NAME qwen36_decoder_test COMMAND qwen36_decoder_test)

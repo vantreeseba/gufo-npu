@@ -108,6 +108,7 @@ struct GgufProjections::Layer {
   std::vector<Rows> ffn_in;        // gate, up: dense or shared expert
   std::vector<Rows> ffn_down;
   std::vector<Rows> router;  // ffn_gate_inp, ffn_gate_inp_shexp
+  std::vector<Rows> mtp_in;  // nextn.eh_proj (MTP layer)
   const TensorInfo* gate_exps = nullptr;
   const TensorInfo* up_exps = nullptr;
   const TensorInfo* down_exps = nullptr;
@@ -134,12 +135,18 @@ GgufProjections::GgufProjections(const gguf::File& file, Precision precision)
   const auto value_dim = static_cast<std::uint64_t>(c.LinearValueDim());
   const auto attn_dim = static_cast<std::uint64_t>(c.heads * c.head_dim);
   const auto kv_dim = static_cast<std::uint64_t>(c.kv_heads * c.head_dim);
-  for (int il = 0; il < c.layers; ++il) {
+  // The decoder layers, then the MTP layers (full attention).
+  for (int il = 0; il < c.layers + c.mtp_layers; ++il) {
     const std::string p = "blk." + std::to_string(il) + ".";
     auto t = [&](const char* name) -> const TensorInfo& {
       return file.Tensor(p + name);
     };
     Layer layer;
+    if (il >= c.layers) {
+      const auto& eh = t("nextn.eh_proj.weight");
+      CheckShape(eh, 2 * static_cast<std::uint64_t>(c.hidden), c.hidden);
+      layer.mtp_in = {All(eh)};
+    }
     if (c.IsMoe()) {
       const auto& router = t("ffn_gate_inp.weight");
       const auto& shared_gate = t("ffn_gate_inp_shexp.weight");
@@ -218,6 +225,9 @@ void GgufProjections::Apply(Stage stage, int layer, const float* x, int tokens,
       break;
     case Stage::kRouter:
       parts = &l.router;
+      break;
+    case Stage::kMtpIn:
+      parts = &l.mtp_in;
       break;
     case Stage::kLmHead:
     case Stage::kExpertIn:

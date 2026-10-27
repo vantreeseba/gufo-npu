@@ -79,7 +79,11 @@ struct Reference::Weights {
   };
   const TensorInfo* embed = nullptr;
   std::vector<float> output_norm;
-  std::vector<Layer> layers;
+  std::vector<Layer> layers;  // decoder layers, then the MTP layer
+  // MTP (nextn) norms.
+  std::vector<float> mtp_enorm;
+  std::vector<float> mtp_hnorm;
+  std::vector<float> mtp_head_norm;
   std::vector<float> rope_inv_freq;  // rope_dim / 2 entries
 };
 
@@ -100,7 +104,8 @@ void Reference::LoadWeights(const gguf::File& file) {
   }
   w.output_norm = ToFloats(file.Tensor("output_norm.weight"));
 
-  for (int il = 0; il < c.layers; ++il) {
+  // The decoder layers, then the MTP layer (full attention).
+  for (int il = 0; il < c.layers + std::min(c.mtp_layers, 1); ++il) {
     const std::string p = "blk." + std::to_string(il) + ".";
     auto tensor = [&](const char* name) -> const TensorInfo& {
       return file.Tensor(p + name);
@@ -125,6 +130,12 @@ void Reference::LoadWeights(const gguf::File& file) {
     }
     w.layers.push_back(std::move(layer));
   }
+  if (c.mtp_layers > 0) {
+    const std::string p = "blk." + std::to_string(c.layers) + ".nextn.";
+    w.mtp_enorm = ToFloats(file.Tensor(p + "enorm.weight"));
+    w.mtp_hnorm = ToFloats(file.Tensor(p + "hnorm.weight"));
+    w.mtp_head_norm = ToFloats(file.Tensor(p + "shared_head_norm.weight"));
+  }
 
   w.rope_inv_freq.resize(c.rope_dim / 2);
   for (int i = 0; i < c.rope_dim / 2; ++i) {
@@ -143,8 +154,8 @@ const Projections& Reference::projections() const {
 State Reference::NewState() const {
   const Config& c = config_;
   State state;
-  state.linear.resize(c.layers);
-  state.attention.resize(c.layers);
+  state.linear.resize(c.layers + c.mtp_layers);
+  state.attention.resize(c.layers + c.mtp_layers);
   for (int il = 0; il < c.layers; ++il) {
     if (!c.IsFullAttention(il)) {
       state.linear[il].conv.assign(
@@ -195,9 +206,46 @@ ForwardOutput Reference::Forward(const std::vector<int>& tokens, State& state,
   state.position += n;
 
   if (want_logits) {
-    result.logits = Logits(h, &proj);
+    result.logits = Head(h, w.output_norm, proj);
   }
   return result;
+}
+
+std::vector<float> Reference::Mtp(const std::vector<float>& h,
+                                  const std::vector<int>& tokens, State& state,
+                                  const Projections* projections) const {
+  const Config& c = config_;
+  const auto& w = *weights_;
+  const Projections& proj =
+      projections != nullptr ? *projections : *gguf_projections_;
+  const int n = static_cast<int>(tokens.size());
+  const int d = c.hidden;
+  if (c.mtp_layers < 1 || h.size() != static_cast<std::size_t>(n) * d) {
+    throw std::invalid_argument("qwen35: no MTP layer, or bad hidden size");
+  }
+  // [RMS(embed(token)) * enorm ; RMS(RMS(h) * output_norm) * hnorm]
+  std::vector<float> eh(static_cast<std::size_t>(n) * 2 * d);
+  std::vector<float> row(d);
+  const auto embed_row = quant::RowBytes(w.embed->type, d);
+  for (int t = 0; t < n; ++t) {
+    if (tokens[t] < 0 || tokens[t] >= c.vocab) {
+      throw std::out_of_range("qwen35: token id out of range");
+    }
+    float* out = &eh[static_cast<std::size_t>(t) * 2 * d];
+    quant::Dequantize(
+        w.embed->type,
+        w.embed->data + static_cast<std::size_t>(tokens[t]) * embed_row,
+        row.data(), d);
+    RmsNorm(row.data(), w.mtp_enorm.data(), d, c.rms_eps, out);
+    RmsNorm(&h[static_cast<std::size_t>(t) * d], w.output_norm.data(), d,
+            c.rms_eps, row.data());
+    RmsNorm(row.data(), w.mtp_hnorm.data(), d, c.rms_eps, out + d);
+  }
+  std::vector<float> x(static_cast<std::size_t>(n) * d);
+  proj.Apply(Stage::kMtpIn, c.layers, eh.data(), n, x.data());
+  RunLayer(c.layers, x, n, state, proj);
+  state.position += n;
+  return Head(x, w.mtp_head_norm, proj);
 }
 
 void Reference::ForwardLayer(int layer, std::vector<float>& h, State& state,
@@ -212,17 +260,23 @@ void Reference::ForwardLayer(int layer, std::vector<float>& h, State& state,
 
 std::vector<float> Reference::Logits(const std::vector<float>& h,
                                      const Projections* projections) const {
+  return Head(h, weights_->output_norm,
+              projections != nullptr ? *projections : *gguf_projections_);
+}
+
+std::vector<float> Reference::Head(const std::vector<float>& h,
+                                   const std::vector<float>& norm,
+                                   const Projections& proj) const {
   const Config& c = config_;
   const int d = c.hidden;
   const int n = static_cast<int>(h.size() / d);
   std::vector<float> normed(h.size());
   for (int t = 0; t < n; ++t) {
-    RmsNorm(&h[static_cast<std::size_t>(t) * d], weights_->output_norm.data(),
-            d, c.rms_eps, &normed[static_cast<std::size_t>(t) * d]);
+    RmsNorm(&h[static_cast<std::size_t>(t) * d], norm.data(), d, c.rms_eps,
+            &normed[static_cast<std::size_t>(t) * d]);
   }
   std::vector<float> logits(static_cast<std::size_t>(n) * c.vocab);
-  (projections != nullptr ? *projections : *gguf_projections_)
-      .Apply(Stage::kLmHead, -1, normed.data(), n, logits.data());
+  proj.Apply(Stage::kLmHead, -1, normed.data(), n, logits.data());
   return logits;
 }
 
@@ -283,7 +337,9 @@ void Reference::RunLayer(int il, std::vector<float>& h, int n, State& state,
       cache.values.insert(cache.values.end(),
                           &v[static_cast<std::size_t>(t) * kv],
                           &v[static_cast<std::size_t>(t) * kv] + kv);
-      const int length = pos + 1;
+      // Every cached position (pos + 1 for the decoder layers; the MTP
+      // layer's cache may start later).
+      const int length = static_cast<int>(cache.keys.size() / kv);
       const float* qt = &qg[static_cast<std::size_t>(t) * 2 * c.heads * hd];
       for (int qh = 0; qh < c.heads; ++qh) {
         const float* raw = qt + static_cast<std::size_t>(qh) * 2 * hd;
@@ -555,6 +611,8 @@ std::size_t StageInputs(const Config& c, Stage stage, int layer) {
       return static_cast<std::size_t>(c.FfnWidth());
     case Stage::kExpertDown:
       return static_cast<std::size_t>(c.expert_ffn);
+    case Stage::kMtpIn:
+      return static_cast<std::size_t>(2 * c.hidden);
     default:
       return static_cast<std::size_t>(c.hidden);
   }
@@ -571,6 +629,7 @@ std::size_t StageOutputs(const Config& c, Stage stage, int /*layer*/) {
     case Stage::kMixerOut:
     case Stage::kFfnDown:
     case Stage::kExpertDown:
+    case Stage::kMtpIn:
       return static_cast<std::size_t>(c.hidden);
     case Stage::kFfnIn:
       return static_cast<std::size_t>(2 * c.FfnWidth());

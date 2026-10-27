@@ -69,6 +69,18 @@ public:
   std::vector<float> Logits(const std::vector<float>& h,
                             const Projections* projections = nullptr) const;
 
+  // The MTP (nextn) head, one draft per row: `h` holds rows of the main
+  // model's last-layer output (before output_norm) at positions p - 1, and
+  // `tokens` the tokens at positions p; returns logits for positions p + 1:
+  //   x = eh_proj [RMS(embed(token)) * enorm ; RMS(RMS(h) * output_norm) *
+  //   hnorm], the MTP block, then the LM head on RMS(x) * shared_head_norm.
+  // The block runs at RoPE positions state.position onwards with its own
+  // cache in `state` (keep one State for the MTP head, with position set to
+  // the first token's p), and advances state.position.
+  std::vector<float> Mtp(const std::vector<float>& h,
+                         const std::vector<int>& tokens, State& state,
+                         const Projections* projections = nullptr) const;
+
 private:
   struct Weights;
   void LoadWeights(const gguf::File& file);
@@ -80,6 +92,10 @@ private:
   // experts plus the gated shared expert. Writes `n` rows of hidden.
   void Ffn(int il, const float* x, int n, const Projections& proj,
            float* out) const;
+  // LM head logits of rows of `h` after RMS(h) * `norm`.
+  std::vector<float> Head(const std::vector<float>& h,
+                          const std::vector<float>& norm,
+                          const Projections& proj) const;
   Config config_;
   std::unique_ptr<Weights> weights_;
   std::unique_ptr<GgufProjections> gguf_projections_;

@@ -33,6 +33,9 @@ enum class Stage {
   kExpertIn,
   // A routed expert's down projection: hidden; ApplyExpert only.
   kExpertDown,
+  // MTP layer input, nextn.eh_proj: [embedding | hidden] (2 * hidden) to
+  // hidden. Its layer is the MTP layer (Config::layers).
+  kMtpIn,
 };
 
 // Input and output widths of `stage` at `layer`.

@@ -188,6 +188,8 @@ private:
       case Stage::kLmHead:
         return type(c_.tied_embeddings ? "token_embd.weight" : "output.weight",
                     "");
+      case Stage::kMtpIn:
+        return type(p + "nextn.eh_proj.weight", "");
     }
     throw std::logic_error("unknown stage");
   }
