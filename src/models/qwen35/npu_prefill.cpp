@@ -1160,8 +1160,14 @@ const NpuPrefill::Profile& NpuPrefill::profile() const {
 PromptPrefill PrefillPrompt(NpuPrefill& prefill) {
   return [&prefill](const std::vector<int>& prompt, DecodeState& state,
                     DecodeState* mtp, float* hidden) {
+    // A prefill pass costs ~0.10 s however short the prompt (98 GEMM calls
+    // of at least 256 rows each), the decode path ~28 ms per two tokens.
+    // Measured TTFT (BENCHMARKS.md): 6 tokens 0.086 s on the decode path
+    // against 0.102 s with prefill, 8 tokens 0.115 against 0.102. Shorter
+    // prompts go through the decoder alone.
+    constexpr int kMinPrefillPrompt = 7;
     const int k = static_cast<int>(prompt.size()) - 1;
-    if (k < 1) {
+    if (static_cast<int>(prompt.size()) < kMinPrefillPrompt) {
       return 0;
     }
     // Every id, including the last (the MTP cache reads prompt[k]), before
