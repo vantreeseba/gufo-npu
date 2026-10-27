@@ -17,7 +17,7 @@
 namespace gufo_npu::npu {
 
 // The longest input, in values.
-inline constexpr std::size_t kGemvMaxDim = 6144;
+inline constexpr std::size_t kGemvMaxDim = 8704;
 // Residual width of the resnorm input stage.
 inline constexpr std::size_t kGemvHidden = 2048;
 // Tokens a call can carry.
@@ -155,9 +155,11 @@ private:
   Epilogue epilogue_ = Epilogue::kStore;
 };
 
-// Experts in a gather call (8 routed and the shared one) and an expert's
-// FFN width: kernels/designs/q4nx_gemv.py MOE_VARIANTS.
+// Experts in a gather call: one token's 8 routed experts and the shared
+// one, up to two tokens' 16 and the shared one (any count in between for two
+// tokens). An expert's FFN width. kernels/designs/q4nx_gemv.py MOE_VARIANTS.
 inline constexpr std::size_t kGatherExperts = 9;
+inline constexpr std::size_t kMaxGatherExperts = 17;
 inline constexpr std::size_t kExpertFfn = 512;
 
 // One MoE layer's experts, packed for Q4nxGather in one device buffer:
@@ -182,9 +184,11 @@ struct ExpertArena {
   std::size_t bytes() const { return experts * (kUpBytes + kDownBytes); }
 };
 
-// A call over kGatherExperts experts of an ExpertArena chosen per call: the
+// A call over `experts` experts of an ExpertArena chosen per call: the
 // weight addresses (and scales) are rewritten in the call's own instruction
-// stream by Select(). Needs a runtime with Flow::kInstructionBuffer.
+// stream by Select(). Needs a runtime with Flow::kInstructionBuffer. One
+// token: kGatherExperts experts; two tokens: kGatherExperts to
+// kMaxGatherExperts.
 //   kGateUp  resnorm input (as a Q4nxGemv's) -> per chosen expert i,
 //            silu(gate) * up * scale as compact bf16, expert i's kExpertFfn
 //            values at i * kExpertFfn; the residual like any resnorm call.
@@ -195,18 +199,20 @@ public:
   enum class Kind { kGateUp, kDown };
 
   Q4nxGather(GemvRuntime& runtime, Kind kind, const ExpertArena& arena,
-             std::size_t tokens = 1);
+             std::size_t experts = kGatherExperts, std::size_t tokens = 1);
   ~Q4nxGather();
   Q4nxGather(const Q4nxGather&) = delete;
   Q4nxGather& operator=(const Q4nxGather&) = delete;
 
-  // Points the call at arena experts ids[0..kGatherExperts); for kGateUp,
-  // scales[i * tokens + t] scales expert i's output for token t. Takes
-  // effect at the next run of a chain holding this call.
+  // Points the call at arena experts ids[0..experts()); for kGateUp,
+  // scales[i * tokens + t] scales expert i's output for token t (0 for an
+  // expert only the other token chose). Takes effect at the next run of a
+  // chain holding this call.
   void Select(const int* ids, const float* scales = nullptr);
 
   // Bytes the y buffer must span.
   std::size_t y_bytes() const;
+  std::size_t experts() const;
   std::size_t tokens() const;
 
   struct Impl;

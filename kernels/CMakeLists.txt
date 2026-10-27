@@ -36,6 +36,16 @@ foreach(sequence IN LISTS q4nx_gemv_SEQUENCES)
          ${sequence}_t${tokens}.insts.bin)
   endforeach()
 endforeach()
+# Two-token MoE gathers over 10 to 17 experts (a pair's expert union).
+foreach(experts RANGE 10 17)
+  math(EXPR rows "${experts} * 1024")
+  math(EXPR dim "${experts} * 512")
+  foreach(sequence
+          q4nx_gemv_k2048_n${rows}_resnorm_swiglu_scaled_rounds${experts}_t2
+          q4nx_gemv_k${dim}_n2048_act_store_k${experts}_t2)
+    list(APPEND q4nx_gemv_OUTPUTS ${sequence}.insts.elf ${sequence}.insts.bin)
+  endforeach()
+endforeach()
 set(q4nx_gemv_SOURCES aie/q4nx_gemv.cc)
 
 set(kernel_outputs)

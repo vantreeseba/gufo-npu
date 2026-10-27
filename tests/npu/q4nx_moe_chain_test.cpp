@@ -4,6 +4,7 @@
 #include <cstring>
 #include <filesystem>
 #include <iterator>
+#include <memory>
 #include <random>
 #include <vector>
 
@@ -15,11 +16,13 @@
 // Qwen3.6-35B-A3B layer (instruction-buffer flow): the input projection and
 // the mixer's output projection in one submission, then, with the gathers
 // pointed at a new selection, gate + up and down gathers and the next
-// layer's input projection in another. The selections cycle through a few
-// fixed ones; every output must be bit-identical to the first run with the
-// same selection. Guards the DMA wait-order rule (AGENTS.md) for the gather
-// sequences, whose many segment fills reuse BDs. argv[2] overrides the
-// iteration count. Exits 77 (skip) without an NPU.
+// layer's input projection in another. The selections cycle through fixed
+// ones, for one token (9 experts) and for two (unions of 9, 13 and 17
+// experts, each token weighing some of them 0); every output must be
+// bit-identical to the first run with the same selection. Guards the DMA
+// wait-order rule (AGENTS.md) for the gather sequences, whose many segment
+// fills reuse BDs. argv[2] overrides the iteration count. Exits 77 (skip)
+// without an NPU.
 namespace {
 
 namespace npu = gufo_npu::npu;
@@ -31,7 +34,14 @@ using npu::Prologue;
 
 constexpr long kDefaultIterations = 20000;
 constexpr int kArena = 24;
-constexpr int kSelections = 4;
+
+// A selection: experts per call and tokens.
+struct Selection {
+  std::size_t experts;
+  std::size_t tokens;
+};
+constexpr Selection kSelections[] = {{9, 1}, {9, 1}, {9, 2}, {13, 2}, {17, 2}};
+constexpr std::size_t kCount = std::size(kSelections);
 
 }  // namespace
 
@@ -88,8 +98,6 @@ int main(int argc, char** argv) {
                 down.bytes.data(), down.bytes.size());
   }
   arena_buf.ToDevice();
-  npu::Q4nxGather gate_up(rt, npu::Q4nxGather::Kind::kGateUp, arena);
-  npu::Q4nxGather gather_down(rt, npu::Q4nxGather::Kind::kDown, arena);
 
   const std::size_t slotted =
       npu::kGemvSlot * sizeof(float) + npu::kGemvHidden * sizeof(float);
@@ -98,7 +106,8 @@ int main(int argc, char** argv) {
   Buffer in_y(rt, in.y_bytes());
   Buffer out_x(rt, npu::kGemvInputBytes);
   Buffer ffn_x(rt, npu::kGemvInputBytes);
-  Buffer mid(rt, gate_up.y_bytes());
+  Buffer mid(
+      rt, npu::Q4nxGather(rt, npu::Q4nxGather::Kind::kGateUp, arena).y_bytes());
   Buffer next_x(rt, npu::kGemvInputBytes);
   Buffer next_y(rt, next.y_bytes());
   Buffer next_r(rt, npu::kGemvResidualBytes);
@@ -110,9 +119,11 @@ int main(int argc, char** argv) {
       norm[i] = quant::FloatToBf16(1.0f + 0.2f * act(rng));
     }
   }
-  for (std::size_t i = 0; i < 2 * hidden; ++i) {
-    in_x.as<float>()[i] = act(rng);  // H and D
-    out_x.as<float>()[i] = act(rng);
+  for (std::size_t t = 0; t < npu::kGemvTokens; ++t) {
+    for (std::size_t i = 0; i < 2 * hidden; ++i) {
+      in_x.as<float>()[t * npu::kGemvSlot + i] = act(rng);  // H and D
+      out_x.as<float>()[t * npu::kGemvSlot + i] = act(rng);
+    }
   }
   for (Buffer* b : {&in_x, &out_x, &ffn_x, &next_x}) {
     b->ToDevice();
@@ -121,77 +132,114 @@ int main(int argc, char** argv) {
   Buffer ffn_d = ffn_x.Sub(d_offset, slotted);
   Buffer next_h = next_x.Sub(0, slotted);
   Buffer next_d = next_x.Sub(d_offset, slotted);
-  npu::Chain first(rt);
-  first.Add(in, in_x, in_y, ffn_h);
-  first.Add(out, out_x, ffn_d, scratch);
-  npu::Chain second(rt);
-  second.Add(gate_up, ffn_x, arena_buf, mid, next_h);
-  second.Add(gather_down, mid, arena_buf, next_d, scratch);
-  second.Add(next, next_x, next_y, next_r);
-
-  // Fixed selections: 9 distinct arena experts and their scales.
-  std::vector<std::vector<int>> ids(kSelections);
-  std::vector<std::vector<float>> scales(kSelections);
-  for (int s = 0; s < kSelections; ++s) {
+  // Per selection: its gathers and chains, distinct arena experts (sorted,
+  // as the decoder orders them) and their scales.
+  struct Setup {
+    std::unique_ptr<npu::Q4nxGather> gate_up, down;
+    std::unique_ptr<npu::Chain> first, second;
+    std::vector<int> ids;
+    std::vector<float> scales;
+  };
+  std::vector<Setup> setups;
+  for (const Selection& sel : kSelections) {
+    Setup& u = setups.emplace_back();
+    u.gate_up = std::make_unique<npu::Q4nxGather>(
+        rt, npu::Q4nxGather::Kind::kGateUp, arena, sel.experts, sel.tokens);
+    u.down = std::make_unique<npu::Q4nxGather>(rt, npu::Q4nxGather::Kind::kDown,
+                                               arena, sel.experts, sel.tokens);
+    u.first = std::make_unique<npu::Chain>(rt);
+    u.first->Add(in, in_x, in_y, ffn_h, sel.tokens);
+    u.first->Add(out, out_x, ffn_d, scratch, sel.tokens);
+    u.second = std::make_unique<npu::Chain>(rt);
+    u.second->Add(*u.gate_up, ffn_x, arena_buf, mid, next_h);
+    u.second->Add(*u.down, mid, arena_buf, next_d, scratch);
+    u.second->Add(next, next_x, next_y, next_r, sel.tokens);
     std::vector<int> all(kArena);
     for (int e = 0; e < kArena; ++e) {
       all[e] = e;
     }
     std::shuffle(all.begin(), all.end(), rng);
-    ids[s].assign(all.begin(), all.begin() + npu::kGatherExperts);
-    for (std::size_t i = 0; i < npu::kGatherExperts; ++i) {
-      scales[s].push_back(
-          std::uniform_real_distribution<float>(0.05f, 1.0f)(rng));
+    u.ids.assign(all.begin(), all.begin() + sel.experts);
+    std::sort(u.ids.begin(), u.ids.end());
+    for (std::size_t i = 0; i < sel.experts * sel.tokens; ++i) {
+      const float v = std::uniform_real_distribution<float>(0.05f, 1.0f)(rng);
+      const bool unused =
+          sel.tokens == 2 && std::uniform_int_distribution<int>(0, 2)(rng) == 0;
+      u.scales.push_back(unused ? 0.0f : v);
     }
   }
 
+  // The bytes a selection writes in each output, per token (a smaller call
+  // leaves the rest of a buffer as the previous one wrote it): `bytes` at
+  // offset + t * stride.
   struct Watched {
     const char* name;
     Buffer* buffer;
+    std::size_t offset;
+    std::size_t stride;
+    std::size_t bytes;  // 0: the selection's experts' SwiGLU outputs
   };
-  const Watched watched[] = {{"in_y", &in_y},     {"ffn_x", &ffn_x},
-                             {"mid", &mid},       {"next_x", &next_x},
-                             {"next_y", &next_y}, {"next_r", &next_r}};
-  std::vector<std::vector<std::uint8_t>> want[kSelections];
+  const std::size_t slot = npu::kGemvSlot * sizeof(float);
+  const std::size_t hidden_bytes = hidden * sizeof(float);
+  const Watched watched[] = {
+      {"in_y", &in_y, 0, in.y_token_stride() * sizeof(float),
+       in.rows() * sizeof(float)},
+      {"ffn_x", &ffn_x, 0, slot, 2 * hidden_bytes},
+      {"mid", &mid, 0, npu::kGemvMaxDim / 2 * sizeof(float), 0},
+      {"next_x", &next_x, 0, slot, 2 * hidden_bytes},
+      {"next_y", &next_y, 0, next.y_token_stride() * sizeof(float),
+       next.rows() * sizeof(float)},
+      {"next_r", &next_r, 0, slot, hidden_bytes}};
+  std::vector<std::vector<std::uint8_t>> want[kCount];
   long bad_runs = 0;
   for (long it = 0; it < iterations; ++it) {
-    const auto s = static_cast<std::size_t>(it % kSelections);
-    first.Run();
-    gate_up.Select(ids[s].data(), scales[s].data());
-    gather_down.Select(ids[s].data());
-    second.Run();
+    const auto s = static_cast<std::size_t>(it) % kCount;
+    Setup& u = setups[s];
+    u.first->Run();
+    u.gate_up->Select(u.ids.data(), u.scales.data());
+    u.down->Select(u.ids.data());
+    u.second->Run();
     bool bad = false;
     for (std::size_t w = 0; w < std::size(watched); ++w) {
-      Buffer& b = *watched[w].buffer;
-      b.FromDevice();
-      const auto* p = b.as<std::uint8_t>();
+      const Watched& o = watched[w];
+      o.buffer->FromDevice();
+      const auto* p = o.buffer->as<std::uint8_t>();
+      const std::size_t bytes = o.bytes != 0
+                                    ? o.bytes
+                                    : kSelections[s].experts * npu::kExpertFfn *
+                                          sizeof(std::uint16_t);
+      std::vector<std::uint8_t> got;
+      for (std::size_t t = 0; t < kSelections[s].tokens; ++t) {
+        const auto* q = p + o.offset + t * o.stride;
+        got.insert(got.end(), q, q + bytes);
+      }
       if (want[s].size() <= w) {
-        want[s].emplace_back(p, p + b.size());
+        want[s].push_back(std::move(got));
         continue;
       }
-      if (std::memcmp(p, want[s][w].data(), b.size()) != 0 && !bad) {
+      if (got != want[s][w] && !bad) {
         std::size_t i = 0;
-        while (p[i] == want[s][w][i]) {
+        while (got[i] == want[s][w][i]) {
           ++i;
         }
         std::fprintf(stderr,
                      "run %ld (selection %zu): %s first differs at "
-                     "byte %zu\n",
-                     it, s, watched[w].name, i);
+                     "byte %zu of what it writes\n",
+                     it, s, o.name, i);
         bad = true;
       }
     }
     bad_runs += bad ? 1 : 0;
   }
   // Different selections must give different outputs (the patches apply):
-  // next_y of the first two.
+  // next_y of the two one-token selections.
   const bool distinct =
       iterations < 2 ||
       std::memcmp(want[0][4].data(), want[1][4].data(), want[0][4].size()) != 0;
   std::printf(
-      "%s MoE layer chain: %ld runs over %d expert selections, %ld with any "
-      "output differing%s\n",
-      bad_runs == 0 && distinct ? "ok  " : "FAIL", iterations, kSelections,
-      bad_runs, distinct ? "" : "; selections gave the same output");
+      "%s MoE layer chain: %ld runs over %zu expert selections (1 token: 9 "
+      "experts; 2 tokens: 9, 13, 17), %ld with any output differing%s\n",
+      bad_runs == 0 && distinct ? "ok  " : "FAIL", iterations, kCount, bad_runs,
+      distinct ? "" : "; selections gave the same output");
   return bad_runs == 0 && distinct ? EXIT_SUCCESS : EXIT_FAILURE;
 }
