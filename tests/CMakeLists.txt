@@ -158,3 +158,5 @@ if(GUFO_NPU_ENABLE_XRT AND GUFO_NPU_BUILD_KERNELS)
   set_tests_properties(bfp16_gemm_test PROPERTIES LABELS npu
                        SKIP_RETURN_CODE 77)
 endif()
+
+add_subdirectory(models/qwen35_4b)
