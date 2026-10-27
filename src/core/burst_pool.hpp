@@ -3,8 +3,11 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <functional>
+#include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #if defined(__x86_64__)
@@ -18,21 +21,23 @@ namespace gufo_npu {
 // for as long as a Burst is open, so a Run never waits for a thread to wake,
 // and a Run waits only for its jobs, not for every worker to check in. Outside
 // a Burst, workers sleep. Run() is not reentrant.
+//
+// A job that throws does not stop the others: Run waits for every job of
+// its call, then rethrows the first exception on the caller.
 class BurstPool {
 public:
   explicit BurstPool(std::size_t workers) {
-    for (std::size_t i = 0; i < workers; ++i) {
-      threads_.emplace_back([this] { Work(); });
+    try {
+      for (std::size_t i = 0; i < workers; ++i) {
+        threads_.emplace_back([this] { Work(); });
+      }
+    } catch (...) {
+      Shutdown();  // the threads that did start
+      throw;
     }
   }
 
-  ~BurstPool() {
-    stop_.store(true, std::memory_order_release);
-    Wake();
-    for (auto& t : threads_) {
-      t.join();
-    }
-  }
+  ~BurstPool() { Shutdown(); }
 
   BurstPool(const BurstPool&) = delete;
   BurstPool& operator=(const BurstPool&) = delete;
@@ -53,18 +58,29 @@ public:
   };
 
   // Runs fn(i) for i in [0, n) on the caller and the workers; returns when
-  // every call has finished.
+  // every call has finished, rethrowing the first exception one threw.
   void Run(std::size_t n, const std::function<void(std::size_t)>& fn) {
     if (n == 0) {
       return;
     }
     if (threads_.empty() || n == 1) {
+      std::exception_ptr first;
       for (std::size_t i = 0; i < n; ++i) {
-        fn(i);
+        try {
+          fn(i);
+        } catch (...) {
+          if (!first) {
+            first = std::current_exception();
+          }
+        }
+      }
+      if (first) {
+        std::rethrow_exception(first);
       }
       return;
     }
     fn_ = &fn;
+    error_ = nullptr;
     done_.store(0, std::memory_order_relaxed);
     const std::uint64_t gen = ++generation_ & kGenMask;
     // Publishes fn_ and done_ with the new ticket.
@@ -73,8 +89,13 @@ public:
       Wake();
     }
     Drain();
+    // Every job must be done (and fn and its captures unused) before Run
+    // returns or throws.
     while (done_.load(std::memory_order_acquire) != n) {
       Pause();
+    }
+    if (error_) {
+      std::rethrow_exception(std::exchange(error_, nullptr));
     }
   }
 
@@ -104,6 +125,14 @@ private:
     sleep_word_.notify_all();
   }
 
+  void Shutdown() {
+    stop_.store(true, std::memory_order_release);
+    Wake();
+    for (auto& t : threads_) {
+      t.join();
+    }
+  }
+
   // Claims and runs jobs of the current ticket until none are left.
   void Drain() {
     std::uint64_t t = ticket_.load(std::memory_order_acquire);
@@ -117,7 +146,15 @@ private:
                                         std::memory_order_acquire)) {
         // The claim succeeded, so this generation is unfinished and fn_ is
         // still its function.
-        (*fn_)(index);
+        try {
+          (*fn_)(index);
+        } catch (...) {
+          const std::lock_guard<std::mutex> lock(error_mutex_);
+          if (!error_) {
+            error_ = std::current_exception();
+          }
+        }
+        // Publishes error_ to Run with the count.
         done_.fetch_add(1, std::memory_order_acq_rel);
         t = ticket_.load(std::memory_order_acquire);
       }
@@ -161,6 +198,8 @@ private:
   std::atomic<bool> stop_{false};
   std::uint64_t generation_ = 0;
   const std::function<void(std::size_t)>* fn_ = nullptr;
+  std::mutex error_mutex_;
+  std::exception_ptr error_;  // the first job exception of the current Run
 };
 
 }  // namespace gufo_npu
