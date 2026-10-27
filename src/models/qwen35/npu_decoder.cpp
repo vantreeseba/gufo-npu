@@ -12,6 +12,7 @@
 #include "core/q4nx.hpp"
 #include "core/quant.hpp"
 #include "core/vec.hpp"
+#include "models/qwen35/draft_vocab.hpp"
 #include "npu/gemv.hpp"
 
 namespace gufo_npu::qwen35 {
@@ -86,12 +87,14 @@ struct NpuDecoder::Impl {
   std::unique_ptr<Buffer> lm_x, lm_y, lm_r, scratch;
   std::unique_ptr<Chain> first[kMaxTokens];  // layer 0's input projection
 
-  // The MTP head: eh_proj into its block's input, the block, then the shared
-  // LM head with shared_head_norm.
+  // The MTP head: eh_proj into its block's input, the block, then an LM
+  // head over the draft vocabulary (draft_ids, ascending) with
+  // shared_head_norm.
   bool has_mtp = false;
   Block mtp;
   std::vector<float> enorm, hnorm, output_norm;
-  std::unique_ptr<Q4nxGemv> eh_proj;
+  std::unique_ptr<Q4nxGemv> eh_proj, draft_lm;
+  std::vector<int> draft_ids;
   std::unique_ptr<Buffer> eh_x, mtp_lm_x, mtp_lm_y;
   std::unique_ptr<Chain> mtp_first[kMaxTokens];  // eh_proj, block in
 
@@ -216,12 +219,24 @@ struct NpuDecoder::Impl {
           runtime, PackOne(file.Tensor(p + "nextn.eh_proj.weight")),
           Prologue::kPlain, Epilogue::kStore);
       eh_x = std::make_unique<Buffer>(runtime, npu::kGemvInputBytes);
+      draft_ids = DraftVocab(c.vocab);
+      std::vector<q4nx::Segment> draft_rows;
+      draft_rows.reserve(draft_ids.size());
+      const std::size_t row_bytes = quant::RowBytes(embed->type, hidden);
+      for (const int id : draft_ids) {
+        draft_rows.push_back(
+            {embed->type,
+             embed->data + static_cast<std::size_t>(id) * row_bytes, 1});
+      }
+      draft_lm = std::make_unique<Q4nxGemv>(
+          runtime, q4nx::PackRows(draft_rows, hidden), Prologue::kResNorm,
+          Epilogue::kStore);
       mtp_lm_x = std::make_unique<Buffer>(runtime, npu::kGemvInputBytes);
-      mtp_lm_y = std::make_unique<Buffer>(runtime, lm->y_bytes());
+      mtp_lm_y = std::make_unique<Buffer>(runtime, draft_lm->y_bytes());
       SetNormWeight(*mtp_lm_x,
                     file.Tensor(p + "nextn.shared_head_norm.weight"));
       // eh_proj -> block in_x.H (its D stays zero); in: residual ->
-      // ffn_x.H; the block chains into the shared LM head on its own input.
+      // ffn_x.H; the block chains into the draft LM head on its own input.
       for (int tokens = 1; tokens <= kMaxTokens; ++tokens) {
         auto& chain = mtp_first[tokens - 1];
         chain = std::make_unique<Chain>(runtime);
@@ -231,7 +246,7 @@ struct NpuDecoder::Impl {
         chain->Add(*mtp.in, *mtp.in_x, *mtp.in_y,
                    mtp.views.emplace_back(mtp.ffn_x->Sub(kH, kSlottedBytes)),
                    tokens);
-        WireBlock(mtp, *mtp_lm_x, tokens, *lm, *mtp_lm_y, *scratch);
+        WireBlock(mtp, *mtp_lm_x, tokens, *draft_lm, *mtp_lm_y, *scratch);
       }
     }
 
@@ -416,8 +431,8 @@ void NpuDecoder::Resolve(DecodeState& state, bool keep_second) {
   }
 }
 
-const float* NpuDecoder::Draft(const float* const* hidden, const int* tokens,
-                               int count, int position, DecodeState& state) {
+void NpuDecoder::FillMtp(const float* const* hidden, const int* tokens,
+                         int count, int position, DecodeState& state) {
   Impl& m = *impl_;
   const Config& c = m.config;
   const int d = c.hidden;
@@ -442,12 +457,24 @@ const float* NpuDecoder::Draft(const float* const* hidden, const int* tokens,
     RmsNorm(m.normed.data(), m.hnorm.data(), d, c.rms_eps, slot + d);
   }
   x.ToDevice();
+  // eh_proj and the block's input projection; the attention appends to the
+  // cache.
   m.Submit(*m.mtp_first[count - 1]);
   m.Mix(m.mtp, c.layers, count, position, state.layers[c.layers], false);
+}
+
+int NpuDecoder::Draft(const float* const* hidden, const int* tokens, int count,
+                      int position, DecodeState& state) {
+  Impl& m = *impl_;
+  FillMtp(hidden, tokens, count, position, state);
   m.Submit(*m.mtp.chain[count - 1]);
   m.mtp_lm_y->FromDevice();
-  return m.mtp_lm_y->as<float>() +
-         static_cast<std::size_t>(count - 1) * m.lm->y_token_stride();
+  const float* scores =
+      m.mtp_lm_y->as<float>() +
+      static_cast<std::size_t>(count - 1) * m.draft_lm->y_token_stride();
+  const auto best =
+      std::max_element(scores, scores + m.draft_ids.size()) - scores;
+  return m.draft_ids[static_cast<std::size_t>(best)];
 }
 
 namespace {
@@ -516,10 +543,10 @@ std::vector<int> SpeculativeGenerate(NpuDecoder& model,
     for (int p = 1; p < n; p += 2) {
       const int count = std::min(2, n - p);
       const float* hs[2] = {hidden.data() + (p - 1) * d, hidden.data() + p * d};
-      model.Draft(hs, &prompt[p], count, p, mtp);
+      model.FillMtp(hs, &prompt[p], count, p, mtp);
     }
     const float* hs[1] = {hidden.data() + (n - 1) * d};
-    y2 = Argmax(model.Draft(hs, &y1, 1, n, mtp), vocab);
+    y2 = model.Draft(hs, &y1, 1, n, mtp);
   }
   local.prefill_seconds = SecondsSince(start);
 
@@ -553,7 +580,7 @@ std::vector<int> SpeculativeGenerate(NpuDecoder& model,
       // position + 2; the second drafts the token after z2.
       const float* hs[2] = {h1.data(), h2.data()};
       const int toks[2] = {y2, z2};
-      y2 = Argmax(model.Draft(hs, toks, 2, position + 1, mtp), vocab);
+      y2 = model.Draft(hs, toks, 2, position + 1, mtp);
       y1 = z2;
       position += 2;
     } else {
@@ -563,7 +590,7 @@ std::vector<int> SpeculativeGenerate(NpuDecoder& model,
         break;
       }
       const float* hs[1] = {h1.data()};
-      y2 = Argmax(model.Draft(hs, &z1, 1, position + 1, mtp), vocab);
+      y2 = model.Draft(hs, &z1, 1, position + 1, mtp);
       y1 = z1;
       position += 1;
     }

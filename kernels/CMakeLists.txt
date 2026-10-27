@@ -26,7 +26,9 @@ set(q4nx_gemv_OUTPUTS
   q4nx_gemv_k6144_n2048_act_store_t1.insts.elf
   q4nx_gemv_k6144_n2048_act_store_t2.insts.elf
   q4nx_gemv_k2048_n248832_resnorm_store_t1.insts.elf
-  q4nx_gemv_k2048_n248832_resnorm_store_t2.insts.elf)
+  q4nx_gemv_k2048_n248832_resnorm_store_t2.insts.elf
+  q4nx_gemv_k2048_n32768_resnorm_store_t1.insts.elf
+  q4nx_gemv_k2048_n32768_resnorm_store_t2.insts.elf)
 set(q4nx_gemv_SOURCES aie/q4nx_gemv.cc)
 
 set(kernel_outputs)

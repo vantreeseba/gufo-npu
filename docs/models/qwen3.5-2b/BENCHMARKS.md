@@ -231,8 +231,47 @@ merged per head. Same 2,120-token prompt, `--draft none`, warm:
 | Prompt (token by token) | 33.7 s | 32.3–32.5 s |
 | CPU mixer time | 4.9 s | 3.5–3.6 s |
 
-Decode at 2k context is now ~2% below short context (no draft: 28.9 vs
-26.9 ms per token).
+Decode at 2k context is now ~8% below short context (no draft: 29.1 vs
+26.9 ms per token). The extra ~2.2 ms is mostly attention over the 52 MB
+of K/V, still well below the CPU's 115 GB/s (a bf16 cache would halve the
+bytes).
+
+### Draft vocabulary for the MTP head
+
+A draft spent 5.8 of its ~7.5 ms in the LM head (248,832 rows, 290 MB). It
+now scores a draft vocabulary of 32,768 ids instead (`DraftVocab()`, 0.8
+ms): every special token, then the top of a ranking built by
+`tools/draft_vocab/rank_tokens.py` from a multilingual sample, weighted
+toward chat, code and the most used languages. The main model still checks
+each draft over the whole vocabulary, so the output is unchanged
+(`qwen35_npu_decode_test`). The MTP cache over the prompt (`FillMtp`) skips
+the LM head entirely. Warm, three runs each, 2026-10-27:
+
+| Prompt | Full vocabulary | Draft vocabulary (32k) | Drafts accepted |
+|---|---|---|---|
+| "Explain in a few sentences why the sky is blue." | 47.70, 47.91, 47.64 tok/s | **52.09, 53.00, 52.99** | 72% → 65% |
+| "Write a Python function that returns the n-th Fibonacci number…" | 47.6 (earlier build) | **61.23, 60.99, 60.69** | 95% |
+| "用几句话解释为什么天空是蓝色的。" | – | 44.55, 44.68, 44.72 | 43% → 40% (offline) |
+| 2,120-token prompt, then the sky question | 41.67, 41.37, 41.65 | **46.62, 47.25, 46.46** | |
+| 2,120-token prompt: time to first token | 40.3–40.8 s | 32.9 s | |
+
+Offline acceptance by draft vocabulary size (`gufo-npu bench mtp`, NPU
+greedy tokens, CPU MTP head restricted to the top K of the ranking):
+
+| Prompt | Full | 8k | 16k | 32k | 48k | 64k |
+|---|---|---|---|---|---|---|
+| English (sky) | 72.4% | 54.0 | 62.1 | **65.5** | 69.0 | 70.1 |
+| Python (Fibonacci) | 95.0% | 92.0 | 92.0 | **93.5** | 94.5 | 94.5 |
+| Math (3x + 7 = 22) | 89.5% | 85.0 | 86.5 | **89.0** | 89.0 | 90.0 |
+| Chinese (sky) | 42.9% | 28.6 | 35.7 | **40.5** | 45.2 | 42.9 |
+| Japanese (sky) | 53.4% | 43.9 | 48.0 | **49.3** | 52.0 | 52.0 |
+| Spanish (sky) | 68.9% | 42.2 | 44.4 | **51.1** | 51.1 | 60.0 |
+
+A step costs about 29.5 ms (verify) plus 1.7 ms (MTP block) plus the draft
+LM head, so 48k ids would add 0.4 ms for 1–4 points: about even. A first
+ranking that gave every source the same say (a token's best frequency in
+any of them) reached only 51.7% on the English prompt: 20 Wikipedia
+languages crowded out common English chat tokens.
 
 ### NPU power mode
 

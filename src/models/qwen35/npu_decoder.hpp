@@ -21,7 +21,9 @@
 // A step takes one or two tokens; the weights are read once for both. The
 // second token of a pair can be a speculative draft: Resolve() keeps it or
 // rolls the state back to just after the first. The MTP head drafts the
-// token after next on the NPU as well (two submissions per draft).
+// token after next on the NPU as well (two submissions per draft); its LM
+// head scores only the draft vocabulary, and the main model still checks
+// each draft over every token.
 namespace gufo_npu::qwen35 {
 
 class NpuDecoder {
@@ -54,10 +56,15 @@ public:
   // MTP draft: for each of `count` (1 or 2) positions p = position + i, the
   // pair (hidden[i], tokens[i]), where hidden[i] is the main model's final
   // residual at p - 1 and tokens[i] the token at p. Appends to the MTP
-  // layer's cache in `state` (an MtpState) and returns the logits for the
-  // position after the last.
-  const float* Draft(const float* const* hidden, const int* tokens, int count,
-                     int position, DecodeState& state);
+  // layer's cache in `state` (an MtpState) and returns the draft for the
+  // position after the last: the MTP head's argmax over the draft
+  // vocabulary (DraftVocab()).
+  int Draft(const float* const* hidden, const int* tokens, int count,
+            int position, DecodeState& state);
+  // Draft() without the draft: only appends the pairs to the MTP layer's
+  // cache (for prompt positions).
+  void FillMtp(const float* const* hidden, const int* tokens, int count,
+               int position, DecodeState& state);
   DecodeState NewMtpState() const;
 
   // Wall time inside NPU submissions since construction, and their count;

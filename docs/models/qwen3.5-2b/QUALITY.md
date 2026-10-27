@@ -83,9 +83,11 @@ per prompt. 2026-10-27:
 
 `qwen35_npu_decode_test` also decodes 48 tokens from the chat prompt with
 and without MTP speculation and requires identical tokens (2026-10-27:
-identical; 28 steps, 19 drafts accepted). A rejected draft rolls back the
-DeltaNet state (the draft's update goes to a spare buffer), the conv window
-and the attention caches.
+identical; 29 steps, 18 drafts accepted with the 32k draft vocabulary, 28
+and 19 with the full one). A rejected draft rolls back the DeltaNet state
+(the draft's update goes to a spare buffer), the conv window and the
+attention caches. The draft vocabulary only changes which drafts are
+proposed; acceptance per prompt and vocabulary size is in BENCHMARKS.md.
 
 ## Fast decoder vs reference
 

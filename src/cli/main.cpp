@@ -352,34 +352,8 @@ int BenchMtp(const std::vector<std::string_view>& args) {
   std::printf("%zu prompt tokens, %zu generated\n", prompt_len,
               seq.size() - prompt_len);
 
-  // Draft vocabulary subsets: the NPU MTP head's argmax over token ids
-  // below K only (one position per draft).
-  {
-    const int vocab = npu.config().vocab;
-    const int sizes[] = {8192, 16384, 32768, 65536, vocab};
-    std::size_t hits[5] = {};
-    std::size_t total = 0;
-    auto state = npu.NewMtpState();
-    for (std::size_t i = 0; i + 2 < seq.size(); ++i) {
-      const float* hs[1] = {hidden[i].data()};
-      const float* logits =
-          npu.Draft(hs, &seq[i + 1], 1, static_cast<int>(i + 1), state);
-      if (i + 2 < prompt_len) {
-        continue;
-      }
-      ++total;
-      for (int s = 0; s < 5; ++s) {
-        const int k = std::min(sizes[s], vocab);
-        hits[s] += std::max_element(logits, logits + k) - logits == seq[i + 2];
-      }
-    }
-    for (int s = 0; s < 5; ++s) {
-      std::printf("draft vocabulary ids < %6d: accepted %zu/%zu (%.1f%%)\n",
-                  std::min(sizes[s], vocab), hits[s], total,
-                  total ? 100.0 * hits[s] / total : 0.0);
-    }
-  }
-  // The NPU MTP head over the same pairs, one and two positions per draft.
+  // The NPU MTP head over the same pairs, one and two positions per draft,
+  // scoring the draft vocabulary (the CPU head below scores every token).
   for (const int per_draft : {1, 2}) {
     auto state = npu.NewMtpState();
     std::size_t hits = 0;
@@ -390,18 +364,17 @@ int BenchMtp(const std::vector<std::string_view>& args) {
       const float* hs[2] = {hidden[i].data(),
                             hidden[std::min(i + 1, seq.size() - 1)].data()};
       const int toks[2] = {seq[i + 1], seq[std::min(i + 2, seq.size() - 1)]};
-      const float* logits =
+      const int draft =
           npu.Draft(hs, toks, count, static_cast<int>(i + 1), state);
       const std::size_t last = i + count - 1;
-      const int draft = static_cast<int>(
-          std::max_element(logits, logits + npu.config().vocab) - logits);
       if (last + 2 >= prompt_len) {
         hits += draft == seq[last + 2];
         ++total;
       }
     }
     std::printf(
-        "NPU MTP, %d position(s) per draft: accepted %zu/%zu (%.1f%%)\n",
+        "NPU MTP (draft vocabulary), %d position(s) per draft: accepted "
+        "%zu/%zu (%.1f%%)\n",
         per_draft, hits, total, total ? 100.0 * hits / total : 0.0);
   }
   for (const bool after_norm : {true, false}) {

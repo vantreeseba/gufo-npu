@@ -89,6 +89,8 @@ VARIANTS = [
     (2048, 12288, "resnorm", "swiglu", 12288 // 4),
     (6144, 2048, "act", "store", SLOT),
     (2048, 248832, "resnorm", "store", 248832),
+    # The MTP draft's LM head over the draft vocabulary.
+    (2048, 32768, "resnorm", "store", 32768),
 ]
 
 
