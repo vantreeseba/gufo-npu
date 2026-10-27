@@ -24,6 +24,16 @@ add_executable(vec_portable_test core/vec_test.cpp)
 target_link_libraries(vec_portable_test PRIVATE gufo_npu_core)
 add_test(NAME vec_portable_test COMMAND vec_portable_test)
 
+add_executable(burst_pool_test core/burst_pool_test.cpp)
+target_link_libraries(burst_pool_test PRIVATE gufo_npu_core)
+add_test(NAME burst_pool_test COMMAND burst_pool_test)
+
+add_executable(simd_test core/simd_test.cpp)
+target_link_libraries(simd_test PRIVATE gufo_npu_core)
+# The vector paths, as the prefill builds them.
+target_compile_options(simd_test PRIVATE -march=x86-64-v3)
+add_test(NAME simd_test COMMAND simd_test)
+
 add_executable(bfp16_test core/bfp16_test.cpp)
 target_link_libraries(bfp16_test PRIVATE gufo_npu_core)
 add_test(NAME bfp16_test COMMAND bfp16_test)
@@ -97,6 +107,13 @@ if(GUFO_NPU_ENABLE_XRT AND GUFO_NPU_BUILD_KERNELS)
            COMMAND q4nx_gemv_chain_test "${CMAKE_BINARY_DIR}/kernels")
   set_tests_properties(q4nx_gemv_chain_test PROPERTIES LABELS npu
                        SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+  add_executable(qwen35_npu_prefill_test models/qwen35/npu_prefill_test.cpp)
+  target_link_libraries(qwen35_npu_prefill_test PRIVATE gufo_npu_qwen35_npu)
+  add_test(NAME qwen35_npu_prefill_test
+           COMMAND qwen35_npu_prefill_test "${CMAKE_BINARY_DIR}/kernels")
+  set_tests_properties(qwen35_npu_prefill_test PROPERTIES LABELS "npu;model"
+                       SKIP_RETURN_CODE 77)
 
   add_executable(bfp16_gemm_test npu/bfp16_gemm_test.cpp)
   target_link_libraries(bfp16_gemm_test PRIVATE gufo_npu_runtime)

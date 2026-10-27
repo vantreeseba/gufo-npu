@@ -35,8 +35,8 @@ int CheckRounding() {
   bfp16::DecodeBlock(block, out);
   for (int i = 0; i < 8; ++i) {
     if (out[i] != want[i]) {
-      std::fprintf(stderr, "FAIL: rounding [%d]: %g -> %g, want %g\n", i,
-                   in[i], out[i], want[i]);
+      std::fprintf(stderr, "FAIL: rounding [%d]: %g -> %g, want %g\n", i, in[i],
+                   out[i], want[i]);
       return 1;
     }
   }

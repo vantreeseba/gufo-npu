@@ -12,8 +12,8 @@
 namespace gufo_npu::npu {
 
 std::string Bfp16GemmSequence(std::size_t m, std::size_t k, std::size_t n) {
-  return "bfp16_gemm_m" + std::to_string(m) + "_k" + std::to_string(k) +
-         "_n" + std::to_string(n);
+  return "bfp16_gemm_m" + std::to_string(m) + "_k" + std::to_string(k) + "_n" +
+         std::to_string(n);
 }
 
 struct GemmRuntime::Impl {
@@ -70,26 +70,36 @@ void GemmBuffer::FromDevice(std::size_t bytes) {
 }
 
 struct Bfp16Gemm::Impl {
-  Sequence* sequence;
+  std::map<std::size_t, Sequence*> sequences;  // by m
   std::size_t w_bytes;
   xrt::bo w;
   std::optional<xrt::run> run;
 
   Impl(GemmRuntime::Impl& rt, const std::vector<std::uint8_t>& packed,
-       std::size_t m, std::size_t dim, std::size_t rows)
-      : sequence(&rt.Get(Bfp16GemmSequence(m, dim, rows))),
-        w_bytes(packed.size()),
-        w(rt.hw.Buffer(w_bytes)) {
+       std::size_t dim, std::size_t rows)
+      : w_bytes(packed.size()), w(rt.hw.Buffer(w_bytes)) {
+    for (const std::size_t m : kGemmChunks) {
+      sequences[m] = &rt.Get(Bfp16GemmSequence(m, dim, rows));
+    }
     std::memcpy(w.map<void*>(), packed.data(), w_bytes);
     w.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  }
+
+  xrt::run Bind(GemmBuffer& a, GemmBuffer& c, std::size_t m) {
+    const auto found = sequences.find(m);
+    if (found == sequences.end()) {
+      throw std::invalid_argument("bfp16 GEMM: no sequence for " +
+                                  std::to_string(m) + " rows");
+    }
+    return found->second->Run({&a.impl().bo, &w, &c.impl().bo});
   }
 };
 
 Bfp16Gemm::Bfp16Gemm(GemmRuntime& runtime, const float* w, std::size_t rows,
-                     std::size_t dim, std::size_t m)
-    : m_(m), dim_(dim), rows_(rows) {
-  impl_ = std::make_unique<Impl>(runtime.impl(),
-                                 bfp16::PackGemmB(w, rows, dim), m, dim, rows);
+                     std::size_t dim)
+    : dim_(dim), rows_(rows) {
+  impl_ = std::make_unique<Impl>(runtime.impl(), bfp16::PackGemmB(w, rows, dim),
+                                 dim, rows);
 }
 
 Bfp16Gemm::~Bfp16Gemm() = default;
@@ -98,14 +108,48 @@ std::size_t Bfp16Gemm::weight_bytes() const {
   return impl_->w_bytes;
 }
 
-void Bfp16Gemm::Run(GemmBuffer& a, GemmBuffer& c) {
-  if (a.size() < a_bytes() || c.size() < c_bytes()) {
+void Bfp16Gemm::Run(GemmBuffer& a, GemmBuffer& c, std::size_t m) {
+  if (a.size() < a_bytes(m) || c.size() < c_bytes(m)) {
     throw std::invalid_argument("bfp16 GEMM: operand buffer too small");
   }
-  impl_->run.emplace(
-      impl_->sequence->Run({&a.impl().bo, &impl_->w, &c.impl().bo}));
+  impl_->run.emplace(impl_->Bind(a, c, m));
   impl_->run->start();
   impl_->run->wait();
+}
+
+struct GemmCall::Impl {
+  xrt::run run;
+};
+
+GemmCall::GemmCall() = default;
+GemmCall::GemmCall(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+GemmCall::~GemmCall() {
+  Wait();
+}
+GemmCall::GemmCall(GemmCall&&) noexcept = default;
+GemmCall& GemmCall::operator=(GemmCall&& other) noexcept {
+  if (this != &other) {
+    Wait();
+    impl_ = std::move(other.impl_);
+  }
+  return *this;
+}
+
+void GemmCall::Wait() {
+  if (impl_) {
+    impl_->run.wait();
+    impl_.reset();
+  }
+}
+
+GemmCall Bfp16Gemm::Start(GemmBuffer& a, GemmBuffer& c, std::size_t m) {
+  if (a.size() < a_bytes(m) || c.size() < c_bytes(m)) {
+    throw std::invalid_argument("bfp16 GEMM: operand buffer too small");
+  }
+  auto call =
+      std::make_unique<GemmCall::Impl>(GemmCall::Impl{impl_->Bind(a, c, m)});
+  call->run.start();
+  return GemmCall(std::move(call));
 }
 
 Bfp16Gemm::Timing Bfp16Gemm::Time(int iterations) {

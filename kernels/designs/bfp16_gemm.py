@@ -41,8 +41,8 @@ M_CHUNK = 1
 # bfp16ebs8: 9 bytes per 8 values.
 B_BYTES_PER_VALUE = flm.BFP16_GROUP_BYTES / flm.BFP16_GROUP
 
-# Prompt tokens per call (rows of A).
-CHUNKS = [256]
+# Prompt tokens per call (rows of A), each a multiple of 256.
+CHUNKS = [256, 512, 1024]
 # Qwen3.5-2B prefill projections as (K, N): DeltaNet input (qkv + z),
 # attention input (q + gate, k, v), mixer output (ssm_out / attn_output),
 # gate + up, down, and the MTP head's eh_proj.

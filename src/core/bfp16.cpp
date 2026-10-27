@@ -34,8 +34,7 @@ std::size_t BlockIndex(std::size_t row, std::size_t k0, std::size_t dim) {
   const std::size_t tb = row % kNTile / kBlock;
   const std::size_t t = row % kBlock;
   const std::size_t k_blocks = dim / kKTile;
-  return ((((cb * k_blocks + kb) * (kKTile / kCtK) + ks) *
-               (kNTile / kBlock) +
+  return ((((cb * k_blocks + kb) * (kKTile / kCtK) + ks) * (kNTile / kBlock) +
            tb) *
               kColA +
           i) *
@@ -88,8 +87,7 @@ void EncodeBlock(const float* in, std::uint8_t* out) {
 void DecodeBlock(const std::uint8_t* in, float* out) {
   const double scale = std::ldexp(1.0, static_cast<int>(in[0]) - 127 - 6);
   for (std::size_t i = 0; i < kBlock; ++i) {
-    out[i] = static_cast<float>(
-        static_cast<std::int8_t>(in[1 + i]) * scale);
+    out[i] = static_cast<float>(static_cast<std::int8_t>(in[1 + i]) * scale);
   }
 }
 

@@ -90,6 +90,10 @@ add_library(gufo_npu_qwen35_npu STATIC src/models/qwen35/npu_decoder.cpp
                                        src/models/qwen35/q4nx_projections.cpp)
 target_link_libraries(gufo_npu_qwen35_npu PUBLIC gufo_npu_qwen35
                       gufo_npu_runtime)
+# Prompt processing on the NPU (GEMMs) with the mixers batched on the CPU.
+target_sources(gufo_npu_qwen35_npu PRIVATE src/models/qwen35/npu_prefill.cpp)
+set_source_files_properties(src/models/qwen35/npu_prefill.cpp PROPERTIES
+  COMPILE_OPTIONS "-march=x86-64-v3;-O3")
 
 add_executable(gufo-npu src/cli/main.cpp)
 target_link_libraries(gufo-npu PRIVATE gufo_npu_qwen35_npu)

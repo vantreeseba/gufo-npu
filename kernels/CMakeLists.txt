@@ -37,7 +37,19 @@ set(bfp16_gemm_OUTPUTS
   bfp16_gemm_m256_k2048_n2048.insts.elf
   bfp16_gemm_m256_k2048_n12288.insts.elf
   bfp16_gemm_m256_k6144_n2048.insts.elf
-  bfp16_gemm_m256_k4096_n2048.insts.elf)
+  bfp16_gemm_m256_k4096_n2048.insts.elf
+  bfp16_gemm_m512_k2048_n8192.insts.elf
+  bfp16_gemm_m512_k2048_n5120.insts.elf
+  bfp16_gemm_m512_k2048_n2048.insts.elf
+  bfp16_gemm_m512_k2048_n12288.insts.elf
+  bfp16_gemm_m512_k6144_n2048.insts.elf
+  bfp16_gemm_m512_k4096_n2048.insts.elf
+  bfp16_gemm_m1024_k2048_n8192.insts.elf
+  bfp16_gemm_m1024_k2048_n5120.insts.elf
+  bfp16_gemm_m1024_k2048_n2048.insts.elf
+  bfp16_gemm_m1024_k2048_n12288.insts.elf
+  bfp16_gemm_m1024_k6144_n2048.insts.elf
+  bfp16_gemm_m1024_k4096_n2048.insts.elf)
 
 set(kernel_outputs)
 foreach(design IN LISTS GUFO_NPU_KERNEL_DESIGNS)
