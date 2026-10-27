@@ -49,7 +49,12 @@ runs: 43.5, 43.6 and 43.4 ms per token, **23.0 tok/s** at short context.
   attention inputs 10.1 ms. The rest is the CPU mixers and routing.
 - With one thread per hardware thread the same step took 635 ms: every
   `SpinPool::Run` waits for all its workers, and an oversubscribed CPU parks
-  one of them for a time slice (~0.7 ms) per call.
+  one of them for a time slice (~0.7 ms) per call. The pools now size
+  themselves from the CPUs the process may use (affinity mask and cgroup
+  quota, `src/core/cpus.hpp`), each at most half of them: limited to 8 CPUs
+  (`docker --cpuset-cpus=0-7` or `--cpus=8`) the decoder test runs at
+  9.3 tok/s instead of falling off that cliff, and the 2B NPU decode keeps
+  its 7 mixer workers (sky prompt, no draft: 39.37, 39.13, 39.16 tok/s).
 - The CPU reads these weights at ~70 GB/s averaged over the step, more than
   the NPU's read bandwidth (52–56 GB/s in the plan's research; ~40 GB/s
   each way in `bench bandwidth` below).
