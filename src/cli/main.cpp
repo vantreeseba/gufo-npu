@@ -27,6 +27,8 @@ constexpr char kUsage[] =
     "                           run the smoke kernel and time dispatches\n"
     "  bench dispatch [--rounds N] [--depths 1,8,32] [--kernels DIR]\n"
     "                           per-dispatch cost: sync, async and runlist\n"
+    "  bench bandwidth [--iters N] [--kernels DIR]\n"
+    "                           DDR bandwidth through all NPU columns\n"
     "  version                  print the version\n";
 
 void PrintChecks(const std::vector<Check>& checks) {
@@ -151,6 +153,33 @@ int BenchDispatch(const std::vector<std::string_view>& args) {
   return 0;
 }
 
+int BenchBandwidth(const std::vector<std::string_view>& args) {
+  int iterations = 20;
+  std::optional<std::string> kernels;
+  for (std::size_t i = 0; i < args.size(); ++i) {
+    if (args[i] == "--iters" && i + 1 < args.size()) {
+      iterations = std::atoi(std::string(args[++i]).c_str());
+    } else if (args[i] == "--kernels" && i + 1 < args.size()) {
+      kernels = std::string(args[++i]);
+    } else {
+      std::cerr << kUsage;
+      return 2;
+    }
+  }
+  const auto result =
+      gufo_npu::npu::BenchBandwidth(KernelDir(kernels), iterations);
+  if (!result.ok) {
+    std::fprintf(stderr, "bench bandwidth: FAIL: %s\n", result.error.c_str());
+    return 1;
+  }
+  std::printf(
+      "bandwidth: %.1f MiB per run (read + write), mean %.0f us; "
+      "mean %.1f GB/s, best %.1f GB/s\n",
+      static_cast<double>(result.bytes_per_run) / (1 << 20), result.mean_us,
+      result.mean_gb_s, result.best_gb_s);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -172,6 +201,9 @@ int main(int argc, char** argv) {
   }
   if (args[0] == "bench" && !rest.empty() && rest[0] == "dispatch") {
     return BenchDispatch({rest.begin() + 1, rest.end()});
+  }
+  if (args[0] == "bench" && !rest.empty() && rest[0] == "bandwidth") {
+    return BenchBandwidth({rest.begin() + 1, rest.end()});
   }
   std::cerr << "unknown command: " << args[0] << "\n" << kUsage;
   return 2;

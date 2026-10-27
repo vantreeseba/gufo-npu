@@ -22,4 +22,11 @@ DispatchBenchResult BenchDispatch(const std::filesystem::path& /*kernel_dir*/,
   return {.error = "this build has no XRT support"};
 }
 
+BandwidthResult BenchBandwidth(const std::filesystem::path& /*kernel_dir*/,
+                               int /*iterations*/) {
+  BandwidthResult result;
+  result.error = "this build has no XRT support";
+  return result;
+}
+
 }  // namespace gufo_npu::npu

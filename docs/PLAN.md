@@ -126,3 +126,73 @@ Teacher-forced logits are checked against HF transformers / llama.cpp dumps (see
 3. The same firmware hardware-context failure as FLM #705 could hit us too. We'll need your firmware/driver versions early.
 4. Pinning all weights (~20 GB Q4) needs memlock unlimited.
 5. When you provide machine access: SSH details, kernel/firmware/XRT versions, and whether it can host a GitHub self-hosted runner.
+
+## Plan updates (2026-10-27)
+
+Measured and researched since the plan was approved; see
+`docs/models/qwen3.6-35b-a3b/BENCHMARKS.md` and
+`docs/research/STRIX-HALO-NPU.md`.
+
+**Second model: Qwen3.5-2B** (fast side-task model and bring-up target; see
+the scope change below: it is now the MVP). Same
+family as the 35B: 24 layers in the same 3 DeltaNet : 1 gated attention
+pattern, hidden 2048, head dim 256, 248k vocab and tokenizer, tied
+embeddings, one MTP layer. It is dense, so it exercises everything except
+routing and experts. Est. ~1.1 GB read per token, ~45–50 tok/s NPU ceiling.
+
+- Phase 2 (CPU reference) and Phase 3 (NPU decode) bring up the 2B first,
+  then add router + experts for the 35B. Kernel shapes are shared where
+  hidden = 2048.
+- Docs under `docs/models/qwen3.5-2b/`; FLM baseline measured the same way.
+
+**Changes from research and measurements**
+
+- Dispatch: ~66 µs sync vs ~20 µs chained (measured). Fuse to ~2 dispatches
+  per layer using IRON's `flm.DecodeLayer` as the template, chain them in a
+  runlist, keep runtime-parameter words few (~2 µs each).
+- Expert selection: confirmed workable with one xclbin and mlir-aie
+  `DispatchTime` scalars for the 8 expert offsets (host builds the sequence
+  after top-8). FLM's pack stores each expert contiguously, so one linear DMA
+  per expert.
+- Bandwidth: weight layout matters ~5× (contiguous 128 KB runs vs strided).
+  Pre-pack weights at load/convert time; never stream strided.
+- MTP: FLM's Qwen3.6 pack has **no MTP tensors**, so FLM cannot speculate.
+  The GGUF path (which carries MTP) is the route to MTP speculative decode;
+  raise its priority.
+- LM head: FLM keeps it 8-bit (540 MB/token for the 35B, ~16% of reads at
+  4-bit). Try 4-bit with a quality check.
+- Power: keep one long-lived hardware context without QoS hints (max DPM),
+  and runtime PM `on`.
+- Greenfield kernels: router/top-k, MoE expert FFN, Gated DeltaNet. IRON
+  reusables: `GEMM` + `DequantBFP`, `PrefillAttention`, `LMHead`.
+- Next measurements: read-only NPU bandwidth; THP vs no-THP weight buffers;
+  NPU/iGPU contention.
+
+## Scope change (2026-10-27): MVP is Qwen3.5-2B
+
+Decided with the user: the **first pass (MVP) is Qwen3.5-2B only**, end to end
+(CPU reference, NPU decode, NPU prefill, server). **Qwen3.6-35B-A3B is the
+second pass**: it adds the router, top-k and MoE expert kernels, expert
+selection by `DispatchTime` offsets, and the MoE prefill path on top of the
+shared Qwen3.5 layers. Sections above that name the 35B as the MVP now
+describe the second pass.
+
+MVP targets (Qwen3.5-2B, same machine, against FLM's measured 28.0 tok/s
+decode and 0.60 s short-prompt TTFT; see `docs/models/qwen3.5-2b/BENCHMARKS.md`):
+
+- decode ≥ 38 tok/s at 1k context (ceiling ~45–50)
+- TTFT < 0.3 s for short prompts
+- prefill ≥ FLM's (~590 tok/s at 1k, ~1,390 at 8.5k)
+- output quality: teacher-forced greedy-argmax match against the CPU
+  reference and HF transformers
+
+MVP phases:
+
+2. CPU reference for Qwen3.5-2B (GGUF first, since it carries the MTP head;
+   then the FLM pack).
+3. NPU decode: int4 GEMV, Gated DeltaNet step, gated GQA decode attention,
+   RMSNorm/RoPE/gating, LM head; ~2 fused dispatches per layer, chained.
+4. NPU prefill: GEMM + DequantBFP projections, chunked DeltaNet, IRON
+   `PrefillAttention`.
+5. `gufo-npu serve` for the 2B.
+6. Then: MTP speculative decode for the 2B, and the 35B second pass.

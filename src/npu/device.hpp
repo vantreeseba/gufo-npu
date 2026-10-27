@@ -52,4 +52,18 @@ struct DispatchBenchResult {
 DispatchBenchResult BenchDispatch(const std::filesystem::path& kernel_dir,
                                   int rounds, const std::vector<int>& depths);
 
+// DDR bandwidth seen by the NPU: copies a 64 MiB buffer through all eight
+// columns (read + write) and reports GB/s over both directions.
+struct BandwidthResult {
+  bool ok = false;
+  std::string error;
+  std::size_t bytes_per_run = 0;
+  double mean_us = 0;
+  double mean_gb_s = 0;
+  double best_gb_s = 0;
+};
+
+BandwidthResult BenchBandwidth(const std::filesystem::path& kernel_dir,
+                               int iterations);
+
 }  // namespace gufo_npu::npu

@@ -1,7 +1,8 @@
 # AGENTS.md
 
 gufo-npu is an open inference engine for the AMD XDNA2 NPU in Strix Halo
-(Ryzen AI MAX+ 395), for one model: Qwen3.6-35B-A3B. The roadmap is in
+(Ryzen AI MAX+ 395). The MVP runs Qwen3.5-2B; Qwen3.6-35B-A3B (MoE) is the
+second pass. The roadmap is in
 [docs/PLAN.md](docs/PLAN.md). Conventions follow
 [gufo](https://github.com/gufo-org/gufo).
 

@@ -7,7 +7,7 @@ set(GUFO_NPU_KERNEL_DEVICE "npu2" CACHE STRING "mlir-aie device family")
 set(GUFO_NPU_KERNEL_OUT "${CMAKE_BINARY_DIR}/kernels")
 
 # One entry per design in designs/<name>.py.
-set(GUFO_NPU_KERNEL_DESIGNS smoke_add_one)
+set(GUFO_NPU_KERNEL_DESIGNS smoke_add_one bw_memcpy)
 
 set(kernel_outputs)
 foreach(design IN LISTS GUFO_NPU_KERNEL_DESIGNS)
