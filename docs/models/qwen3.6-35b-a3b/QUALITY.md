@@ -148,6 +148,69 @@ logits as all at once (rel. err 0). RoPE starting at the token's position
 or at the hidden state's gives identical drafts (only position differences
 matter inside the MTP block's own cache).
 
+## q4nx requantization
+
+What the NPU's q4nx format (`src/core/q4nx.hpp`: 4.625 bits per weight,
+4-bit codes, 8-bit sub-scale and sub-minimum per 32, bf16 d and dmin per row
+and 256 inputs) costs when every matrix is stored in it.
+`tests/models/qwen36/q4nx_requant_test.cpp` (label `model`, same variables)
+runs the fp32 CPU decoder teacher forced over the four oracle prompts (chat,
+code, prose and a 230-token prose passage; 301 positions) with four weight
+sets:
+
+- **(a)** as stored in the GGUF;
+- **(d)** every non-expert matrix through q4nx (DeltaNet and attention
+  projections, shared experts; all Q8_0 in the GGUF), LM head as stored;
+- **(b)** (d) plus the LM head (Q8_0) through q4nx;
+- **(c)** (b) plus the routed experts: Q4_K gate/up keep their codes (d and
+  dmin round to bf16), Q5_K/Q6_K down projections (and layer 39's Q5_K
+  gate/up) requantize.
+
+Matrices through q4nx are packed with `q4nx::PackRows` and multiplied with
+`q4nx::Gemv`, i.e. the weights `q4nx::Unpack` returns. Q4_K expert rows are
+unpacked on the fly by the same rule, checked bit for bit against
+`q4nx::Unpack(q4nx::PackRows(...))` first. q4nx works per row and per 256
+inputs, so how the NPU stacks or orders rows does not change any weight. F32
+matrices (router, DeltaNet alpha/beta) and the embedding lookup stay as
+stored. KL is KL(softmax(a) ‖ softmax(set)) per position, in nats.
+2026-10-27, deterministic across two runs:
+
+| Set | Packed | Top-1 vs llama.cpp | Top-1 vs reference | Top-1 vs (a) | First top-1 change vs (a): chat / code / prose / long | KL vs (a): mean | max | Logits rel. L2 vs reference (per prompt) |
+|---|---|---|---|---|---|---|---|---|
+| (a) | — | 296/301 (98.3%) | 299/301 (99.3%) | 301/301 | — | 0 | 0 | 1.3e-4 – 1.5e-2 |
+| (d) | 0.82 GB | 272/301 (90.4%) | 275/301 (91.4%) | 277/301 (92.0%) | none / 0 / 4 / 35 | 0.041 | 0.42 | 0.09 – 0.17 |
+| (b) | 1.11 GB | 269/301 (89.4%) | 272/301 (90.4%) | 274/301 (91.0%) | none / 0 / 6 / 35 | 0.047 | 0.47 | 0.11 – 0.18 |
+| (c) | 7.62 GB¹ | 260/301 (86.4%) | 266/301 (88.4%) | 265/301 (88.0%) | none / 0 / 4 / 32 | 0.048 | 0.40 | 0.12 – 0.18 |
+
+1. Only the requantized experts are packed by the test (Q4_K experts are
+   read from the GGUF); all of (c) in q4nx is ~20.5 GB.
+
+For scale: llama.cpp against (a), which differs only by its 8-bit
+activation rounding, has KL mean 0.006 (max 0.50) and 98.3% top-1. The
+reference's 2B UD-Q4_K_XL GGUF against BF16 HF agrees on 90% of top-1
+(66/73).
+
+Greedy decoding of the chat prompt, 64 tokens: (c) matches (a) for the first
+38 tokens, then words the same plan differently (38/64 equal).
+
+- (a): `Thinking Process:\n\n1.  **Deconstruct the request:**\n    *   Topic:
+  The moon.\n    *   Constraint: One sentence.\n\n2.  **Brainstorming
+  angles/facts about the moon:**\n    *   It's Earth's only natural
+  satellite.\n    *   It reflects`
+- (c): `Thinking Process:\n\n1.  **Deconstruct the request:**\n    *   Topic:
+  The moon.\n    *   Constraint: One sentence.\n\n2.  **Brainstorm
+  ideas/facts about the moon:**\n    *   It's Earth's only natural
+  satellite.\n    *   It affects t`
+
+Reading: almost all of the loss comes from requantizing the 8-bit
+non-expert matrices (d): 8% of top-1 choices change and KL rises ~7× over
+llama.cpp's own noise. The LM head adds 1 point, the Q5_K/Q6_K experts 3
+more. Keeping the non-expert matrices at 8 bits on the NPU (an 8-bit GEMV
+variant; 1.9 B weights, ~2 GB at Q8_0 against 1.1 GB in q4nx) would recover
+most of it; the experts, which dominate the bytes, can stay q4nx. Peak RSS
+of the test 26.6 GB, of which 8.2 GB anonymous (the packed matrices) and the
+rest page cache of the memory-mapped GGUF; ~7 minutes.
+
 ## GGUF load
 
 `tests/models/qwen36/gguf_load_test.cpp` (label `model`): ReadConfig gives
