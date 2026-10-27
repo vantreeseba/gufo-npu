@@ -43,6 +43,9 @@ constexpr Variant kVariants[] = {
     {2048, 12288, Prologue::kResNorm, Epilogue::kSwiGlu},
     {6144, 2048, Prologue::kAct, Epilogue::kStore},
     {2048, 248320, Prologue::kResNorm, Epilogue::kStore},
+    // One MoE expert (Qwen3.6-35B-A3B): gate + up, down.
+    {2048, 1024, Prologue::kResNorm, Epilogue::kSwiGlu},
+    {512, 2048, Prologue::kAct, Epilogue::kStore},
 };
 
 float Bf16(float v) {

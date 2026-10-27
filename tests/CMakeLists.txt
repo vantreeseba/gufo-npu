@@ -116,6 +116,13 @@ if(GUFO_NPU_ENABLE_XRT AND GUFO_NPU_BUILD_KERNELS)
   set_tests_properties(qwen35_npu_decode_test PROPERTIES LABELS "npu;model"
                        SKIP_RETURN_CODE 77)
 
+  add_executable(qwen36_npu_decode_test models/qwen36/npu_decode_test.cpp)
+  target_link_libraries(qwen36_npu_decode_test PRIVATE gufo_npu_qwen35_npu)
+  add_test(NAME qwen36_npu_decode_test
+           COMMAND qwen36_npu_decode_test "${CMAKE_BINARY_DIR}/kernels")
+  set_tests_properties(qwen36_npu_decode_test PROPERTIES LABELS "npu;model"
+                       SKIP_RETURN_CODE 77 TIMEOUT 3600)
+
   add_executable(q4nx_gemv_test npu/q4nx_gemv_test.cpp)
   target_link_libraries(q4nx_gemv_test PRIVATE gufo_npu_runtime)
   add_test(NAME q4nx_gemv_test
@@ -123,10 +130,24 @@ if(GUFO_NPU_ENABLE_XRT AND GUFO_NPU_BUILD_KERNELS)
   set_tests_properties(q4nx_gemv_test PROPERTIES LABELS npu
                        SKIP_RETURN_CODE 77)
 
+  add_executable(q4nx_moe_gather_test npu/q4nx_moe_gather_test.cpp)
+  target_link_libraries(q4nx_moe_gather_test PRIVATE gufo_npu_runtime)
+  add_test(NAME q4nx_moe_gather_test
+           COMMAND q4nx_moe_gather_test "${CMAKE_BINARY_DIR}/kernels")
+  set_tests_properties(q4nx_moe_gather_test PROPERTIES LABELS npu
+                       SKIP_RETURN_CODE 77)
+
   add_executable(q4nx_gemv_chain_test npu/q4nx_gemv_chain_test.cpp)
   target_link_libraries(q4nx_gemv_chain_test PRIVATE gufo_npu_runtime)
   add_test(NAME q4nx_gemv_chain_test
            COMMAND q4nx_gemv_chain_test "${CMAKE_BINARY_DIR}/kernels")
   set_tests_properties(q4nx_gemv_chain_test PROPERTIES LABELS npu
+                       SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+  add_executable(q4nx_moe_chain_test npu/q4nx_moe_chain_test.cpp)
+  target_link_libraries(q4nx_moe_chain_test PRIVATE gufo_npu_runtime)
+  add_test(NAME q4nx_moe_chain_test
+           COMMAND q4nx_moe_chain_test "${CMAKE_BINARY_DIR}/kernels")
+  set_tests_properties(q4nx_moe_chain_test PROPERTIES LABELS npu
                        SKIP_RETURN_CODE 77 TIMEOUT 600)
 endif()

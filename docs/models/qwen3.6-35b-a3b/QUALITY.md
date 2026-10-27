@@ -5,8 +5,8 @@ Planned contracts (see [the plan](../../PLAN.md)):
 | Check | Tolerance | State |
 |---|---|---|
 | CPU reference vs llama.cpp (CPU), teacher-forced logits | see below | enforced |
-| Each NPU op vs CPU reference | relative error < 1e-2 | |
-| NPU model vs CPU reference, teacher-forced | greedy argmax match | |
+| Each NPU op vs CPU reference | relative error < 1e-2 | enforced: MoE gathers 6.1e-4 (1 token), 8.6e-4 (2) |
+| NPU decode vs CPU decoder over the same q4nx weights, teacher-forced, routing followed | logits rel. L2 < 1e-2 per prompt, argmax ≥ 98%, routing differences at near ties only | enforced (below) |
 | Prefill vs one-token decode | identical next token | reference: identical logits |
 | CPU decoder vs reference | see below | enforced |
 | MTP head (reference) vs main model's top-1 | ≥ 50% of drafts | enforced (69%) |
@@ -223,6 +223,60 @@ variant; 1.9 B weights, ~2 GB at Q8_0 against 1.1 GB in q4nx) would recover
 most of it; the experts, which dominate the bytes, can stay q4nx. Peak RSS
 of the test 26.6 GB, of which 8.2 GB anonymous (the packed matrices) and the
 rest page cache of the memory-mapped GGUF; ~7 minutes.
+
+## NPU decode
+
+`tests/models/qwen36/npu_decode_test.cpp` (labels `npu`, `model`; same
+variables plus the kernel directory): `NpuDecoder` (every matrix in q4nx on
+the NPU, experts through `npu::Q4nxGather`, router and mixers on the CPU)
+against the fp32 CPU `Decoder` over `Q4nxProjections`, the same q4nx weights
+(Q4_K experts unpacked by q4nx's rule, everything else packed with
+`q4nx::PackRows`, router and DeltaNet alpha/beta in fp32 as on the NPU
+path). Teacher forced over the four oracle prompts (301 positions),
+2026-10-27.
+
+The NPU rounds every call's input to bf16, so where a layer's 8th and 9th
+experts are nearly tied it can route differently from the CPU, and both
+decodes then carry that on. In a first version of the test, which let both
+route on their own, that happened at position 0 or 1 in three of the four
+prompts (gaps 3.2e-4 to 2.7e-2), so "agree until the first routing
+difference" checked almost nothing. The test now makes the CPU follow the
+NPU's routing (the other experts' router logits drop 64 below the lowest
+chosen one, which leaves the chosen experts' renormalized weights exactly as
+the CPU computes them), compares the logits at every position, and checks
+separately that each routing the CPU would have made differently was a near
+tie in the CPU's own logits: the gap is 1 − exp(l_x − l_y) for the
+lowest-scored expert only the NPU chose and the highest-scored one only the
+CPU's top 8 had.
+
+| Prompt | Tokens | Logits rel. L2 (worst position) | Argmax vs CPU | Routings unlike the CPU's | Largest gap | NPU top-1 vs llama.cpp |
+|---|---|---|---|---|---|---|
+| chat | 17 | 4.4e-03 (7.4e-03) | 17/17 | 9 of 680 | 5.0e-03 | 16/17 |
+| code | 15 | 5.9e-03 (1.4e-02) | 15/15 | 8 of 600 | 2.7e-02 | 14/15 |
+| prose | 39 | 3.4e-03 (5.8e-03) | 39/39 | 24 of 1,560 | 3.6e-03 | 34/39 |
+| long | 230 | 3.8e-03 (6.7e-03) | 230/230 | 129 of 9,200 | 6.3e-03 | 199/230 |
+| all | 301 | | 301/301 | 170 of 12,040 (1.4%) | 2.7e-02 | 263/301 (87.4%) |
+
+Thresholds:
+
+| Check | Pass | Measured | Why |
+|---|---|---|---|
+| Logits rel. L2, per prompt | < 1e-2 | ≤ 5.9e-3 | the 2B's NPU bound; bf16 rounding of each call's input |
+| Argmax vs CPU, all prompts | ≥ 98% | 301/301 | |
+| Largest routing gap | < 5e-2 | 2.7e-2 | a misrouted expert lands far from the top 8 (gaps of order 1); bf16 noise moves router logits by ~1e-2 |
+
+Letting both route on their own (the first version), the NPU and the CPU
+still agreed on top-1 at 294/301 positions; the worst position's logits
+were 4–12% apart, depending on the prompt. Against llama.cpp, top-1 agrees at 263/301 positions on
+the NPU and at 260/301 on the CPU over the same weights. That matches set
+(c) above: requantizing to q4nx sets the quality; the NPU adds nothing
+measurable on top.
+
+Determinism: `q4nx_moe_chain_test` (label `npu`) runs one layer's calls as
+the decoder wires them (input and output projections, then the two gathers
+and the next input projection, re-pointed between submissions at four
+expert selections) 20,000 times; every output is bit-identical to the first
+run with the same selection.
 
 ## GGUF load
 

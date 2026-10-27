@@ -29,6 +29,15 @@ Output stages (token t at t * y_stride in Y):
   store    the rows' fp32 values.
   swiglu   each core's 32 rows are 16 gate rows then their 16 up rows; Y gets
            silu(gate) * up as bf16, compact (y_stride in fp32 words).
+  swiglu_scaled  swiglu times a per-round, per-token scale (an MoE router
+           weight) from RTP words RTP_SCALES + round * TOKENS + token.
+
+MoE gather variants read their weights from host-chosen places in W, one DMA
+task per segment, whose DDR offsets (and scales) the host rewrites in the
+instruction stream before each call (docs/research/NPU-MOE.md):
+  rounds   round r is expert r's gate + up (1024 rows), anywhere in W.
+  k        the K dimension is the experts' 512-wide inputs back to back; each
+           (round, column) slice is gathered from every expert's down matrix.
 
 Adapted from IRON's iron.operators.flm.lm_head design (Apache-2.0).
 Runtime arguments: X, W (q4nx bytes as uint32), Y (fp32), R (fp32).
@@ -68,15 +77,34 @@ RMS_EPS = 1e-6
 # With per-round drains (SwiGLU), the sequence finishes each round's group
 # DEPTH rounds later, which frees its BDs for reuse (a shim tile holds 16).
 DEPTH = 2
+# MoE gathers: segment groups in flight before the oldest is awaited, and
+# down segments per group (only a group's last fill per column is awaited).
+# A shim tile has 16 BDs: (GATHER_DEPTH + 1) * GATHER_GROUP + 1 <= 16.
+GATHER_DEPTH = 3
+GATHER_GROUP = 3
+# Gate + up gathers: a round is a fill and a drain per column, plus the token
+# and residual BDs: (UP_DEPTH + 1) * UP_GROUP * 2 + 2 <= 16.
+UP_DEPTH = 1
+UP_GROUP = 3
+EXPERT_FFN = 512  # an MoE expert's width (Qwen3.6-35B-A3B)
+MAX_EXPERTS = MAX_DIM // EXPERT_FFN  # experts a down gather can concatenate
+RTP_SCALES = 7  # first RTP word of the swiglu_scaled scales
+RTP_WORDS = RTP_SCALES + MAX_EXPERTS * TOKENS
+# Placeholder RTP values for the scales, which the host finds and rewrites:
+# NaN payloads that no other instruction word carries.
+SCALE_SENTINEL = 0x7FA50000
 STACK_SIZE = 8 * 1024
 
 KERNEL_SOURCE = Path(__file__).resolve().parent.parent / "aie" / "q4nx_gemv.cc"
 XCLBIN = "q4nx_gemv"
 
 bf16 = np.dtype[bfloat16]
+# k blocks, rounds, input stage, output stage, residual pieces, core row,
+# tokens, then the swiglu_scaled scales.
+RTP_TY = np.ndarray[(RTP_WORDS,), np.dtype[np.int32]]
 
 PROLOGUES = {"plain": 0, "resnorm": 1, "act": 2}
-EPILOGUES = {"store": 0, "swiglu": 1}
+EPILOGUES = {"store": 0, "swiglu": 1, "swiglu_scaled": 2}
 
 # Decode calls of Qwen3.5-2B as (dim, padded rows, input, output, Y token
 # stride): mixer output (into the next resnorm's D slots), the MTP head's
@@ -94,23 +122,49 @@ VARIANTS = [
     (2048, 248832, "resnorm", "store", 248832),
     # The MTP draft's LM head over the draft vocabulary.
     (2048, 32768, "resnorm", "store", 32768),
+    # Qwen3.6-35B-A3B MoE, one expert per call: gate + up and down.
+    (2048, 1024, "resnorm", "swiglu", MAX_DIM // 2),
+    (512, 2048, "act", "store", SLOT),
+    # Qwen3.6-35B-A3B input projections: DeltaNet (qkv + z), attention
+    # (q + gate, k, v). Its mixer outputs (4096 -> 2048) and LM head
+    # (248,320 rows) use the shapes above.
+    (2048, 12288, "resnorm", "store", 12288),
+    (2048, 9216, "resnorm", "store", 9216),
+]
+
+# MoE gathers as (dim, rows, input, output, Y token stride, gather, experts):
+# 9 experts (8 routed and the shared one) per call.
+MOE_VARIANTS = [
+    (2048, 9 * 1024, "resnorm", "swiglu_scaled", MAX_DIM // 2, "rounds", 9),
+    (9 * EXPERT_FFN, 2048, "act", "store", SLOT, "k", 9),
 ]
 
 
-def sequence_name(dim, rows, prologue, epilogue, tokens) -> str:
-    return f"{XCLBIN}_k{dim}_n{rows}_{prologue}_{epilogue}_t{tokens}"
+def sequence_name(dim, rows, prologue, epilogue, tokens, gather="", experts=0):
+    moe = f"_{gather}{experts}" if gather else ""
+    return f"{XCLBIN}_k{dim}_n{rows}_{prologue}_{epilogue}{moe}_t{tokens}"
 
 
 def _sequences():
-    for dim, rows, prologue, epilogue, y_stride in VARIANTS:
+    for variant in VARIANTS + MOE_VARIANTS:
+        dim, rows, prologue, epilogue, y_stride, *moe = variant
+        gather, experts = moe if moe else ("", 0)
         for tokens in range(1, TOKENS + 1):
-            yield (dim, rows, prologue, epilogue, y_stride, tokens)
+            yield (dim, rows, prologue, epilogue, y_stride, tokens, gather, experts)
 
 
-# build.py checks these: the xclbin, then one instruction ELF per variant.
+# build.py checks these: the xclbin, then per variant an instruction ELF and
+# the raw instruction words (the host's instruction-buffer flow).
 OUTPUTS = [f"{XCLBIN}.xclbin"] + [
-    f"{sequence_name(d, n, p, e, t)}.insts.elf" for d, n, p, e, _, t in _sequences()
+    f"{sequence_name(d, n, p, e, t, g, x)}.insts.{suffix}"
+    for d, n, p, e, _, t, g, x in _sequences()
+    for suffix in ("elf", "bin")
 ]
+
+
+def _chunk(words):
+    """The longest run (at most 1024 words, the BD inner size) dividing words."""
+    return max(c for c in range(1, 1025) if words % c == 0)
 
 
 def _kernels():
@@ -143,7 +197,7 @@ def _kernels():
     residual = bind("gemv_residual", [x_ty, np.int32, np.int32, np.int32])
     residual_out = bind("gemv_residual_out", [y_ty, x_ty, np.int32, np.int32])
     zero = bind("gemv_zero", [y_acc_ty])
-    store = bind("gemv_store", [y_ty, y_acc_ty, np.int32])
+    store = bind("gemv_store", [y_ty, y_acc_ty, RTP_TY, np.int32])
     kernels = dict(
         block=block,
         prep=prep,
@@ -155,10 +209,16 @@ def _kernels():
     return kernels, (x_ty, sums_ty, y_acc_ty, y_ty, w_blk_ty, res_ty)
 
 
-def gemv_program(dev, dim, n_out, prologue, epilogue, y_stride, tokens):
+def gemv_program(
+    dev, dim, n_out, prologue, epilogue, y_stride, tokens, gather="", experts=0
+):
     """The design with the instruction sequence for one variant."""
     if dim % K_TILE or dim > MAX_DIM or n_out % OUT_PER_ROUND:
         raise ValueError(f"unsupported shape dim={dim} n_out={n_out}")
+    if gather == "rounds" and n_out != experts * OUT_PER_ROUND:
+        raise ValueError("a rounds gather has one expert per round")
+    if gather == "k" and dim != experts * EXPERT_FFN:
+        raise ValueError("a k gather concatenates the experts' inputs")
     if prologue == "resnorm" and dim != HIDDEN:
         raise ValueError("resnorm needs dim == HIDDEN")
     rounds = n_out // OUT_PER_ROUND
@@ -166,23 +226,21 @@ def gemv_program(dev, dim, n_out, prologue, epilogue, y_stride, tokens):
     k, types = _kernels()
     x_ty, sums_ty, y_acc_ty, y_blk_ty, w_blk_ty, res_ty = types
     (w_blk,) = w_blk_ty.__args__[0]
-    # k blocks, rounds, input stage, output stage, residual pieces, core row,
-    # tokens.
-    rtp_ty = np.ndarray[(7,), np.dtype[np.int32]]
+    rtp_ty = RTP_TY
 
     w_col_ty = np.ndarray[(ROWS, w_blk), bf16]
     y_col_ty = np.ndarray[(ROWS, TOKENS * M_TILE), np.dtype[np.float32]]
     shims = [Tile(j, 0) for j in range(COLS)]
 
     def body(x, w_in, y_out, k_zero, k_block, k_store, y_acc, sums, rtp):
-        for _ in range_(rtp[1]):
+        for rnd in range_(rtp[1]):
             k_zero(y_acc)
             for kb in range_(rtp[0]):
                 w = w_in.acquire(1)
                 k_block(w, x, y_acc, sums, kb, rtp[2], rtp[6])
                 w_in.release(1)
             y = y_out.acquire(1)
-            k_store(y, y_acc, rtp[3])
+            k_store(y, y_acc, rtp, rnd)
             y_out.release(1)
 
     # The sequence writes the RTP before it sends the token, so it is current
@@ -225,7 +283,7 @@ def gemv_program(dev, dim, n_out, prologue, epilogue, y_stride, tokens):
     w_words = n_out // M_TILE * (dim // K_TILE) * BLOCK_BYTES // 4
     words_per_col = w_words // (rounds * COLS)
     w_l3_ty = np.ndarray[(w_words,), np.dtype[np.uint32]]
-    if epilogue == "swiglu":
+    if epilogue.startswith("swiglu"):
         # Token t's compact bf16 values at t * y_stride words; the padding of
         # each core's output (24 of every 32 words) goes past both tokens.
         pad_stride = TOKENS * y_stride
@@ -274,8 +332,7 @@ def gemv_program(dev, dim, n_out, prologue, epilogue, y_stride, tokens):
     # round r starts at (r * COLS + c) * words_per_col. The slice is split
     # into CHUNK-word runs to fit the BD's inner size field. A short
     # instruction stream also keeps the LM head's (243 rounds) small.
-    chunk = 1024
-    assert words_per_col % chunk == 0
+    chunk = _chunk(words_per_col)
     w_taps = [
         TensorAccessPattern(
             (1, rounds * COLS * words_per_col),
@@ -306,7 +363,7 @@ def gemv_program(dev, dim, n_out, prologue, epilogue, y_stride, tokens):
             [COLS * ROWS * M_TILE, M_TILE, y_stride, 1],
         )
 
-    if epilogue == "swiglu":
+    if epilogue.startswith("swiglu"):
         y_taps = [y_tap(i) for i in range(rounds * COLS)]
     else:
         y_taps = [y_col_tap(col) for col in range(COLS)]
@@ -320,6 +377,74 @@ def gemv_program(dev, dim, n_out, prologue, epilogue, y_stride, tokens):
         [M_TILE, HIDDEN // ROWS, SLOT, 1],
     )
 
+    # MoE gathers: one fill per segment and column, at a placeholder offset
+    # (segments back to back) that the host rewrites per call. Every fill is
+    # awaited, in queue order per channel, so its BD can be reused.
+    if gather == "rounds":
+        seg_words = words_per_col  # one expert's slice for one column
+    elif gather == "k":
+        seg_words = words_per_col // experts  # one expert's (round, col) part
+    else:
+        seg_words = words_per_col
+    seg_chunk = _chunk(seg_words)
+
+    def seg_tap(index):
+        return TensorAccessPattern(
+            (1, w_words),
+            index * seg_words,
+            [1, 1, seg_words // seg_chunk, seg_chunk],
+            [0, 0, seg_chunk, 1],
+        )
+
+    def gather_sequence(W, Y, w_prods, y_conses, tg, finish_residual):
+        window = []
+
+        def push(group, depth=GATHER_DEPTH):
+            window.append(group)
+            if len(window) > depth:
+                finish_residual()
+                window.pop(0).finish()
+
+        if gather == "rounds":
+            # Placeholder: segment (round, col) at (round * COLS + col). A
+            # group of UP_GROUP rounds awaits only its last round's fill and
+            # drain per column (each channel finishes in order).
+            for start in range(0, rounds, UP_GROUP):
+                part = range(start, min(start + UP_GROUP, rounds))
+                g = TaskGroup()
+                for rnd in part:
+                    last = rnd == part[-1]
+                    for col in range(COLS):
+                        w_prods[col].fill(
+                            W, seg_tap(rnd * COLS + col), wait=last, group=g
+                        )
+                    for col in range(COLS):
+                        y_conses[col].drain(
+                            Y, y_taps[rnd * COLS + col], wait=last, group=g
+                        )
+                push(g, UP_DEPTH)
+        else:
+            for col in range(COLS):
+                y_conses[col].drain(Y, y_taps[col], wait=True, group=tg)
+            # Placeholder: segment (round, col, expert) at
+            # ((round * COLS + col) * experts + expert). A channel's fills
+            # finish in order, so a group of GATHER_GROUP segments awaits only
+            # its last fill per column before its BDs are reused.
+            order = [(rnd, e) for rnd in range(rounds) for e in range(experts)]
+            for start in range(0, len(order), GATHER_GROUP):
+                part = order[start : start + GATHER_GROUP]
+                g = TaskGroup()
+                for i, (rnd, e) in enumerate(part):
+                    for col in range(COLS):
+                        index = (rnd * COLS + col) * experts + e
+                        w_prods[col].fill(
+                            W, seg_tap(index), wait=i == len(part) - 1, group=g
+                        )
+                push(g)
+        finish_residual()
+        for g in window:
+            g.finish()
+
     def sequence(X, W, Y, R, x_prod, w_prods, y_conses, rtps):
         for rtp, row in zip(rtps, rtp_rows):
             rtp[0] = k_blocks
@@ -329,6 +454,9 @@ def gemv_program(dev, dim, n_out, prologue, epilogue, y_stride, tokens):
             rtp[4] = RES_PIECES if prologue == "resnorm" else 0
             rtp[5] = row
             rtp[6] = tokens
+            if epilogue == "swiglu_scaled":
+                for i in range(rounds * TOKENS):
+                    rtp[RTP_SCALES + i] = SCALE_SENTINEL + i
         # One broadcast sends the token to every core; it has no completion
         # token, so its BD is freed at the end.
         x_task = x_prod.fill(X, x_tap, wait=False, managed=False)
@@ -352,6 +480,11 @@ def gemv_program(dev, dim, n_out, prologue, epilogue, y_stride, tokens):
                 r_group = None
 
         tg = TaskGroup()
+        if gather:
+            gather_sequence(W, Y, w_prods, y_conses, tg, finish_residual)
+            tg.finish()
+            x_task.free()
+            return
         for col in range(COLS):
             w_prods[col].fill(W, w_taps[col], wait=False, group=tg)
         if epilogue == "swiglu":
@@ -387,8 +520,8 @@ def compile_to(out_dir: Path, dev: str) -> None:
     iron.set_current_device(device)
     first_cores = None
     for variant in _sequences():
-        dim, rows, prologue, epilogue, _, tokens = variant
-        name = sequence_name(dim, rows, prologue, epilogue, tokens)
+        dim, rows, prologue, epilogue, _, tokens, gather, experts = variant
+        name = sequence_name(dim, rows, prologue, epilogue, tokens, gather, experts)
         # IRON reuses any kernel object already in the work dir, even when
         # its source changed, so every build starts from an empty one.
         work_dir = out_dir / f"{name}.work"

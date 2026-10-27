@@ -11,24 +11,31 @@ set(GUFO_NPU_KERNEL_DESIGNS smoke_add_one bw_memcpy bw_read q4nx_gemv)
 # Designs that write other files than <name>.xclbin + <name>.insts.elf list
 # them here (must match OUTPUTS in the design); <name>_SOURCES are extra
 # inputs.
-set(q4nx_gemv_OUTPUTS
-  q4nx_gemv.xclbin
-  q4nx_gemv_k2048_n2048_plain_store_t1.insts.elf
-  q4nx_gemv_k2048_n2048_plain_store_t2.insts.elf
-  q4nx_gemv_k4096_n2048_plain_store_t1.insts.elf
-  q4nx_gemv_k4096_n2048_plain_store_t2.insts.elf
-  q4nx_gemv_k2048_n5120_resnorm_store_t1.insts.elf
-  q4nx_gemv_k2048_n5120_resnorm_store_t2.insts.elf
-  q4nx_gemv_k2048_n8192_resnorm_store_t1.insts.elf
-  q4nx_gemv_k2048_n8192_resnorm_store_t2.insts.elf
-  q4nx_gemv_k2048_n12288_resnorm_swiglu_t1.insts.elf
-  q4nx_gemv_k2048_n12288_resnorm_swiglu_t2.insts.elf
-  q4nx_gemv_k6144_n2048_act_store_t1.insts.elf
-  q4nx_gemv_k6144_n2048_act_store_t2.insts.elf
-  q4nx_gemv_k2048_n248832_resnorm_store_t1.insts.elf
-  q4nx_gemv_k2048_n248832_resnorm_store_t2.insts.elf
-  q4nx_gemv_k2048_n32768_resnorm_store_t1.insts.elf
-  q4nx_gemv_k2048_n32768_resnorm_store_t2.insts.elf)
+# q4nx_gemv: one sequence per variant (VARIANTS and MOE_VARIANTS in the
+# design) and token count, each as an instruction ELF (the ELF flow) and as
+# raw instruction words (the instruction-buffer flow, src/npu/gemv.hpp).
+set(q4nx_gemv_SEQUENCES
+  q4nx_gemv_k2048_n2048_plain_store
+  q4nx_gemv_k4096_n2048_plain_store
+  q4nx_gemv_k2048_n5120_resnorm_store
+  q4nx_gemv_k2048_n8192_resnorm_store
+  q4nx_gemv_k2048_n12288_resnorm_swiglu
+  q4nx_gemv_k6144_n2048_act_store
+  q4nx_gemv_k2048_n248832_resnorm_store
+  q4nx_gemv_k2048_n32768_resnorm_store
+  q4nx_gemv_k2048_n1024_resnorm_swiglu
+  q4nx_gemv_k512_n2048_act_store
+  q4nx_gemv_k2048_n9216_resnorm_swiglu_scaled_rounds9
+  q4nx_gemv_k4608_n2048_act_store_k9
+  q4nx_gemv_k2048_n12288_resnorm_store
+  q4nx_gemv_k2048_n9216_resnorm_store)
+set(q4nx_gemv_OUTPUTS q4nx_gemv.xclbin)
+foreach(sequence IN LISTS q4nx_gemv_SEQUENCES)
+  foreach(tokens 1 2)
+    list(APPEND q4nx_gemv_OUTPUTS ${sequence}_t${tokens}.insts.elf
+         ${sequence}_t${tokens}.insts.bin)
+  endforeach()
+endforeach()
 set(q4nx_gemv_SOURCES aie/q4nx_gemv.cc)
 
 set(kernel_outputs)
