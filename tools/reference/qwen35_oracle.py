@@ -79,6 +79,14 @@ def main() -> int:
             "last_top5_text": [tokenizer.decode([t]) for t in top],
         }
         print(f"{name}: {len(ids)} tokens, last-position top-5 {top}")
+    # Greedy continuation of the chat prompt (thinking off), for generate tests.
+    ids = encode(tokenizer, PROMPTS["chat"])
+    generated = model.generate(torch.tensor([ids]), max_new_tokens=32, do_sample=False,
+                               temperature=None, top_p=None, top_k=None)
+    continuation = generated[0, len(ids):].tolist()
+    (args.out / "chat.greedy.json").write_text(json.dumps(continuation))
+    manifest["chat_greedy_text"] = tokenizer.decode(continuation)
+    print("chat greedy:", repr(manifest["chat_greedy_text"]))
     (args.out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return 0
 

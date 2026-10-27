@@ -9,15 +9,15 @@ ships its kernels as closed binaries. gufo-npu writes its own kernels with
 AMD's open [IRON](https://github.com/amd/IRON) / [MLIR-AIE](https://github.com/Xilinx/mlir-aie)
 toolchain so every bottleneck can be fixed. See [docs/PLAN.md](docs/PLAN.md).
 
-**Status: Phase 0.** The toolchain, CI and NPU runtime path work end to end:
-a kernel compiled on a hosted CI runner runs on a Strix Halo NPU. The model is
-not implemented yet.
+**Status: Phase 2 done.** The toolchain, CI and NPU runtime path work end to
+end, and an fp32 CPU reference of Qwen3.5-2B (GGUF) matches HF transformers.
+`gufo-npu generate` chats on the CPU; NPU kernels are next.
 
 | Phase | Scope | State |
 |---|---|---|
 | 0 | Repo, CI, pinned toolchain, smoke kernel | done |
 | 1 | Hardware microbenchmarks (dispatch, DMA bandwidth, int4 GEMV) | dispatch, copy bandwidth, FLM baseline done |
-| 2 | CPU reference model (GGUF + Q4NX) | |
+| 2 | CPU reference model (GGUF): forward pass, tokenizer, chat, greedy generate; matches HF | done (MTP and FLM pack: later) |
 | 3 | NPU decode | |
 | 4 | NPU prefill | |
 | 5 | OpenAI-compatible server | |

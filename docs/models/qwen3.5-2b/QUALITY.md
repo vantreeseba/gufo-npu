@@ -17,6 +17,16 @@ prompts (chat template, code, prose; 73 tokens). Measured 2026-10-27.
 - The Q4 row is quantization loss, not a reference error. The NPU path is
   checked against this CPU reference **on the same Q4 weights**.
 
+## Tokenizer and chat template vs HF
+
+- `tests/core/tokenizer_test.cpp`: 18/18 fixture strings encode to the same
+  ids as HF `tokenizers` and decode to the same text (CJK, emoji/ZWJ,
+  decomposed Unicode, contractions, code, special tokens inside text).
+  Fixtures: `tools/reference/tokenizer_fixtures.py`.
+- `tests/models/qwen35/generate_oracle_test.cpp`: the rendered chat prompt
+  (thinking off) tokenizes to HF's ids, and greedy decoding on the BF16 GGUF
+  reproduces HF `generate` for all 25 tokens up to `<|im_end|>`.
+
 ## Planned
 
 | Check | Tolerance |

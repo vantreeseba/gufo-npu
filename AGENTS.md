@@ -39,6 +39,10 @@ Compiling NPU kernels needs no NPU; running them does. Run NPU work with
   match. Record checks in `docs/models/qwen3.6-35b-a3b/QUALITY.md`.
 - Timings are compared per request and per phase, against FLM and against
   main, with the same prompts and toolchain. Record them in `BENCHMARKS.md`.
+- Model tests (CTest label `model`) need, for Qwen3.5-2B:
+  `GUFO_NPU_QWEN35_2B_GGUF` (the BF16 GGUF for the HF-oracle tests) and
+  `GUFO_NPU_QWEN35_2B_ORACLE` (output of `tools/reference/qwen35_oracle.py`).
+  Run them from a Release build; the CPU reference is slow in Debug.
 - Before committing C++: `python3 tools/ci/check-format.py` (`--fix` to apply).
 
 ## Kernels

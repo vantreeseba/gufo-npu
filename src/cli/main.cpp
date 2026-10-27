@@ -1,5 +1,6 @@
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -11,6 +12,11 @@
 
 #include "build_info.hpp"
 #include "core/diagnose.hpp"
+#include "core/gguf.hpp"
+#include "core/tokenizer.hpp"
+#include "models/qwen35/chat.hpp"
+#include "models/qwen35/generate.hpp"
+#include "models/qwen35/reference.hpp"
 #include "npu/device.hpp"
 
 namespace {
@@ -29,6 +35,8 @@ constexpr char kUsage[] =
     "                           per-dispatch cost: sync, async and runlist\n"
     "  bench bandwidth [--iters N] [--kernels DIR]\n"
     "                           DDR bandwidth through all NPU columns\n"
+    "  generate --model GGUF --prompt TEXT [--system TEXT] [--max-tokens N]\n"
+    "           [--think]       greedy chat completion on the CPU reference\n"
     "  version                  print the version\n";
 
 void PrintChecks(const std::vector<Check>& checks) {
@@ -180,6 +188,68 @@ int BenchBandwidth(const std::vector<std::string_view>& args) {
   return 0;
 }
 
+int Generate(const std::vector<std::string_view>& args) {
+  std::string model;
+  std::string prompt;
+  std::string system;
+  int max_tokens = 128;
+  bool thinking = false;
+  for (std::size_t i = 0; i < args.size(); ++i) {
+    const bool has_value = i + 1 < args.size();
+    if (args[i] == "--model" && has_value) {
+      model = std::string(args[++i]);
+    } else if (args[i] == "--prompt" && has_value) {
+      prompt = std::string(args[++i]);
+    } else if (args[i] == "--system" && has_value) {
+      system = std::string(args[++i]);
+    } else if (args[i] == "--max-tokens" && has_value) {
+      max_tokens = std::atoi(std::string(args[++i]).c_str());
+    } else if (args[i] == "--think") {
+      thinking = true;
+    } else {
+      std::cerr << kUsage;
+      return 2;
+    }
+  }
+  if (model.empty() || prompt.empty()) {
+    std::cerr << kUsage;
+    return 2;
+  }
+  namespace qwen35 = gufo_npu::qwen35;
+  const auto file = gufo_npu::gguf::File::Open(model);
+  const gufo_npu::Tokenizer tokenizer(*file);
+  const qwen35::Reference reference(*file);
+
+  std::vector<qwen35::Message> messages;
+  if (!system.empty()) {
+    messages.push_back({"system", system});
+  }
+  messages.push_back({"user", prompt});
+  const auto ids = tokenizer.Encode(qwen35::RenderChat(messages, thinking));
+  const std::vector<int> stop = {tokenizer.Find(qwen35::kImEnd),
+                                 tokenizer.Find(qwen35::kEndOfText)};
+
+  qwen35::GenerateStats stats;
+  qwen35::GreedyGenerate(
+      reference, ids, max_tokens, stop,
+      [&](int id) {
+        if (std::find(stop.begin(), stop.end(), id) == stop.end()) {
+          std::fputs(tokenizer.TokenBytes(id).c_str(), stdout);
+          std::fflush(stdout);
+        }
+      },
+      &stats);
+  std::fprintf(stderr,
+               "\n[%d prompt tokens in %.2f s; %d generated in %.2f s, "
+               "%.2f tok/s; CPU reference]\n",
+               stats.prompt_tokens, stats.prefill_seconds,
+               stats.generated_tokens, stats.decode_seconds,
+               stats.decode_seconds > 0
+                   ? stats.generated_tokens / stats.decode_seconds
+                   : 0.0);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -195,6 +265,9 @@ int main(int argc, char** argv) {
   }
   if (args[0] == "diagnose") {
     return Diagnose();
+  }
+  if (args[0] == "generate") {
+    return Generate(rest);
   }
   if (args[0] == "smoke") {
     return Smoke(rest);
