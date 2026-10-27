@@ -633,13 +633,18 @@ struct NpuPrefill::Impl {
     }
   }
 
-  void Embed(Lane& lane, const int* tokens) {
-    const int d = config.hidden;
-    for (int t = 0; t < lane.n; ++t) {
+  // Throws before any work (as the decoder does) when an id is not in the
+  // vocabulary; the jobs index the embedding table with them.
+  void CheckTokens(const int* tokens, int count) const {
+    for (int t = 0; t < count; ++t) {
       if (tokens[t] < 0 || tokens[t] >= config.vocab) {
         throw std::out_of_range("qwen35: token id out of range");
       }
     }
+  }
+
+  void Embed(Lane& lane, const int* tokens) {
+    const int d = config.hidden;
     pool.Run(static_cast<std::size_t>(lane.n), [&](std::size_t t) {
       quant::Dequantize(embed->type,
                         embed->data + static_cast<std::size_t>(tokens[t]) *
@@ -979,6 +984,7 @@ struct NpuPrefill::Impl {
   // Runs `count` tokens, two chunks at a time.
   void Run(const int* tokens, int count, DecodeState& state, float* hidden) {
     const int d = config.hidden;
+    CheckTokens(tokens, count);
     for (int done = 0; done < count;) {
       const auto start = Clock::now();
       const double before = Profiled();
@@ -1074,6 +1080,7 @@ void NpuPrefill::FillMtp(const float* hidden, const int* tokens, int count,
     throw std::runtime_error("qwen35: model has no MTP layer");
   }
   const int d = impl_->config.hidden;
+  impl_->CheckTokens(tokens, count);
   const BurstPool::Burst burst(impl_->pool);
   for (int done = 0; done < count;) {
     const int n = std::min(ChunkFor(count - done, 1), count - done);
@@ -1093,6 +1100,13 @@ PromptPrefill PrefillPrompt(NpuPrefill& prefill) {
     const int k = static_cast<int>(prompt.size()) - 1;
     if (k < 1) {
       return 0;
+    }
+    // Every id, including the last (the MTP cache reads prompt[k]), before
+    // any state changes.
+    for (const int id : prompt) {
+      if (id < 0 || id >= prefill.config().vocab) {
+        throw std::out_of_range("qwen35: token id out of range");
+      }
     }
     prefill.Run(prompt.data(), k, state, hidden);
     if (mtp != nullptr) {
