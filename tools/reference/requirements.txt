@@ -1,0 +1,7 @@
+# HF transformers oracle for the CPU reference (tools/reference/qwen35_oracle.py).
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.13.0+cpu
+transformers==5.21.0
+safetensors
+numpy
+huggingface_hub

@@ -11,3 +11,7 @@ NPU kernels are built with, and may include code from:
 - IRON (https://github.com/amd/IRON), Apache-2.0
 - llvm-aie / Peano (https://github.com/Xilinx/llvm-aie), Apache-2.0 WITH LLVM-exception
 The runtime image bundles XRT (https://github.com/Xilinx/XRT), Apache-2.0.
+
+Vendored in third_party/:
+- nlohmann/json v3.12.0 (https://github.com/nlohmann/json), MIT License,
+  Copyright (c) 2013-2025 Niels Lohmann.

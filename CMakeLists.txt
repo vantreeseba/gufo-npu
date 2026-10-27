@@ -33,13 +33,33 @@ set(GUFO_NPU_KERNEL_INSTALL_DIR "${CMAKE_INSTALL_DATADIR}/gufo-npu/kernels")
 configure_file(src/core/build_info.hpp.in
                "${CMAKE_CURRENT_BINARY_DIR}/generated/build_info.hpp" @ONLY)
 
+find_package(ICU REQUIRED COMPONENTS uc i18n)
+
+# Vendored header-only dependencies (see NOTICE).
+add_library(nlohmann_json INTERFACE)
+target_include_directories(nlohmann_json SYSTEM INTERFACE
+  "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
+
 # CPU-only core: no XRT, safe for hosted CI and unit tests.
 add_library(gufo_npu_core STATIC
   src/core/diagnose.cpp
+  src/core/gguf.cpp
+  src/core/quant.cpp
+  src/core/tokenizer.cpp
 )
+target_link_libraries(gufo_npu_core PUBLIC ICU::uc ICU::i18n)
 target_include_directories(gufo_npu_core PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
   "${CMAKE_CURRENT_BINARY_DIR}/generated")
+
+# Qwen3.5 / Qwen3.6 model code (CPU reference).
+add_library(gufo_npu_qwen35 STATIC
+  src/models/qwen35/chat.cpp
+  src/models/qwen35/config.cpp
+  src/models/qwen35/generate.cpp
+  src/models/qwen35/reference.cpp
+)
+target_link_libraries(gufo_npu_qwen35 PUBLIC gufo_npu_core)
 
 # NPU runtime: XRT when enabled, otherwise a stub that reports it is absent.
 if(GUFO_NPU_ENABLE_XRT)
@@ -52,7 +72,7 @@ else()
 endif()
 
 add_executable(gufo-npu src/cli/main.cpp)
-target_link_libraries(gufo-npu PRIVATE gufo_npu_runtime)
+target_link_libraries(gufo-npu PRIVATE gufo_npu_runtime gufo_npu_qwen35)
 install(TARGETS gufo-npu RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 if(GUFO_NPU_BUILD_KERNELS)

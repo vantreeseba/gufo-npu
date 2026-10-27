@@ -32,6 +32,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       libxrt2="${XRT_VERSION}" libxrt-npu2="${XRT_VERSION}" \
       libxrt-utils="${XRT_VERSION}" libxrt-utils-npu="${XRT_VERSION}" \
+      libicu74 \
  && apt-get purge -y software-properties-common && apt-get autoremove -y \
  && rm -rf /var/lib/apt/lists/*
 
@@ -42,7 +43,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       build-essential cmake ninja-build ccache git clang-format \
       python3 python3-dev python3-venv \
-      uuid-dev libxrt-dev="${XRT_VERSION}" \
+      uuid-dev libicu-dev libxrt-dev="${XRT_VERSION}" \
  && rm -rf /var/lib/apt/lists/*
 ENV VIRTUAL_ENV=/opt/venv
 RUN python3 -m venv "${VIRTUAL_ENV}"
