@@ -23,15 +23,16 @@
 // (its own submission) the CPU routes in fp32 (moe.hpp) and points two
 // gathers at the chosen experts (npu::Q4nxGather): gate + up with SwiGLU
 // scaled by the router weights, then one down over all of them, chained
-// with the next layer's input projection. Two submissions per layer.
+// with the next layer's input projection. Two submissions per layer. A
+// two-token step reads the union of both tokens' experts once; each token
+// weighs the experts it did not choose 0.
 //
-// A dense model's step takes one or two tokens; the weights are read once
-// for both. The second token of a pair can be a speculative draft: Resolve()
-// keeps it or rolls the state back to just after the first. The MTP head
-// drafts the token after next on the NPU as well (two submissions per
-// draft); its LM head scores only the draft vocabulary, and the main model
-// still checks each draft over every token. MoE models take one token per
-// step and have no MTP head here yet.
+// A step takes one or two tokens; the weights are read once for both. The
+// second token of a pair can be a speculative draft: Resolve() keeps it or
+// rolls the state back to just after the first. The MTP head drafts the
+// token after next on the NPU as well (two submissions per draft, four for
+// an MoE MTP block); its LM head scores only the draft vocabulary, and the
+// main model still checks each draft over every token.
 namespace gufo_npu::qwen35 {
 
 class NpuDecoder {
@@ -45,9 +46,7 @@ public:
   const Config& config() const;
   DecodeState NewState() const;
 
-  // Tokens a Step can take (2, or 1 for MoE models), and whether Draft()
-  // works.
-  int step_tokens() const;
+  // Whether the model has an MTP head, so Draft() works.
   bool can_draft() const;
 
   // Runs `token` at state.position, advances the state and returns the
@@ -117,9 +116,9 @@ using PromptPrefill =
 // Greedy decoding with MTP speculation: each step verifies one MTP draft in a
 // 2-token pass and keeps it when the main model agrees, so the output is the
 // main model's greedy output. The prompt runs through `prefill` when given,
-// the rest of it step_tokens() tokens per pass. With `draft` false, every
-// step decodes one token (no MTP); `draft` needs can_draft(). `on_token` sees
-// each generated id (including a stop id) as it is produced.
+// the rest of it two tokens per pass. With `draft` false, every step decodes
+// one token (no MTP); `draft` needs can_draft(). `on_token` sees each
+// generated id (including a stop id) as it is produced.
 std::vector<int> SpeculativeGenerate(NpuDecoder& model,
                                      const std::vector<int>& prompt,
                                      int max_tokens,

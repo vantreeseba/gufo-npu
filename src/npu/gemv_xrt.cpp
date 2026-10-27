@@ -315,16 +315,17 @@ constexpr std::size_t kArrayCores = q4nx::kCols * q4nx::kRows;
 // Output rounds of a down gather (kGemvHidden rows).
 constexpr std::size_t kDownRounds = kGemvHidden / q4nx::kOutPerRound;
 
-std::string GatherSequence(Q4nxGather::Kind kind, std::size_t tokens) {
-  const std::string experts = std::to_string(kGatherExperts);
+std::string GatherSequence(Q4nxGather::Kind kind, std::size_t experts,
+                           std::size_t tokens) {
+  const std::string count = std::to_string(experts);
   const std::string t = "_t" + std::to_string(tokens);
   if (kind == Q4nxGather::Kind::kGateUp) {
     return "q4nx_gemv_k" + std::to_string(kGemvHidden) + "_n" +
-           std::to_string(kGatherExperts * q4nx::kOutPerRound) +
-           "_resnorm_swiglu_scaled_rounds" + experts + t;
+           std::to_string(experts * q4nx::kOutPerRound) +
+           "_resnorm_swiglu_scaled_rounds" + count + t;
   }
-  return "q4nx_gemv_k" + std::to_string(kGatherExperts * kExpertFfn) + "_n" +
-         std::to_string(kGemvHidden) + "_act_store_k" + experts + t;
+  return "q4nx_gemv_k" + std::to_string(experts * kExpertFfn) + "_n" +
+         std::to_string(kGemvHidden) + "_act_store_k" + count + t;
 }
 
 }  // namespace
@@ -333,6 +334,7 @@ struct Q4nxGather::Impl {
   GemvRuntime::Impl& rt;
   Kind kind;
   ExpertArena arena;
+  std::size_t experts;
   std::size_t tokens;
   std::unique_ptr<InstrSequence> instructions;
   // A weight patch: the expert slot (index into Select's ids) it reads and
@@ -351,8 +353,9 @@ struct Q4nxGather::Impl {
   };
   std::vector<Scale> scales;
 
-  Impl(GemvRuntime::Impl& r, Kind k, const ExpertArena& a, std::size_t t)
-      : rt(r), kind(k), arena(a), tokens(t) {
+  Impl(GemvRuntime::Impl& r, Kind k, const ExpertArena& a, std::size_t n,
+       std::size_t t)
+      : rt(r), kind(k), arena(a), experts(n), tokens(t) {
     if (rt.flow != Flow::kInstructionBuffer) {
       throw std::logic_error(
           "q4nx gather: needs a runtime with the instruction-buffer flow");
@@ -360,14 +363,20 @@ struct Q4nxGather::Impl {
     if (tokens < 1 || tokens > kGemvTokens) {
       throw std::invalid_argument("q4nx gather: 1 or 2 tokens per call");
     }
-    const std::string name = GatherSequence(kind, tokens);
+    if (experts < kGatherExperts ||
+        experts > (tokens == 1 ? kGatherExperts : kMaxGatherExperts)) {
+      throw std::invalid_argument("q4nx gather: no variant for " +
+                                  std::to_string(experts) + " experts and " +
+                                  std::to_string(tokens) + " token(s)");
+    }
+    const std::string name = GatherSequence(kind, experts, tokens);
     instructions = std::make_unique<InstrSequence>(rt.hw, *rt.kernel,
                                                    rt.Path(name, ".insts.bin"));
     const auto& w = instructions->words;
     // The compiled offsets place segments back to back in a virtual matrix:
     //   gate + up: segment round * kCols + col, a column's slice of the
     //     gate + up of the round's expert;
-    //   down: segment (round * kCols + col) * kGatherExperts + expert, the
+    //   down: segment (round * kCols + col) * experts + expert, the
     //     expert's part of that (round, col) slice.
     const std::size_t seg =
         kind == Kind::kGateUp
@@ -383,16 +392,15 @@ struct Q4nxGather::Impl {
       const Site site =
           kind == Kind::kGateUp
               ? Site{word, index / q4nx::kCols, (index % q4nx::kCols) * seg}
-              : Site{word, index % kGatherExperts,
-                     (index / kGatherExperts) * seg};
-      if (site.expert >= kGatherExperts) {
+              : Site{word, index % experts, (index / experts) * seg};
+      if (site.expert >= experts) {
         throw std::runtime_error("q4nx gather: patch beyond the experts in " +
                                  name);
       }
       sites.push_back(site);
     }
     const std::size_t want_sites =
-        kGatherExperts * q4nx::kCols *
+        experts * q4nx::kCols *
         (kind == Kind::kGateUp ? std::size_t{1} : kDownRounds);
     if (sites.size() != want_sites) {
       throw std::runtime_error("q4nx gather: " + std::to_string(sites.size()) +
@@ -404,12 +412,12 @@ struct Q4nxGather::Impl {
     }
     for (std::size_t i = 0; i < w.size(); ++i) {
       if (w[i] >= kScaleSentinel &&
-          w[i] < kScaleSentinel + kGatherExperts * kGemvTokens) {
+          w[i] < kScaleSentinel + experts * kGemvTokens) {
         const std::size_t j = w[i] - kScaleSentinel;
         scales.push_back({i, j / kGemvTokens, j % kGemvTokens});
       }
     }
-    const std::size_t want_scales = kArrayCores * kGatherExperts * kGemvTokens;
+    const std::size_t want_scales = kArrayCores * experts * kGemvTokens;
     if (scales.size() != want_scales) {
       throw std::runtime_error("q4nx gather: " + std::to_string(scales.size()) +
                                " scale words in " + name + ", expected " +
@@ -419,15 +427,17 @@ struct Q4nxGather::Impl {
 };
 
 Q4nxGather::Q4nxGather(GemvRuntime& runtime, Kind kind,
-                       const ExpertArena& arena, std::size_t tokens)
-    : impl_(std::make_unique<Impl>(runtime.impl(), kind, arena, tokens)) {}
+                       const ExpertArena& arena, std::size_t experts,
+                       std::size_t tokens)
+    : impl_(std::make_unique<Impl>(runtime.impl(), kind, arena, experts,
+                                   tokens)) {}
 
 Q4nxGather::~Q4nxGather() = default;
 
 void Q4nxGather::Select(const int* ids, const float* scales) {
   Impl& m = *impl_;
   auto& w = m.instructions->words;
-  for (std::size_t i = 0; i < kGatherExperts; ++i) {
+  for (std::size_t i = 0; i < m.experts; ++i) {
     if (ids[i] < 0 || static_cast<std::size_t>(ids[i]) >= m.arena.experts) {
       throw std::out_of_range("q4nx gather: expert outside the arena");
     }
@@ -459,6 +469,10 @@ std::size_t Q4nxGather::y_bytes() const {
     return 8 * (kGemvMaxDim / 2) * sizeof(float);
   }
   return ((kGemvTokens - 1) * kGemvSlot + kGemvHidden) * sizeof(float);
+}
+
+std::size_t Q4nxGather::experts() const {
+  return impl_->experts;
 }
 
 std::size_t Q4nxGather::tokens() const {

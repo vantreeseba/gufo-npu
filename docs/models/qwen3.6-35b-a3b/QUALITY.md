@@ -5,8 +5,9 @@ Planned contracts (see [the plan](../../PLAN.md)):
 | Check | Tolerance | State |
 |---|---|---|
 | CPU reference vs llama.cpp (CPU), teacher-forced logits | see below | enforced |
-| Each NPU op vs CPU reference | relative error < 1e-2 | enforced: MoE gathers 6.1e-4 (1 token), 8.6e-4 (2) |
+| Each NPU op vs CPU reference | relative error < 1e-2 | enforced: MoE gathers 4.8e-4 (1 token), 4.8e-4 to 7.9e-4 (2 tokens, unions of 9 to 17) |
 | NPU decode vs CPU decoder over the same q4nx weights, teacher-forced, routing followed | logits rel. L2 < 1e-2 per prompt, argmax ≥ 98%, routing differences at near ties only | enforced (below) |
+| NPU MTP speculation vs plain greedy decode | identical output | enforced: 400 tokens after 4 prompts, 73% of drafts accepted |
 | Prefill vs one-token decode | identical next token | reference: identical logits |
 | CPU decoder vs reference | see below | enforced |
 | MTP head (reference) vs main model's top-1 | ≥ 50% of drafts | enforced (69%) |
@@ -233,7 +234,10 @@ against the fp32 CPU `Decoder` over `Q4nxProjections`, the same q4nx weights
 (Q4_K experts unpacked by q4nx's rule, everything else packed with
 `q4nx::PackRows`, router and DeltaNet alpha/beta in fp32 as on the NPU
 path). Teacher forced over the four oracle prompts (301 positions),
-2026-10-27.
+2026-10-27, after the experts' order in the gathers became ascending ids
+(for MTP, below); the first measurements, with experts in order of weight,
+were within the same bounds (logits ≤ 5.9e-3, argmax 301/301, top-1 against
+llama.cpp 263/301).
 
 The NPU rounds every call's input to bf16, so where a layer's 8th and 9th
 experts are nearly tied it can route differently from the CPU, and both
@@ -251,32 +255,62 @@ CPU's top 8 had.
 
 | Prompt | Tokens | Logits rel. L2 (worst position) | Argmax vs CPU | Routings unlike the CPU's | Largest gap | NPU top-1 vs llama.cpp |
 |---|---|---|---|---|---|---|
-| chat | 17 | 4.4e-03 (7.4e-03) | 17/17 | 9 of 680 | 5.0e-03 | 16/17 |
-| code | 15 | 5.9e-03 (1.4e-02) | 15/15 | 8 of 600 | 2.7e-02 | 14/15 |
-| prose | 39 | 3.4e-03 (5.8e-03) | 39/39 | 24 of 1,560 | 3.6e-03 | 34/39 |
-| long | 230 | 3.8e-03 (6.7e-03) | 230/230 | 129 of 9,200 | 6.3e-03 | 199/230 |
-| all | 301 | | 301/301 | 170 of 12,040 (1.4%) | 2.7e-02 | 263/301 (87.4%) |
+| chat | 17 | 4.3e-03 (6.2e-03) | 17/17 | 12 of 680 | 1.6e-02 | 16/17 |
+| code | 15 | 8.1e-03 (2.1e-02) | 15/15 | 12 of 600 | 2.7e-02 | 14/15 |
+| prose | 39 | 3.2e-03 (4.3e-03) | 39/39 | 24 of 1,560 | 5.2e-03 | 33/39 |
+| long | 230 | 3.7e-03 (6.4e-03) | 228/230 | 134 of 9,200 | 1.0e-02 | 198/230 |
+| all | 301 | | 299/301 | 182 of 12,040 (1.5%) | 2.7e-02 | 261/301 (86.7%) |
 
 Thresholds:
 
 | Check | Pass | Measured | Why |
 |---|---|---|---|
-| Logits rel. L2, per prompt | < 1e-2 | ≤ 5.9e-3 | the 2B's NPU bound; bf16 rounding of each call's input |
-| Argmax vs CPU, all prompts | ≥ 98% | 301/301 | |
+| Logits rel. L2, per prompt | < 1e-2 | ≤ 8.1e-3 | the 2B's NPU bound; bf16 rounding of each call's input |
+| Argmax vs CPU, all prompts | ≥ 98% | 299/301 | |
 | Largest routing gap | < 5e-2 | 2.7e-2 | a misrouted expert lands far from the top 8 (gaps of order 1); bf16 noise moves router logits by ~1e-2 |
 
 Letting both route on their own (the first version), the NPU and the CPU
 still agreed on top-1 at 294/301 positions; the worst position's logits
-were 4–12% apart, depending on the prompt. Against llama.cpp, top-1 agrees at 263/301 positions on
-the NPU and at 260/301 on the CPU over the same weights. That matches set
-(c) above: requantizing to q4nx sets the quality; the NPU adds nothing
-measurable on top.
+were 4–12% apart, depending on the prompt. Against llama.cpp, top-1 agrees
+at 261–263/301 positions on the NPU and at 260/301 on the CPU over the same
+weights. That matches set (c) above: requantizing to q4nx sets the quality;
+the NPU adds nothing measurable on top.
+
+### MTP speculation
+
+The same test then decodes greedily after each oracle prompt twice:
+plainly (one token per pass after the prompt) and with MTP speculation (a
+draft from the MTP block on the NPU, verified in a two-token pass that reads
+the pair's expert union), both with the prompt in two-token passes. The
+outputs must be identical token for token:
+
+| After | Tokens | Identical | Verify steps | Drafts accepted |
+|---|---|---|---|---|
+| chat | 256 | yes | 145 | 110 (76%) |
+| code | 48 | yes | 24 | 23 (96%) |
+| prose | 48 | yes | 28 | 19 (68%) |
+| long | 48 | yes | 32 | 16 (50%) |
+| all | 400 | yes | 229 | 168 (73%) |
+
+Identical, not merely close: a two-token pass gives each token exactly the
+logits of a one-token pass (checked bit for bit over 3 positions × 248,320
+logits and the final hidden states with a scratch probe), because each
+token weighs the experts only the other token chose 0, those add exact
+zeros, and the experts sum in ascending id order in both. Before the
+experts were sorted by id they summed in order of weight, which differs
+between a token's own call and the union. A bug the probe found on the way:
+the mixer output's buffer view covered only the first 1.5 slots, enough for
+Qwen3.5-2B's 2,048-wide mixers but not for this model's 4,096; the second
+token's upper half never reached the device.
 
 Determinism: `q4nx_moe_chain_test` (label `npu`) runs one layer's calls as
 the decoder wires them (input and output projections, then the two gathers
-and the next input projection, re-pointed between submissions at four
-expert selections) 20,000 times; every output is bit-identical to the first
-run with the same selection.
+and the next input projection, re-pointed between submissions) over five
+selections: one token with 9 experts (twice), and two tokens with unions of
+9, 13 and 17 experts, each token weighing about a third of them 0. 20,000
+runs; every byte each selection writes is identical to its first run.
+`q4nx_moe_gather_test` checks the same gathers against the CPU (worst
+relative error 4.8e-4 to 7.9e-4).
 
 ## GGUF load
 

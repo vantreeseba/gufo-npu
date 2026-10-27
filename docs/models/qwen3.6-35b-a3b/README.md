@@ -16,8 +16,10 @@ Qwen3.5-2B) runs this model from the GGUF and is checked against llama.cpp
 ([QUALITY.md](QUALITY.md)). `generate --device npu` decodes it on the NPU
 (`NpuDecoder`): every matrix in q4nx (4.625 bits per weight) on the NPU,
 each layer's experts in one device arena read through two gathers, the
-mixers and the router on the CPU. One token per pass for now (no MTP, no
-batched prompt); speeds in [BENCHMARKS.md](BENCHMARKS.md). See
+mixers and the router on the CPU. The MTP layer drafts on the NPU and a
+two-token pass verifies (same output as plain greedy); the prompt runs two
+tokens per pass, so long prompts are still slow until there is an MoE
+prefill. Speeds in [BENCHMARKS.md](BENCHMARKS.md). See
 [the plan](../../PLAN.md).
 
 ## The GGUF (`Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`)
