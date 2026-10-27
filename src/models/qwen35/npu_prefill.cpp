@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <new>
 #include <stdexcept>
 #include <string>
@@ -32,16 +33,61 @@ using vec::RmsNorm;
 
 constexpr int kMaxChunk = static_cast<int>(npu::kGemmMaxChunk);
 
-// GEMM rows for a pass over `remaining` tokens with `lanes` lanes: the
-// largest chunk the lanes fill, else the smallest (padded).
-int ChunkFor(int remaining, int lanes) {
-  int best = static_cast<int>(npu::kGemmChunks[0]);
-  for (const std::size_t m : npu::kGemmChunks) {
-    if (lanes * static_cast<int>(m) <= remaining) {
-      best = static_cast<int>(m);
+// The model the chunk plan is chosen with, measured on the 2B (BENCHMARKS.md,
+// "Prefill GEMM" and "Where the time goes"): the GEMMs' throughput at each
+// chunk size of npu::kGemmChunks (a 256-row call runs at ~11 TFLOPS, a
+// 1,024-row one at ~17), and the CPU's time per token between them (~0.14 ms
+// at 1k tokens: mixers, norms, conversions).
+constexpr double kGemmTflops[] = {11.0, 14.5, 17.0};
+static_assert(std::size(kGemmTflops) == std::size(npu::kGemmChunks));
+constexpr double kCpuSecondsPerToken = 0.14e-3;
+
+// One pass of a prefill: `lanes` chunks of `m` GEMM rows over `tokens`
+// prompt tokens (the last chunk padded).
+struct Pass {
+  int m = 0;
+  int lanes = 0;
+  int tokens = 0;
+};
+
+// The passes over `count` tokens with the least estimated time, for GEMMs of
+// `flops` per token and `cpu` seconds of CPU work per token. One lane takes
+// its GEMMs' time and then its CPU time; two lanes overlap one chunk's GEMMs
+// with the other's CPU work, about max(GEMMs of both, CPU of both). So 1,000
+// tokens run as 512 + 488 (GEMMs ~0.2 s) rather than four chunks of 256
+// (~0.25 s) or one of 1,024 without overlap.
+std::vector<Pass> PlanPasses(int count, int max_lanes, double flops,
+                             double cpu) {
+  const auto npu = [&](std::size_t chunk) {
+    return flops * static_cast<double>(npu::kGemmChunks[chunk]) /
+           (kGemmTflops[chunk] * 1e12);
+  };
+  // best[r]: least time for the last r tokens, and the pass that starts it.
+  std::vector<double> best(static_cast<std::size_t>(count) + 1, 0.0);
+  std::vector<Pass> first(static_cast<std::size_t>(count) + 1);
+  for (int r = 1; r <= count; ++r) {
+    best[r] = INFINITY;
+    for (std::size_t c = 0; c < std::size(npu::kGemmChunks); ++c) {
+      const int m = static_cast<int>(npu::kGemmChunks[c]);
+      for (int lanes = 1; lanes <= max_lanes; ++lanes) {
+        if (lanes > 1 && r <= (lanes - 1) * m) {
+          continue;  // a lane would be empty
+        }
+        const int tokens = std::min(r, lanes * m);
+        const double t = lanes == 1 ? npu(c) + cpu * tokens
+                                    : std::max(lanes * npu(c), cpu * tokens);
+        if (t + best[r - tokens] < best[r]) {
+          best[r] = t + best[r - tokens];
+          first[r] = {m, lanes, tokens};
+        }
+      }
     }
   }
-  return best;
+  std::vector<Pass> plan;
+  for (int r = count; r > 0; r -= first[r].tokens) {
+    plan.push_back(first[r]);
+  }
+  return plan;
 }
 
 // Attention: query tokens per work item, keys per online-softmax block.
@@ -404,6 +450,9 @@ struct NpuPrefill::Impl {
       std::max<std::size_t>(std::thread::hardware_concurrency() / 2, 1) - 1};
 
   Profile profile;
+  // GEMM work per token of a prefill pass and of the MTP cache fill.
+  double flops_per_token = 0;
+  double mtp_flops_per_token = 0;
 
   Layer MakeLayer(const gguf::File& file, int il, bool full) {
     const Config& cfg = config;
@@ -499,6 +548,14 @@ struct NpuPrefill::Impl {
       hnorm = ToFloats(file.Tensor(p + "nextn.hnorm.weight"));
       output_norm = ToFloats(file.Tensor("output_norm.weight"));
     }
+    auto flops = [](const std::unique_ptr<Bfp16Gemm>& g) {
+      return g ? 2.0 * static_cast<double>(g->rows() * g->dim()) : 0.0;
+    };
+    for (const auto& l : layers) {
+      flops_per_token +=
+          flops(l.in) + flops(l.out) + flops(l.ffn) + flops(l.down);
+    }
+    mtp_flops_per_token = flops(eh_proj) + flops(mtp.in);
     rope_inv_freq.resize(cfg.rope_dim / 2);
     for (int i = 0; i < cfg.rope_dim / 2; ++i) {
       rope_inv_freq[i] = static_cast<float>(
@@ -984,22 +1041,22 @@ struct NpuPrefill::Impl {
     }
   }
 
-  // Runs `count` tokens, two chunks at a time.
+  // Runs `count` tokens, up to two chunks at a time, in the passes
+  // PlanPasses picks.
   void Run(const int* tokens, int count, DecodeState& state, float* hidden) {
     const int d = config.hidden;
     CheckTokens(tokens, count);
-    for (int done = 0; done < count;) {
+    int done = 0;
+    for (const Pass& pass :
+         PlanPasses(count, 2, flops_per_token, kCpuSecondsPerToken)) {
       const auto start = Clock::now();
       const double before = Profiled();
-      const int m = ChunkFor(count - done, 2);
       int used = 0;
       int taken = 0;
-      for (Lane& lane : lanes) {
-        lane.m = m;
-        lane.n = std::min(m, count - done - taken);
-        if (lane.n <= 0) {
-          break;
-        }
+      for (int i = 0; i < pass.lanes; ++i) {
+        Lane& lane = lanes[i];
+        lane.m = pass.m;
+        lane.n = std::min(pass.m, pass.tokens - taken);
         lane.position = state.position + taken;
         Embed(lane, tokens + done + taken);
         taken += lane.n;
@@ -1021,15 +1078,16 @@ struct NpuPrefill::Impl {
     }
   }
 
-  void FillMtpChunk(const float* hidden, const int* tokens, int n, int position,
-                    DecodeState& state) {
+  void FillMtpChunk(const float* hidden, const int* tokens, const Pass& pass,
+                    int position, DecodeState& state) {
     const Config& cfg = config;
     const int d = cfg.hidden;
+    const int n = pass.tokens;
     const auto start = Clock::now();
     const double before = Profiled();
     Lane& lane = lanes[0];
     lane.n = n;
-    lane.m = ChunkFor(n, 1);
+    lane.m = pass.m;
     lane.position = position;
     // [RMS(embed(token)) * enorm ; RMS(RMS(h) * output_norm) * hnorm].
     auto* bits = lane.a->as<std::uint16_t>();
@@ -1085,11 +1143,13 @@ void NpuPrefill::FillMtp(const float* hidden, const int* tokens, int count,
   const int d = impl_->config.hidden;
   impl_->CheckTokens(tokens, count);
   const BurstPool::Burst burst(impl_->pool);
-  for (int done = 0; done < count;) {
-    const int n = std::min(ChunkFor(count - done, 1), count - done);
+  // One lane, and almost no CPU work between its two GEMMs.
+  int done = 0;
+  for (const Pass& pass :
+       PlanPasses(count, 1, impl_->mtp_flops_per_token, 0.0)) {
     impl_->FillMtpChunk(hidden + static_cast<std::size_t>(done) * d,
-                        tokens + done, n, position + done, mtp);
-    done += n;
+                        tokens + done, pass, position + done, mtp);
+    done += pass.tokens;
   }
 }
 
