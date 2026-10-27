@@ -63,11 +63,14 @@ error < 1e-2, and the resnorm residual (H + D) within 1e-6 of its scale.
   unchanged and gave 1.1e-2.
 - `q4nx_test` (hosted CI) checks the packing: Q4_K codes, sub-scales and
   sub-minima carry over unchanged (only d and dmin round to bf16),
-  requantized weights stay within half their step (the group's range / 15,
-  widened by the int8 minimum's grid and rounded up onto d's), fused stacks
-  equal their parts, row orders (SwiGLU) apply, and the CPU q4nx GEMV matches
-  the reference. Requantizing N(0, 0.02) weights: relative RMS error 0.0787
-  (0.0783 with 5120-byte blocks).
+  requantized weights stay within one step of a min/max fit (the group's
+  range / 15, widened by the int8 minimum's grid and rounded up onto d's;
+  the packer's error-minimizing fit may clip a group's extremes), fused
+  stacks equal their parts, row orders (SwiGLU) apply, and the CPU q4nx GEMV
+  matches the reference. Requantizing N(0, 0.02) weights: relative RMS error
+  0.0702 (pass < 0.074); the min/max fit before 2026-10-27 gave 0.0787
+  (0.0783 with 5120-byte blocks). How the fit was chosen:
+  [Qwen3.6-35B-A3B quality](../qwen3.6-35b-a3b/QUALITY.md#choosing-the-4-bit-values).
 
 ## NPU decode, teacher-forced
 
@@ -102,6 +105,22 @@ With the compact 4736-byte blocks (same day, same test):
   positions as the NPU here, except 2 prose positions where the GGUF weights
   do better: requantizing the 5–8-bit tensors costs 2 of 73. A longer quality
   run decides whether an 8-bit kernel variant is needed.
+
+With the error-minimizing fit for requantized tensors (2026-10-27, compact
+blocks; [how it was chosen](../qwen3.6-35b-a3b/QUALITY.md#choosing-the-4-bit-values)):
+
+| Prompt | Tokens | NPU vs q4nx CPU: argmax | Logits rel err | NPU argmax vs HF |
+|---|---|---|---|---|
+| chat | 19 | 19/19 | 8.2e-3 | 17/19 |
+| code | 15 | 15/15 | 5.1e-3 | 14/15 |
+| prose | 39 | 39/39 | 4.9e-3 | 30/39 |
+
+- 73/73 against its own weights on the CPU; 61/73 against HF (63/73 with
+  the min/max fit), a difference of two near ties in 73 positions. On
+  1,515 positions of held-out text against the GGUF as stored (the 35B's
+  quality test run on this model), KL with every requantized matrix in
+  q4nx is 0.0424 with the min/max fit (0.0336 without the LM head).
+- The NPU decoder packs and uploads in 2.6 s instead of 1.3 s.
 
 ## Speculative decoding
 
