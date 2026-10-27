@@ -2,8 +2,8 @@
 # CI. NPU tests exit 77 (skip) when the device is missing, which is not a pass.
 # Model tests live with their model (models/<model>/CMakeLists.txt) and carry
 # its label (qwen35_2b, qwen36_35b_a3b), plus "model" when they need weights
-# and "kernels" for NPU op tests; shared code is tested here and in
-# models/qwen35 (the Qwen3.5 family's CPU code).
+# and "kernels" for NPU op tests. Shared code is tested here and in
+# models/qwen35 (the Qwen3.5 family's CPU code, label qwen35_family).
 
 add_executable(diagnose_test core/diagnose_test.cpp)
 target_link_libraries(diagnose_test PRIVATE gufo_npu_core)

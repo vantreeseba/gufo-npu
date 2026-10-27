@@ -4,4 +4,4 @@
 add_executable(qwen35_config_test config_test.cpp)
 target_link_libraries(qwen35_config_test PRIVATE gufo_npu_qwen35)
 add_test(NAME qwen35_config_test COMMAND qwen35_config_test)
-set_tests_properties(qwen35_config_test PROPERTIES LABELS qwen35)
+set_tests_properties(qwen35_config_test PROPERTIES LABELS qwen35_family)
