@@ -4,11 +4,14 @@ IRON imports, so the build can list the design's outputs at configure time
 """
 
 XCLBIN = "q4nx_gemv"
-MAX_DIM = 6144  # longest input a call takes
+# The longest input a call takes: a down gather over 17 experts (two tokens'
+# 16 routed experts and the shared one, 17 x 512).
+MAX_DIM = 8704
 HIDDEN = 2048  # residual width (resnorm)
 TOKENS = 2  # tokens a call can carry
 SLOT = 2 * HIDDEN  # fp32 per plain/resnorm token slot ([H | D])
 EXPERT_FFN = 512  # an MoE expert's width (Qwen3.6-35B-A3B)
+MAX_EXPERTS = MAX_DIM // EXPERT_FFN  # experts a down gather can concatenate
 
 # Decode calls of Qwen3.5-2B as (dim, padded rows, input, output, Y token
 # stride): mixer output (into the next resnorm's D slots), the MTP head's
@@ -21,7 +24,7 @@ VARIANTS = [
     (4096, 2048, "plain", "store", SLOT),
     (2048, 5120, "resnorm", "store", 5120),
     (2048, 8192, "resnorm", "store", 8192),
-    (2048, 12288, "resnorm", "swiglu", 12288 // 4),
+    (2048, 12288, "resnorm", "swiglu", MAX_DIM // 2),
     (6144, 2048, "act", "store", SLOT),
     (2048, 248832, "resnorm", "store", 248832),
     # The MTP draft's LM head over the draft vocabulary.
@@ -36,11 +39,27 @@ VARIANTS = [
     (2048, 9216, "resnorm", "store", 9216),
 ]
 
-# MoE gathers as (dim, rows, input, output, Y token stride, gather, experts):
-# 9 experts (8 routed and the shared one) per call.
+# MoE gathers as (dim, rows, input, output, Y token stride, gather, experts,
+# token counts). One token reads its 8 routed experts and the shared one.
+# Two tokens (a speculative verify, or two prompt tokens) read the union of
+# their routed experts (8 to 16) and the shared one: a variant per count, so
+# a pair pays for the experts it uses.
+MOE_COUNTS = range(9, MAX_EXPERTS + 1)
 MOE_VARIANTS = [
-    (2048, 9 * 1024, "resnorm", "swiglu_scaled", MAX_DIM // 2, "rounds", 9),
-    (9 * EXPERT_FFN, 2048, "act", "store", SLOT, "k", 9),
+    (
+        2048,
+        n * 1024,
+        "resnorm",
+        "swiglu_scaled",
+        MAX_DIM // 2,
+        "rounds",
+        n,
+        (1, 2) if n == 9 else (2,),
+    )
+    for n in MOE_COUNTS
+] + [
+    (n * EXPERT_FFN, 2048, "act", "store", SLOT, "k", n, (1, 2) if n == 9 else (2,))
+    for n in MOE_COUNTS
 ]
 
 
@@ -52,8 +71,8 @@ def sequence_name(dim, rows, prologue, epilogue, tokens, gather="", experts=0):
 def sequences():
     for variant in VARIANTS + MOE_VARIANTS:
         dim, rows, prologue, epilogue, y_stride, *moe = variant
-        gather, experts = moe if moe else ("", 0)
-        for tokens in range(1, TOKENS + 1):
+        gather, experts, token_counts = moe if moe else ("", 0, range(1, TOKENS + 1))
+        for tokens in token_counts:
             yield (dim, rows, prologue, epilogue, y_stride, tokens, gather, experts)
 
 

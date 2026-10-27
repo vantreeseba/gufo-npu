@@ -17,8 +17,10 @@
 // SwiGLU scaled by its router weight) and a down gather (K = the experts'
 // 512-wide outputs back to back), whose weight offsets and scales Select()
 // rewrites before each call. Checked against the CPU over the same q4nx
-// weights for random selections, for one and two tokens; also prints the
-// patch and layer times. Exits 77 (skip) without an NPU.
+// weights for random selections: one token over 9 experts, and two tokens
+// over unions of 9, 13 and 17 experts in which each token weighs some
+// experts 0 (those only the other token chose). Also prints the patch and
+// layer times. Exits 77 (skip) without an NPU.
 namespace {
 
 namespace npu = gufo_npu::npu;
@@ -26,8 +28,7 @@ namespace q4nx = gufo_npu::q4nx;
 namespace quant = gufo_npu::quant;
 using Clock = std::chrono::steady_clock;
 
-constexpr int kExperts = static_cast<int>(npu::kGatherExperts);
-constexpr int kArena = 16;  // experts to choose from
+constexpr int kArena = 20;  // experts to choose from
 constexpr int kFfn = static_cast<int>(npu::kExpertFfn);
 constexpr int kHidden = static_cast<int>(npu::kGemvHidden);
 constexpr double kMaxError = 1e-2;
@@ -117,9 +118,17 @@ int main(int argc, char** argv) {
   bool ok = true;
   double layer_us = 0;
   double patch_us = 0;
-  for (std::size_t tokens = 1; tokens <= npu::kGemvTokens; ++tokens) {
-    npu::Q4nxGather up(rt, npu::Q4nxGather::Kind::kGateUp, arena, tokens);
-    npu::Q4nxGather down(rt, npu::Q4nxGather::Kind::kDown, arena, tokens);
+  struct Case {
+    int experts;
+    std::size_t tokens;
+  };
+  for (const Case call : {Case{9, 1}, Case{9, 2}, Case{13, 2}, Case{17, 2}}) {
+    const int count = call.experts;
+    const std::size_t tokens = call.tokens;
+    npu::Q4nxGather up(rt, npu::Q4nxGather::Kind::kGateUp, arena,
+                       static_cast<std::size_t>(count), tokens);
+    npu::Q4nxGather down(rt, npu::Q4nxGather::Kind::kDown, arena,
+                         static_cast<std::size_t>(count), tokens);
     npu::Buffer mid(rt, up.y_bytes());
     npu::Buffer y(rt, down.y_bytes());
     npu::Buffer r(rt, npu::kGemvResidualBytes);
@@ -135,10 +144,14 @@ int main(int argc, char** argv) {
         experts[i] = i;
       }
       std::shuffle(experts.begin(), experts.end(), rng);
-      // scales[i * tokens + t]: each token weighs the experts differently.
-      std::vector<float> scales(kExperts * tokens);
+      // scales[i * tokens + t]: each token weighs the experts differently,
+      // and with two tokens about a third of each token's are 0.
+      std::vector<float> scales(count * tokens);
       for (auto& s : scales) {
         s = std::uniform_real_distribution<float>(0.05f, 1.0f)(rng);
+        if (tokens == 2 && std::uniform_int_distribution<int>(0, 2)(rng) == 0) {
+          s = 0.0f;
+        }
       }
       up.Select(experts.data(), scales.data());
       down.Select(experts.data());
@@ -146,7 +159,7 @@ int main(int argc, char** argv) {
       y.FromDevice();
       for (std::size_t t = 0; t < tokens; ++t) {
         std::vector<double> want(kHidden, 0.0);
-        for (int i = 0; i < kExperts; ++i) {
+        for (int i = 0; i < count; ++i) {
           const auto& u = up_w[experts[i]];
           std::vector<float> a(kFfn);
           // SwiGLU order: each 32-row tile is 16 gate rows, then their up
@@ -190,12 +203,12 @@ int main(int argc, char** argv) {
     const bool pass = worst < kMaxError;
     ok = ok && pass;
     std::printf(
-        "%s MoE gather, %zu token(s), 9 of %d experts with router scales, vs "
-        "CPU: worst rel err %.2e over 20 selections\n",
-        pass ? "ok  " : "FAIL", tokens, kArena, worst);
+        "%s MoE gather, %zu token(s), %d of %d experts with router scales, "
+        "vs CPU: worst rel err %.2e over 20 selections\n",
+        pass ? "ok  " : "FAIL", tokens, count, kArena, worst);
 
     if (tokens == 1) {
-      std::vector<float> scales(kExperts, 0.5f);
+      std::vector<float> scales(count, 0.5f);
       patch_us = 1e9;
       layer_us = 1e9;
       for (int i = 0; i < 100; ++i) {
@@ -213,7 +226,7 @@ int main(int argc, char** argv) {
       "     patch %.1f us; layer FFN (2 calls, 1 submission) %.1f us, "
       "%.1f GB/s\n",
       patch_us, layer_us,
-      kExperts *
+      static_cast<double>(npu::kGatherExperts) *
           static_cast<double>(npu::ExpertArena::kUpBytes +
                               npu::ExpertArena::kDownBytes) /
           layer_us / 1e3);

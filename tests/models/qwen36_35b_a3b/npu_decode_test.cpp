@@ -30,7 +30,8 @@
 // compared at every position; separately, wherever the NPU chose experts the
 // CPU would not have, that must have been a near tie in the CPU's own router
 // logits. Top-1 against llama.cpp is reported (it includes requantizing to
-// q4nx; QUALITY.md).
+// q4nx; QUALITY.md). Then MTP speculation must reproduce plain greedy
+// decoding exactly, and its acceptance rate is reported.
 //   GUFO_NPU_QWEN36_MODEL   the Qwen3.6-35B-A3B GGUF
 //   GUFO_NPU_QWEN36_ORACLE  oracle output directory
 // Exits 77 (skip) when either is unset or there is no NPU.
@@ -246,6 +247,50 @@ int main(int argc, char** argv) {
         follow.differences, ids.size() * c.layers, follow.worst_gap, same_llama,
         ids.size());
   }
+  // Speculative decoding (an MTP draft verified in a 2-token pass over the
+  // pair's expert union; the prompt in 2-token passes) must give exactly the
+  // plain greedy output (1-token passes after the prompt), token for token:
+  // 48 tokens after each oracle prompt, 256 after the chat prompt.
+  {
+    const std::vector<int> stop;  // none: always the full length
+    struct Reply {
+      const char* prompt;
+      int tokens;
+    };
+    int steps = 0;
+    int accepted = 0;
+    for (const Reply reply : {Reply{"chat", 256}, Reply{"code", 48},
+                              Reply{"prose", 48}, Reply{"long", 48}}) {
+      const auto prompt =
+          ReadIds(fs::path(oracle) / (std::string(reply.prompt) + ".ids.json"));
+      qwen35::SpeculativeStats plain_stats;
+      qwen35::SpeculativeStats spec_stats;
+      const auto plain = qwen35::SpeculativeGenerate(
+          npu, prompt, reply.tokens, stop, false, {}, &plain_stats);
+      const auto spec = qwen35::SpeculativeGenerate(
+          npu, prompt, reply.tokens, stop, true, {}, &spec_stats);
+      std::size_t same = 0;
+      while (same < std::min(plain.size(), spec.size()) &&
+             plain[same] == spec[same]) {
+        ++same;
+      }
+      const bool ok = plain == spec;
+      failures += ok ? 0 : 1;
+      steps += spec_stats.steps;
+      accepted += spec_stats.accepted;
+      std::printf(
+          "%s speculative decode after %s: %zu tokens, %zu equal to plain "
+          "greedy before any difference; %d steps, %d drafts accepted "
+          "(%.0f%%)\n",
+          ok ? "ok  " : "FAIL", reply.prompt, spec.size(), same,
+          spec_stats.steps, spec_stats.accepted,
+          spec_stats.steps ? 100.0 * spec_stats.accepted / spec_stats.steps
+                           : 0.0);
+    }
+    std::printf("     MTP drafts accepted: %d of %d steps (%.0f%%)\n", accepted,
+                steps, steps ? 100.0 * accepted / steps : 0.0);
+  }
+
   const double total = static_cast<double>(matched) / positions;
   const bool agree_ok = total >= kMinArgmaxAgreement;
   failures += agree_ok ? 0 : 1;

@@ -66,12 +66,16 @@ std::size_t Q4nxGemv::y_bytes() const {
 }
 
 struct Q4nxGather::Impl {};
-Q4nxGather::Q4nxGather(GemvRuntime&, Kind, const ExpertArena&, std::size_t) {
+Q4nxGather::Q4nxGather(GemvRuntime&, Kind, const ExpertArena&, std::size_t,
+                       std::size_t) {
   NoXrt();
 }
 Q4nxGather::~Q4nxGather() = default;
 void Q4nxGather::Select(const int*, const float*) {}
 std::size_t Q4nxGather::y_bytes() const {
+  return 0;
+}
+std::size_t Q4nxGather::experts() const {
   return 0;
 }
 std::size_t Q4nxGather::tokens() const {

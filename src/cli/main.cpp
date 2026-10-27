@@ -221,16 +221,17 @@ int BenchBandwidth(const std::vector<std::string_view>& args) {
   return 0;
 }
 
-// One MoE layer's FFN as the decoder runs it: layer 0's first 8 routed
-// experts and its shared expert, the gate + up gather then the down gather
-// in one submission, for 1 and 2 tokens.
+// One MoE layer's FFN as the decoder runs it: the gate + up gather then the
+// down gather in one submission, over layer 0's first routed experts and its
+// shared expert. One token reads 9 experts; two tokens read their union, 9
+// to 17 experts, with a variant per count.
 void BenchMoeFfn(const gufo_npu::gguf::File& file,
                  gufo_npu::npu::GemvRuntime& runtime, int iterations) {
   namespace q4nx = gufo_npu::q4nx;
   namespace npu = gufo_npu::npu;
   const auto ffn = npu::kExpertFfn;
   const auto hidden = npu::kGemvHidden;
-  const npu::ExpertArena arena{npu::kGatherExperts};
+  const npu::ExpertArena arena{npu::kMaxGatherExperts};
   npu::Buffer arena_buf(runtime, arena.bytes());
   auto rows = [&](const char* name, std::size_t first, std::size_t count) {
     const auto& t = file.Tensor(name);
@@ -239,8 +240,9 @@ void BenchMoeFfn(const gufo_npu::gguf::File& file,
         t.data + first * gufo_npu::quant::RowBytes(t.type, t.RowElements()),
         count};
   };
-  for (std::size_t e = 0; e < npu::kGatherExperts; ++e) {
-    const bool shared = e + 1 == npu::kGatherExperts;
+  // Arena slots 0..15: routed experts 0..15; slot 16: the shared expert.
+  for (std::size_t e = 0; e < arena.experts; ++e) {
+    const bool shared = e + 1 == arena.experts;
     const auto up = q4nx::PackRows(
         shared ? std::vector<q4nx::Segment>{rows("blk.0.ffn_gate_shexp.weight",
                                                  0, ffn),
@@ -266,20 +268,21 @@ void BenchMoeFfn(const gufo_npu::gguf::File& file,
   x.ToDevice();
   npu::Buffer y(runtime, npu::kGemvResidualBytes);
   npu::Buffer r(runtime, npu::kGemvResidualBytes);
-  int ids[npu::kGatherExperts];
-  float scales[npu::kGatherExperts * npu::kGemvTokens];
-  for (std::size_t i = 0; i < npu::kGatherExperts; ++i) {
-    ids[i] = static_cast<int>(i);
-  }
-  std::fill_n(scales, npu::kGatherExperts * npu::kGemvTokens, 0.5f);
-  double mean_us[2];
-  for (std::size_t tokens = 1; tokens <= npu::kGemvTokens; ++tokens) {
+  // Mean us of one submission of the two gathers over `experts` experts.
+  auto time = [&](std::size_t experts, std::size_t tokens) {
     npu::Q4nxGather gate_up(runtime, npu::Q4nxGather::Kind::kGateUp, arena,
-                            tokens);
-    npu::Q4nxGather down(runtime, npu::Q4nxGather::Kind::kDown, arena, tokens);
+                            experts, tokens);
+    npu::Q4nxGather down(runtime, npu::Q4nxGather::Kind::kDown, arena, experts,
+                         tokens);
     npu::Buffer mid(runtime, gate_up.y_bytes());
-    gate_up.Select(ids, scales);
-    down.Select(ids);
+    std::vector<int> ids(experts);
+    for (std::size_t i = 0; i + 1 < experts; ++i) {
+      ids[i] = static_cast<int>(i);
+    }
+    ids.back() = static_cast<int>(arena.experts - 1);
+    const std::vector<float> scales(experts * tokens, 0.5f);
+    gate_up.Select(ids.data(), scales.data());
+    down.Select(ids.data());
     npu::Chain chain(runtime);
     chain.Add(gate_up, x, arena_buf, mid, r);
     chain.Add(down, mid, arena_buf, y, r);
@@ -293,13 +296,24 @@ void BenchMoeFfn(const gufo_npu::gguf::File& file,
                      .count();
       }
     }
-    mean_us[tokens - 1] = total / std::max(iterations, 1);
-  }
-  const double mb = static_cast<double>(arena.bytes()) / 1e6;
+    return total / std::max(iterations, 1);
+  };
+  const double expert_mb = static_cast<double>(npu::ExpertArena::kUpBytes +
+                                               npu::ExpertArena::kDownBytes) /
+                           1e6;
+  const double one = time(npu::kGatherExperts, 1);
+  const double two = time(npu::kGatherExperts, 2);
   std::printf("%-22s %6zu %7zu %8.1f %10.1f %10.1f %8.1f %8.2fx\n",
-              "MoE FFN (9 experts)", hidden, npu::kGatherExperts * 2 * ffn, mb,
-              mean_us[0], mean_us[1], mb * 1e6 / mean_us[0] / 1e3,
-              mean_us[1] / mean_us[0]);
+              "MoE FFN (9 experts)", hidden, npu::kGatherExperts * 2 * ffn,
+              npu::kGatherExperts * expert_mb, one, two,
+              npu::kGatherExperts * expert_mb * 1e6 / one / 1e3, two / one);
+  std::printf("2-token MoE FFN by expert count (the pair's union + shared):\n");
+  for (std::size_t experts = npu::kGatherExperts;
+       experts <= npu::kMaxGatherExperts; experts += 2) {
+    const double us = time(experts, 2);
+    std::printf("  %2zu experts %5.1f MB %8.1f us %6.1f GB/s\n", experts,
+                experts * expert_mb, us, experts * expert_mb * 1e3 / us);
+  }
 }
 
 int BenchGemv(const std::vector<std::string_view>& args) {
@@ -456,11 +470,6 @@ int BenchMtp(const std::vector<std::string_view>& args) {
   }
   namespace qwen35 = gufo_npu::qwen35;
   const auto file = gufo_npu::gguf::File::Open(model);
-  if (qwen35::ReadConfig(*file).IsMoe()) {
-    std::fprintf(stderr,
-                 "bench mtp: MoE models have no MTP head on the NPU yet\n");
-    return 1;
-  }
   const gufo_npu::Tokenizer tokenizer(*file);
   auto seq = tokenizer.Encode(qwen35::RenderChat({{"user", prompt}}, false));
   const std::size_t prompt_len = seq.size();
@@ -513,7 +522,11 @@ int BenchMtp(const std::vector<std::string_view>& args) {
         "%zu/%zu (%.1f%%)\n",
         per_draft, hits, total, total ? 100.0 * hits / total : 0.0);
   }
+  // The CPU head's formulations (dense models with tied embeddings only).
   for (const bool after_norm : {true, false}) {
+    if (npu.config().IsMoe()) {
+      break;
+    }
     for (const bool token_position : {true, false}) {
       qwen35::MtpHead mtp(*file, {after_norm, token_position});
       auto state = mtp.NewState();
@@ -745,8 +758,8 @@ int Generate(const std::vector<std::string_view>& args) {
   if (device == "npu") {
     const auto load_start = std::chrono::steady_clock::now();
     qwen35::NpuDecoder npu(*file, KernelDir(kernels));
-    // MoE models have no NPU prefill or MTP head yet: their prompt goes
-    // through the decoder and they decode without drafting.
+    // MoE models have no NPU prefill yet: their prompt goes through the
+    // decoder, two tokens per pass.
     std::optional<qwen35::NpuPrefill> prefill;
     if (!npu.config().IsMoe()) {
       prefill.emplace(*file, KernelDir(kernels));
@@ -755,6 +768,7 @@ int Generate(const std::vector<std::string_view>& args) {
         std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                       load_start)
             .count();
+    // A GGUF without the MTP layer decodes without a draft.
     const bool speculate = draft == "mtp" && npu.can_draft();
     qwen35::SpeculativeStats stats;
     qwen35::SpeculativeGenerate(
@@ -778,7 +792,7 @@ int Generate(const std::vector<std::string_view>& args) {
                      ? stats.generated_tokens / stats.decode_seconds
                      : 0.0,
                  speculate        ? "MTP draft"
-                 : draft == "mtp" ? "no draft (no NPU MTP head here)"
+                 : draft == "mtp" ? "no draft (no MTP layer in the GGUF)"
                                   : "no draft");
     std::fprintf(stderr,
                  "[%d decode steps, %d drafts accepted (%.0f%%); %ld NPU "
