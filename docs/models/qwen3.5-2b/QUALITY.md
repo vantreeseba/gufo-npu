@@ -68,6 +68,14 @@ all prompts, logits relative error < 1e-2 per prompt. 2026-10-27:
   against HF here (GGUF CPU vs q4nx CPU), on short prompts. A longer quality
   run decides whether an 8-bit kernel variant is needed.
 
+## Fast decoder vs reference
+
+`qwen35_decoder_test` (label `model`; needs `GUFO_NPU_QWEN35_2B_Q4_GGUF` and
+`GUFO_NPU_QWEN35_2B_ORACLE`, no NPU): the fp32 decode step against the
+reference, token by token on the chat prompt, both with the same q4nx
+projections on the CPU. Pass: logits relative error < 1e-4 and every argmax
+equal. 2026-10-27: worst 2.5e-6, argmax 19/19.
+
 ## Planned
 
 | Check | Tolerance |

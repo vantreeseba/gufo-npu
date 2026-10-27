@@ -74,22 +74,30 @@ Measured 2026-10-27.
   bf16 halves, and writes fp32. That took its error from 4.5e-3 to 6e-6 at
   the same speed.
 
-## NPU decode, end to end (Phase 3, step 2)
+## NPU decode, end to end (Phase 3)
 
 `gufo-npu generate --device npu --model Qwen3.5-2B-UD-Q4_K_XL.gguf --prompt
-"Name three primary colors, briefly." --max-tokens 48`: every matrix product
-on the NPU (97 GEMVs per token), everything else in the CPU reference.
-2026-10-27.
+"Name three primary colors, briefly." --max-tokens 128` (19 prompt tokens,
+stops after 64): every matrix product on the NPU (97 GEMVs per token), the
+rest in the fp32 decoder on the CPU. Three runs in a row, 2026-10-27:
 
-| | Decode tok/s | ms per token |
-|---|---|---|
-| CPU reference (GGUF weights) | 5.55 | 180 |
-| NPU projections | 22.4 | 44.8 |
-| FLM (Lemonade), for reference | 28.5 | 35 |
+| Path | Decode tok/s | ms per token | TTFT (19 tokens) |
+|---|---|---|---|
+| CPU reference (GGUF weights) | 5.55 | 180 | 1.83 s |
+| NPU projections + CPU reference math | 22.4 | 44.8 | 0.85 s |
+| **NPU projections + fp32 decoder** | **32.5** (32.45, 32.52, 32.69) | **30.7** | 0.59 s |
+| FLM (Lemonade), 35-token prompt | 28.5 | 35.1 | 0.60 s |
 
-- Of the 44.8 ms: ~29 ms in GEMV calls (~21 ms streaming 1.2 GB at 56 GB/s,
-  ~8 ms fixed per-call cost and copies), ~16 ms in the CPU reference's
-  DeltaNet, attention and norms (fp32/double, one thread).
-- Next: a fast CPU decode step (multi-threaded fp32, ~1–2 ms), then fewer
-  host round trips (runlists, ops moved onto the NPU).
-- Prompts run through the same per-token path for now (prefill is Phase 4).
+- FLM's number comes from its server (`tools/bench/openai_bench.py`, 256
+  generated tokens); ours from the CLI with a 64-token reply. Both are warm
+  and short-context; a like-for-like run waits for `gufo-npu serve`
+  (Phase 5).
+- Of the 30.7 ms: ~28.4 ms in GEMV calls (~21.4 ms streaming 1.2 GB at
+  56 GB/s, ~7 ms fixed cost: ~62 µs per call from submit to completion,
+  measured on the smoke kernel; polling instead of waiting saves ~3 µs,
+  buffer syncs ~0.3 µs), ~2.3 ms in the decoder's CPU math. The LM head alone
+  is 5.7 ms.
+- A runlist dispatch costs ~20 µs, so chaining a layer's GEMVs (which needs
+  the norms, residuals, SwiGLU, DeltaNet and attention on the NPU) is worth
+  up to ~4 ms per token. The streaming floor is ~21.4 ms (~47 tok/s).
+- Prompts run token by token through the decode path (prefill is Phase 4).

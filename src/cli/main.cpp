@@ -20,6 +20,7 @@
 #include "core/quant.hpp"
 #include "core/tokenizer.hpp"
 #include "models/qwen35/chat.hpp"
+#include "models/qwen35/decoder.hpp"
 #include "models/qwen35/generate.hpp"
 #include "models/qwen35/q4nx_projections.hpp"
 #include "models/qwen35/reference.hpp"
@@ -342,11 +343,32 @@ int Generate(const std::vector<std::string_view>& args) {
   namespace qwen35 = gufo_npu::qwen35;
   const auto file = gufo_npu::gguf::File::Open(model);
   const gufo_npu::Tokenizer tokenizer(*file);
-  const qwen35::Reference reference(*file);
+  std::unique_ptr<qwen35::Reference> reference;
   std::unique_ptr<qwen35::Q4nxProjections> npu;
+  std::unique_ptr<qwen35::Decoder> decoder;
+  qwen35::Decoder::State state;
+  qwen35::ForwardFn forward;
   if (device == "npu") {
     npu = std::make_unique<qwen35::Q4nxProjections>(
         *file, qwen35::Q4nxProjections::Backend::kNpu, KernelDir(kernels));
+    decoder = std::make_unique<qwen35::Decoder>(*file, *npu);
+    state = decoder->NewState();
+    forward = [&](const std::vector<int>& ids) {
+      const float* logits = nullptr;
+      for (const int id : ids) {
+        logits = decoder->Step(id, state).data();
+      }
+      return logits;
+    };
+  } else {
+    reference = std::make_unique<qwen35::Reference>(*file);
+    forward = [&, logits = std::vector<float>(),
+               ref_state =
+                   reference->NewState()](const std::vector<int>& ids) mutable {
+      logits = reference->Forward(ids, ref_state).logits;
+      return logits.data() + (ids.size() - 1) * static_cast<std::size_t>(
+                                                    reference->config().vocab);
+    };
   }
 
   std::vector<qwen35::Message> messages;
@@ -360,14 +382,14 @@ int Generate(const std::vector<std::string_view>& args) {
 
   qwen35::GenerateStats stats;
   qwen35::GreedyGenerate(
-      reference, ids, max_tokens, stop,
+      forward, qwen35::ReadConfig(*file).vocab, ids, max_tokens, stop,
       [&](int id) {
         if (std::find(stop.begin(), stop.end(), id) == stop.end()) {
           std::fputs(tokenizer.TokenBytes(id).c_str(), stdout);
           std::fflush(stdout);
         }
       },
-      &stats, npu.get());
+      &stats);
   std::fprintf(stderr,
                "\n[%d prompt tokens in %.2f s; %d generated in %.2f s, "
                "%.2f tok/s; %s]\n",
@@ -376,7 +398,7 @@ int Generate(const std::vector<std::string_view>& args) {
                stats.decode_seconds > 0
                    ? stats.generated_tokens / stats.decode_seconds
                    : 0.0,
-               npu ? "NPU projections" : "CPU reference");
+               npu ? "NPU decoder" : "CPU reference");
   if (npu) {
     std::fprintf(stderr, "[%ld GEMVs, %.2f s on the NPU including copies]\n",
                  npu->gemv_calls(), npu->gemv_seconds());
