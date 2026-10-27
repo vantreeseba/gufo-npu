@@ -1,0 +1,13 @@
+gufo-npu
+Copyright (c) 2026 gufo-npu contributors. Licensed under the MIT License.
+
+Project layout, conventions and CI structure follow gufo
+(https://github.com/gufo-org/gufo), MIT License, Copyright (c) 2026 gufo
+contributors. tools/ci/check-pr-title.py, .clang-format and .clang-tidy are
+adapted from it.
+
+NPU kernels are built with, and may include code from:
+- MLIR-AIE (https://github.com/Xilinx/mlir-aie), Apache-2.0 WITH LLVM-exception
+- IRON (https://github.com/amd/IRON), Apache-2.0
+- llvm-aie / Peano (https://github.com/Xilinx/llvm-aie), Apache-2.0 WITH LLVM-exception
+The runtime image bundles XRT (https://github.com/Xilinx/XRT), Apache-2.0.

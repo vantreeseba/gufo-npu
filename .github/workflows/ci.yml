@@ -1,0 +1,47 @@
+name: CI
+
+# Pull requests build and test without publishing. Pushes to any branch also
+# publish ghcr.io/<owner>/gufo-npu:<branch> and :sha-<sha> for testing on a
+# Strix Halo machine (see docs/TESTING.md).
+
+on:
+  push:
+    branches: [ '**' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Repository checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Unit tests for CI scripts
+        run: python3 -m unittest discover -s tests/tools -p '*_test.py'
+
+      # Same clang-format release as the toolchain image (Ubuntu 24.04).
+      - name: C++ formatting
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q clang-format
+          python3 tools/ci/check-format.py
+
+  build:
+    name: Build, test and package
+    uses: ./.github/workflows/linux-build.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      push: ${{ github.event_name != 'pull_request' }}

@@ -1,0 +1,71 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}"
+    },
+    {
+      "name": "release",
+      "displayName": "Production build: XRT runtime + NPU kernels",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "GUFO_NPU_ENABLE_XRT": "ON",
+        "GUFO_NPU_BUILD_KERNELS": "ON",
+        "BUILD_TESTING": "ON"
+      }
+    },
+    {
+      "name": "npu-test",
+      "displayName": "RelWithDebInfo with assertions, for NPU development",
+      "inherits": "release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_CXX_FLAGS": "-UNDEBUG"
+      }
+    },
+    {
+      "name": "cpu-test",
+      "displayName": "CPU-only: no XRT, no kernel compiler",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "GUFO_NPU_ENABLE_XRT": "OFF",
+        "GUFO_NPU_BUILD_KERNELS": "OFF",
+        "BUILD_TESTING": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "release", "configurePreset": "release" },
+    { "name": "npu-test", "configurePreset": "npu-test" },
+    { "name": "cpu-test", "configurePreset": "cpu-test" }
+  ],
+  "testPresets": [
+    {
+      "name": "cpu",
+      "displayName": "CPU tests (hosted CI)",
+      "configurePreset": "release",
+      "filter": { "exclude": { "label": "npu" } },
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "cpu-only",
+      "configurePreset": "cpu-test",
+      "filter": { "exclude": { "label": "npu" } },
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "npu",
+      "displayName": "Tests that need /dev/accel/accel0",
+      "configurePreset": "npu-test",
+      "filter": { "include": { "label": "npu" } },
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error" }
+    }
+  ]
+}

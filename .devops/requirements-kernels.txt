@@ -1,0 +1,11 @@
+# NPU kernel compiler, pinned together. mlir-aie and llvm-aie (Peano) are not
+# on PyPI; these are the versions amd/IRON's CI uses at the pinned commit
+# below. Bump all three together and record it in docs/TOOLCHAIN.md.
+--find-links https://github.com/Xilinx/mlir-aie/releases/expanded_assets/v1.4.4
+--find-links https://github.com/Xilinx/llvm-aie/releases/expanded_assets/nightly
+
+mlir_aie==v1.4.4
+llvm-aie==22.0.0.2026092101+0006955e
+numpy
+ml_dtypes
+iron @ git+https://github.com/amd/IRON@b3ba3cf3a138c21e021d5ee2d6794573cd7a3287

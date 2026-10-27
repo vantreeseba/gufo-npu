@@ -1,0 +1,40 @@
+# gufo-npu
+
+An open-source engine for running **Qwen3.6-35B-A3B** on the **AMD XDNA2 NPU**
+in Strix Halo (Ryzen AI MAX+ 395), on Linux.
+
+The only NPU runtime for this model today, [FastFlowLM](https://github.com/ROCm/FastFlowLM),
+ships its kernels as closed binaries. gufo-npu writes its own kernels with
+AMD's open [IRON](https://github.com/amd/IRON) / [MLIR-AIE](https://github.com/Xilinx/mlir-aie)
+toolchain so every bottleneck can be fixed. See [docs/PLAN.md](docs/PLAN.md).
+
+**Status: Phase 0.** The toolchain, CI and NPU runtime path work end to end:
+a kernel compiled on a hosted CI runner runs on a Strix Halo NPU. The model is
+not implemented yet.
+
+| Phase | Scope | State |
+|---|---|---|
+| 0 | Repo, CI, pinned toolchain, smoke kernel | done |
+| 1 | Hardware microbenchmarks (dispatch, DMA bandwidth, int4 GEMV) | dispatch done |
+| 2 | CPU reference model (GGUF + Q4NX) | |
+| 3 | NPU decode | |
+| 4 | NPU prefill | |
+| 5 | OpenAI-compatible server | |
+
+## Try it
+
+```sh
+docker run --rm --device /dev/accel/accel0 --ulimit memlock=-1:-1 \
+  -v /opt/xilinx/xrt:/opt/xilinx/xrt:ro \
+  ghcr.io/vantreeseba/gufo-npu:main diagnose
+# also: smoke, bench dispatch
+```
+
+Drop the `/opt/xilinx/xrt` mount to use the XRT bundled in the image. Host
+requirements and pinned versions: [docs/TOOLCHAIN.md](docs/TOOLCHAIN.md).
+Testing and CI: [docs/TESTING.md](docs/TESTING.md).
+Model docs: [docs/models/qwen3.6-35b-a3b](docs/models/qwen3.6-35b-a3b/README.md).
+
+## License
+
+MIT; see [LICENSE](LICENSE) and [NOTICE](NOTICE).

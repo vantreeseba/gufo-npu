@@ -1,0 +1,57 @@
+name: NPU smoke
+
+# Runs a published image on a self-hosted Strix Halo runner with labels
+# [linux, strix-halo, npu]. Manual until a runner is registered; see
+# docs/TESTING.md for registering one.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Image tag to test (branch name or sha-<commit>)
+        required: true
+        default: main
+      host-xrt:
+        description: Mount the host's /opt/xilinx/xrt into the container
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: npu-smoke
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    name: Diagnose and smoke kernel
+    runs-on: [ self-hosted, linux, strix-halo, npu ]
+    timeout-minutes: 15
+    steps:
+      - name: Pull image
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:${TAG}"
+          printf '%s' "${GITHUB_TOKEN}" \
+            | docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+          docker pull "${image}"
+          echo "IMAGE=${image}" >> "${GITHUB_ENV}"
+
+      - name: Diagnose and smoke
+        env:
+          HOST_XRT: ${{ inputs.host-xrt }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(--rm --device /dev/accel/accel0 --ulimit memlock=-1:-1)
+          if [[ "${HOST_XRT}" == "true" && -d /opt/xilinx/xrt ]]; then
+            args+=(-v /opt/xilinx/xrt:/opt/xilinx/xrt:ro)
+          fi
+          docker run "${args[@]}" "${IMAGE}" diagnose | tee -a "${GITHUB_STEP_SUMMARY}"
+          docker run "${args[@]}" "${IMAGE}" smoke --iters 1000 | tee -a "${GITHUB_STEP_SUMMARY}"
