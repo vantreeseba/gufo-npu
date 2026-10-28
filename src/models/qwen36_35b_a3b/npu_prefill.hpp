@@ -98,8 +98,10 @@ private:
 // The prompt hook for SpeculativeGenerate: every prompt token but the last
 // through `prefill`, and the MTP cache over them; the decoder then runs the
 // last token for its logits. Prompts shorter than kMinPrefillPrompt, which
-// the decoder's two-token passes run faster, are left to the decoder.
-inline constexpr int kMinPrefillPrompt = 64;
+// the decoder's two-token passes run faster, are left to the decoder:
+// measured (BENCHMARKS.md), a prefill pass costs ~2.78 s at 64 tokens plus
+// ~9 ms per token, the decode path ~30 ms per token, even at ~108.
+inline constexpr int kMinPrefillPrompt = 108;
 qwen35::PromptPrefill PrefillPrompt(NpuPrefill& prefill);
 
 }  // namespace gufo_npu::qwen36_35b_a3b
