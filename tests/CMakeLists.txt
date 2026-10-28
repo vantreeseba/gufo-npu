@@ -62,8 +62,14 @@ add_test(NAME serve_text_test COMMAND serve_text_test)
 add_executable(serve_server_test serve/server_test.cpp)
 target_link_libraries(serve_server_test PRIVATE gufo_npu_serve cpp_httplib)
 add_test(NAME serve_server_test COMMAND serve_server_test)
-set_tests_properties(serve_text_test serve_server_test PROPERTIES
-                     LABELS serve TIMEOUT 120)
+# The same with the real Qwen3.5 chat format: reasoning and tool calls end
+# to end.
+add_executable(serve_chat_test serve/server_chat_test.cpp)
+target_link_libraries(serve_chat_test PRIVATE gufo_npu_serve
+                      gufo_npu_serve_chat cpp_httplib)
+add_test(NAME serve_chat_test COMMAND serve_chat_test)
+set_tests_properties(serve_text_test serve_server_test serve_chat_test
+                     PROPERTIES LABELS serve TIMEOUT 120)
 
 add_executable(tokenizer_test core/tokenizer_test.cpp)
 target_link_libraries(tokenizer_test PRIVATE gufo_npu_core nlohmann_json)
