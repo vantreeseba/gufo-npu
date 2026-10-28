@@ -405,10 +405,32 @@ relative error 4.8e-4 to 7.9e-4).
 ## NPU prefill
 
 `qwen36_35b_a3b::NpuPrefill` (src/models/qwen36_35b_a3b): every prompt
-token but the last through the model layer by layer on the NPU (bfp16 GEMMs
-on bfp16 weights converted from the decoder's own q4nx), the mixers and the
-routing on the CPU; then the decoder runs the last token. Measured
-2026-10-27 on the box.
+token but the last through the model layer by layer: the dense matrices as
+bfp16 GEMMs on the NPU (bfp16 weights converted from the decoder's own
+q4nx), the mixers and the routing on the CPU, the experts on the CPU
+(`ExpertBackend::kCpu`, the default) or on the NPU (`kNpu`); then the
+decoder runs the last token. Measured 2026-10-27 (NPU experts) and
+2026-10-28 (CPU experts) on the box.
+
+### CPU expert step (`qwen36_cpu_experts_test`, labels `qwen36_35b_a3b;kernels`)
+
+Eight random q4nx experts (σ 0.03) and a shared one in the decoder's arena
+layout, 37 tokens routed to 2–4 experts each plus the shared one (one
+expert takes none), bf16 activations, against a double-precision
+computation over the same q4nx weights (SwiGLU unrounded): the experts'
+contribution to each token's residual.
+
+| Path | Worst token rel. L2 | Repeat | Limit |
+|---|---|---|---|
+| Portable (any x86-64-v3 CPU; hosted CI) | 3.67e-3 | bit-identical | < 1e-2 |
+| AVX-512 BF16 (the box) | 3.67e-3 | bit-identical | < 1e-2 |
+
+(The experts are packed with the search fit, as the 35B packs its weights;
+3.80e-3 with the min/max fit.)
+
+The step rounds each q4nx weight once to bf16 (dmin·mn + d·sc·code built
+exactly in fp32) and the SwiGLU output to bf16 before the down projection;
+the sums are fp32. The test needs no NPU and runs on hosted CI.
 
 ### Ops (`qwen36_prefill_ops_test`, labels `qwen36_35b_a3b;npu;kernels`)
 
@@ -454,7 +476,43 @@ cut to 1, 2, 1,024, 1,025, 2,049 and 4,000 tokens.
 (A one-token prompt prefills nothing; its row is all zeros.) Argmax agrees
 170/170; every prompt's repeat is bit-identical; MTP speculation after the
 prefill gives exactly the plain greedy output after it (48 tokens, 68% of
-drafts kept).
+drafts kept). That table is the experts on the NPU (`kNpu`, the test's `npu`
+argument, `qwen36_npu_prefill_npu_experts_test`); 2026-10-28 it gives the
+same results.
+
+With the experts on the CPU (the default, `qwen36_npu_prefill_test`),
+2026-10-28, on the min/max-fit weights before #15: the same checks, the
+errors equal or a little smaller (the experts' weights are rounded to bf16
+per value rather than to bfp16 per 8, and their activations stay bf16):
+
+| Prompt | Hidden | Conv | DeltaNet state | K/V | MTP K/V | Logits | Argmax | Routings unlike the prefill's own (largest gap) | Hidden per token: max / over 0.1 |
+|---|---|---|---|---|---|---|---|---|---|
+| chat (17) | 6.0e-3 | 1.2e-2 | 1.6e-2 | 1.8e-2 | 1.2e-2 | 5.4e-2 | 17/17 | 43 of 640 (3.8e-2) | 3.8e-2 / 0 |
+| code (15) | 2.4e-2 | 1.2e-2 | 4.8e-2 | 2.9e-2 | 1.3e-2 | 4.2e-2 | 17/17 | 45 of 560 (4.1e-2) | 7.4e-2 / 0 |
+| prose (39) | 1.4e-2 | 1.1e-2 | 1.6e-2 | 1.7e-2 | 1.4e-2 | 2.8e-2 | 17/17 | 80 of 1,520 (3.4e-2) | 3.2e-2 / 0 |
+| long (230) | 1.6e-2 | 1.3e-2 | 1.4e-2 | 1.9e-2 | 1.4e-2 | 2.8e-2 | 17/17 | 651 of 9,160 (6.4e-2) | 3.2e-2 / 0 |
+| 2 | 2.2e-3 | 1.2e-2 | 2.2e-2 | 2.2e-2 | 1.8e-2 | 4.1e-2 | 16/17 | 3 of 40 (5.3e-3) | 2.2e-3 / 0 |
+| 1,024 | 4.3e-2 | 5.6e-2 | 5.5e-2 | 7.1e-2 | 1.5e-2 | 9.8e-2 | 17/17 | 7,286 of 40,920 (1) | 0.59 / 40 |
+| 1,025 | 4.3e-2 | 5.7e-2 | 5.1e-2 | 7.1e-2 | 1.5e-2 | 8.4e-2 | 17/17 | 7,299 of 40,960 (1) | 0.59 / 40 |
+| 2,049 | 7.3e-2 | 3.0e-2 | 5.0e-2 | 0.11 | 1.5e-2 | 0.16 | 17/17 | 20,483 of 81,920 (1) | 0.91 / 191 |
+| 4,000 | 8.0e-2 | 2.9e-2 | 5.1e-2 | 0.11 | 1.6e-2 | 0.12 | 17/17 | 45,142 of 159,960 (1) | 0.91 / 370 |
+
+Argmax 169/170 (the 2-token prompt's one teacher-forced step that flips is
+within the 95% limit); the first token is the decode path's on 9 of 10
+prompts (the 230-token passage again a 0.01-logit tie); every repeat is
+bit-identical; speculation after the prefill equals plain greedy (48 tokens,
+57% of drafts kept). The same limits hold.
+
+With the search fit (#15), 2026-10-28, both backends pass the same limits:
+
+| Experts | Argmax | First token (own routing) | 1,024: hidden / logits | 2,049: hidden / K/V / logits | 4,000: hidden / K/V / logits | Speculation after prefill |
+|---|---|---|---|---|---|---|
+| CPU (default) | 169/170 | same on 10 of 10 | 4.5e-2 / 0.17 | 7.2e-2 / 9.9e-2 / 0.11 | 8.2e-2 / 0.11 / 0.17 | equals greedy (48 tokens, 66% kept) |
+| NPU | 167/170 | same on 10 of 10 | 4.1e-2 / 0.16 | 7.5e-2 / 0.10 / 0.12 | 8.5e-2 / 0.11 / 0.16 | equals greedy (48 tokens, 66% kept) |
+
+The NPU backend's 167/170 is #15's own measurement again (near ties in the
+decode path's top two after routing diverges on the long prompts); every
+repeat is bit-identical on both.
 
 **With the search fit** (this model's fit since 2026-10-28, `qwen35::Q4nxFit`)
 argmax agrees 167/170 (pass ≥ 95%); the states after prefill are as close to

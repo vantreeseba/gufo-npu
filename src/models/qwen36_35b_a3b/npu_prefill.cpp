@@ -17,6 +17,7 @@
 #include "core/vec.hpp"
 #include "models/qwen35/moe.hpp"
 #include "models/qwen35/prefill_mixer.hpp"
+#include "models/qwen36_35b_a3b/cpu_experts.hpp"
 #include "models/qwen36_35b_a3b/expert_step.hpp"
 #include "models/qwen36_35b_a3b/npu_experts.hpp"
 #include "models/qwen36_35b_a3b/prefill_device.hpp"
@@ -40,6 +41,45 @@ constexpr std::size_t kMixerOut = 4096;  // ssm_out / attn_output inputs
 constexpr std::size_t kMaxInRows = 12288;
 constexpr std::size_t kDenseOutOffset = BfpBytes(kMaxInRows, kHidden);
 static_assert(kDenseOutOffset % 64 == 0, "buffer windows start on 64 bytes");
+
+// Dot(w, x[t], n) for four rows x[t] at once, reading w once: the same
+// sums in the same order as vec::Dot, so the router logits (and so the
+// routing) are those of one Dot per token.
+void Dot4(const float* w, const float* const* x, int n, float* out) {
+#if defined(__AVX2__) && defined(__FMA__)
+  __m256 acc0[4];
+  __m256 acc1[4];
+  for (int t = 0; t < 4; ++t) {
+    acc0[t] = _mm256_setzero_ps();
+    acc1[t] = _mm256_setzero_ps();
+  }
+  int i = 0;
+  for (; i + 16 <= n; i += 16) {
+    const __m256 w0 = _mm256_loadu_ps(w + i);
+    const __m256 w1 = _mm256_loadu_ps(w + i + 8);
+    for (int t = 0; t < 4; ++t) {
+      acc0[t] = _mm256_fmadd_ps(w0, _mm256_loadu_ps(x[t] + i), acc0[t]);
+      acc1[t] = _mm256_fmadd_ps(w1, _mm256_loadu_ps(x[t] + i + 8), acc1[t]);
+    }
+  }
+  for (int t = 0; t < 4; ++t) {
+    const __m256 acc = _mm256_add_ps(acc0[t], acc1[t]);
+    __m128 sum =
+        _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+    sum = _mm_hadd_ps(sum, sum);
+    sum = _mm_hadd_ps(sum, sum);
+    float total = _mm_cvtss_f32(sum);
+    for (int j = i; j < n; ++j) {
+      total += w[j] * x[t][j];
+    }
+    out[t] = total;
+  }
+#else
+  for (int t = 0; t < 4; ++t) {
+    out[t] = Dot(w, x[t], n);
+  }
+#endif
+}
 
 std::vector<float> ToFloats(const gguf::TensorInfo& t) {
   std::vector<float> out(t.num_elements);
@@ -69,10 +109,15 @@ struct NpuPrefill::Impl {
   std::optional<DeviceMatrix> eh_proj, mtp_in;
 
   PrefillDevice device;
+  ExpertBackend backend;
 
   // Device scratch: bfp16 weights converted per pass, and GEMM operands.
   std::optional<Buffer> dense_b;  // a layer's input, then output projection
-  std::optional<Buffer> mtp_b;    // eh_proj, then the MTP block's input
+  // With kCpu: every layer's input and output projections as bfp16,
+  // converted once (input at 0, output at dense_out[il]).
+  std::vector<Buffer> dense_all;
+  std::vector<std::size_t> dense_out;
+  std::optional<Buffer> mtp_b;  // eh_proj, then the MTP block's input
   std::optional<Buffer> a_dense, c_dense;
   int dense_layer = -1;  // whose matrices dense_b holds
   bool mtp_ready = false;
@@ -104,8 +149,10 @@ struct NpuPrefill::Impl {
   double gap = 0;
 
   Impl(const gguf::File& file, qwen35::NpuDecoder& decoder,
-       const std::filesystem::path& kernel_dir)
-      : config(decoder.config()), device(kernel_dir, profile) {
+       const std::filesystem::path& kernel_dir, ExpertBackend experts_on)
+      : config(decoder.config()),
+        device(kernel_dir, profile),
+        backend(experts_on) {
     const Config& c = config;
     if (!c.IsMoe() || static_cast<std::size_t>(c.hidden) != kHidden ||
         static_cast<std::size_t>(c.expert_ffn) != kExpertFfn ||
@@ -122,6 +169,7 @@ struct NpuPrefill::Impl {
       throw std::logic_error("qwen36_35b_a3b prefill: decoder layer count");
     }
     std::vector<Buffer> arenas;
+    std::vector<const std::uint8_t*> arena_hosts;
     for (int il = 0; il < c.layers; ++il) {
       const std::string p = "blk." + std::to_string(il) + ".";
       Layer& l = layers.emplace_back();
@@ -142,6 +190,7 @@ struct NpuPrefill::Impl {
       l.in = w.in;
       l.out = w.out;
       arenas.push_back(*w.arena);
+      arena_hosts.push_back(w.arena->as<std::uint8_t>());
     }
     if (c.mtp_layers > 0 && weights_on_device.eh_proj &&
         weights_on_device.mtp_in) {
@@ -159,10 +208,34 @@ struct NpuPrefill::Impl {
     }
 
     const std::size_t arena_experts = static_cast<std::size_t>(c.experts) + 1;
-    experts = MakeNpuExperts(device, pool, std::move(arenas), arena_experts,
-                             static_cast<std::size_t>(kMaxPromptChunk));
-    dense_b.emplace(device.gemm,
-                    kDenseOutOffset + BfpBytes(kHidden, kMixerOut));
+    if (backend == ExpertBackend::kNpu) {
+      experts = MakeNpuExperts(device, pool, std::move(arenas), arena_experts,
+                               static_cast<std::size_t>(kMaxPromptChunk));
+      dense_b.emplace(device.gemm,
+                      kDenseOutOffset + BfpBytes(kHidden, kMixerOut));
+    } else {
+      experts = MakeCpuExperts(pool, std::move(arena_hosts), arena_experts,
+                               static_cast<std::size_t>(kMaxPromptChunk));
+      // Every dense matrix (and the MTP head's) converted now, in one visit
+      // to the dequant program; the NPU then only runs GEMMs.
+      Batch batch(device.dequant);
+      for (int il = 0; il < c.layers; ++il) {
+        const Layer& l = layers[il];
+        const std::size_t in_bytes = BfpBytes(l.in->rows, l.in->dim);
+        dense_out.push_back(in_bytes);
+        dense_all.emplace_back(device.gemm,
+                               in_bytes + BfpBytes(l.out->rows, l.out->dim));
+      }
+      for (int il = 0; il < c.layers; ++il) {
+        AddDequant(batch, *layers[il].in, dense_all[il], 0);
+        AddDequant(batch, *layers[il].out, dense_all[il], dense_out[il]);
+      }
+      if (has_mtp) {
+        AddMtp(batch);
+        mtp_ready = true;
+      }
+      device.Run(batch, device.dequant);
+    }
     a_dense.emplace(device.gemm, kMaxRows * kMixerOut * sizeof(std::uint16_t));
     c_dense.emplace(device.gemm, kMaxRows * kMaxInRows * sizeof(std::uint16_t));
     normed.resize(kMaxRows * kHidden);
@@ -250,6 +323,10 @@ struct NpuPrefill::Impl {
   // the pass's tokens, in blocks of up to kMaxRows.
   void Mixers(int il, int count, DecodeState& state) {
     const Layer& l = layers[il];
+    Buffer& weights_b =
+        backend == ExpertBackend::kCpu ? dense_all[il] : *dense_b;
+    const std::size_t out_offset =
+        backend == ExpertBackend::kCpu ? dense_out[il] : kDenseOutOffset;
     const int d = config.hidden;
     const std::size_t in_rows = l.in->rows;
     auto& st = state.layers[il];
@@ -259,7 +336,7 @@ struct NpuPrefill::Impl {
       auto start = Clock::now();
       NormToA(hs, n, l.attn_norm, l.mix.attention ? nullptr : normed.data());
       profile.other_seconds += SecondsSince(start);
-      Gemm(n, kHidden, in_rows, *a_dense, *dense_b, 0, *c_dense);
+      Gemm(n, kHidden, in_rows, *a_dense, weights_b, 0, *c_dense);
       start = Clock::now();
       FromC(n, static_cast<int>(in_rows), in.data(), false);
       profile.other_seconds += SecondsSince(start);
@@ -276,8 +353,7 @@ struct NpuPrefill::Impl {
       start = Clock::now();
       ToA(mixed.data(), n, static_cast<int>(kMixerOut));
       profile.other_seconds += SecondsSince(start);
-      Gemm(n, kMixerOut, kHidden, *a_dense, *dense_b, kDenseOutOffset,
-           *c_dense);
+      Gemm(n, kMixerOut, kHidden, *a_dense, weights_b, out_offset, *c_dense);
       start = Clock::now();
       FromC(n, d, hs, true);
       profile.other_seconds += SecondsSince(start);
@@ -297,20 +373,49 @@ struct NpuPrefill::Impl {
       float* xt = x.data() + t * d;
       RmsNorm(h.data() + t * d, l.post_norm.data(), d, c.rms_eps, xt);
       simd::ToBf16Row(xt, xb.data() + t * d, d);
-      float* y = logits.data() + t * cols;
-      for (int e = 0; e < cols; ++e) {
-        y[e] = Dot(l.router.data() + static_cast<std::size_t>(e) * d, xt, d);
-      }
     });
-    for (int t = 0; t < count; ++t) {
-      float* y = logits.data() + static_cast<std::size_t>(t) * cols;
-      int* ids = chosen.data() + static_cast<std::size_t>(t) * k;
-      float* w = weights.data() + static_cast<std::size_t>(t) * k;
+    // Router logits, four tokens per pass over a block of router rows (each
+    // row read once per four tokens).
+    constexpr int kRowBlock = 64;
+    const int token_blocks = (count + 3) / 4;
+    const int row_blocks = (cols + kRowBlock - 1) / kRowBlock;
+    pool.Run(static_cast<std::size_t>(token_blocks * row_blocks),
+             [&](std::size_t job) {
+               const int t0 = static_cast<int>(job) / row_blocks * 4;
+               const int e0 = static_cast<int>(job) % row_blocks * kRowBlock;
+               const float* rows[4];
+               for (int i = 0; i < 4; ++i) {
+                 // Past the last token: repeat it (its logits are not kept).
+                 const int t = std::min(t0 + i, count - 1);
+                 rows[i] = x.data() + static_cast<std::size_t>(t) * d;
+               }
+               float y[4];
+               for (int e = e0; e < std::min(cols, e0 + kRowBlock); ++e) {
+                 Dot4(l.router.data() + static_cast<std::size_t>(e) * d, rows,
+                      d, y);
+                 for (int i = 0; i < 4 && t0 + i < count; ++i) {
+                   logits[static_cast<std::size_t>(t0 + i) * cols + e] = y[i];
+                 }
+               }
+             });
+    // Each token's top k on its own (the test hook, which keeps counts over
+    // all tokens, in token order on the caller).
+    auto route = [&](std::size_t t) {
+      float* y = logits.data() + t * cols;
+      int* ids = chosen.data() + t * k;
+      float* w = weights.data() + t * k;
       qwen35::Route(y, experts, k, ids, w);
-      if (follow != nullptr) {
-        Follow(il, t, y, ids, w);
-      }
       shared_scale[t] = qwen35::SharedExpertScale(y[experts]);
+    };
+    if (follow == nullptr) {
+      pool.Run(static_cast<std::size_t>(count), route);
+    } else {
+      for (int t = 0; t < count; ++t) {
+        route(static_cast<std::size_t>(t));
+        const auto at = static_cast<std::size_t>(t);
+        Follow(il, t, logits.data() + at * cols, chosen.data() + at * k,
+               weights.data() + at * k);
+      }
     }
     for (int e = 0; e <= experts; ++e) {
       expert_tokens[e].clear();
@@ -410,7 +515,8 @@ struct NpuPrefill::Impl {
                         h.data() + t * d, d);
     });
     profile.other_seconds += SecondsSince(t0);
-    if (dense_layer != 0) {
+    const bool npu_experts = backend == ExpertBackend::kNpu;
+    if (npu_experts && dense_layer != 0) {
       Batch batch(device.dequant);
       AddDense(batch, 0);
       device.Run(batch, device.dequant);
@@ -420,9 +526,15 @@ struct NpuPrefill::Impl {
     for (int il = 0; il < c.layers; ++il) {
       Mixers(il, count, state);
       Route(il, count);
-      Convert(il, routing);
+      if (npu_experts) {
+        Convert(il, routing);
+      }
       // Step 4: the routed experts and the shared one, into h.
+      t0 = Clock::now();
       experts->Run(il, routing, xb.data(), h.data());
+      if (!npu_experts) {
+        profile.expert_seconds += SecondsSince(t0);
+      }
     }
     state.position += count;
     if (hidden != nullptr) {
@@ -507,13 +619,18 @@ struct NpuPrefill::Impl {
 };
 
 NpuPrefill::NpuPrefill(const gguf::File& file, qwen35::NpuDecoder& decoder,
-                       const std::filesystem::path& kernel_dir)
-    : impl_(std::make_unique<Impl>(file, decoder, kernel_dir)) {}
+                       const std::filesystem::path& kernel_dir,
+                       ExpertBackend experts)
+    : impl_(std::make_unique<Impl>(file, decoder, kernel_dir, experts)) {}
 
 NpuPrefill::~NpuPrefill() = default;
 
 const qwen35::Config& NpuPrefill::config() const {
   return impl_->config;
+}
+
+ExpertBackend NpuPrefill::experts() const {
+  return impl_->backend;
 }
 
 void NpuPrefill::Run(const int* tokens, int count, qwen35::DecodeState& state,
@@ -552,7 +669,7 @@ qwen35::PromptPrefill PrefillPrompt(NpuPrefill& prefill) {
   return [&prefill](const std::vector<int>& prompt, qwen35::DecodeState& state,
                     qwen35::DecodeState* mtp, float* hidden) {
     const int k = static_cast<int>(prompt.size()) - 1;
-    if (static_cast<int>(prompt.size()) < kMinPrefillPrompt) {
+    if (static_cast<int>(prompt.size()) < MinPrefillPrompt(prefill.experts())) {
       return 0;
     }
     // Every id, including the last (the MTP cache reads prompt[k]), before
