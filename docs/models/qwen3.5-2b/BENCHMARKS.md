@@ -556,3 +556,31 @@ unchanged. The Fibonacci prompt with MTP changes, `69e1c62d` → `fdb595fb`
 "\n\n\n# Example usage"; the MTP output equals plain greedy from the new
 state (`fdb595fb` both), as before the change (`69e1c62d` both). Decode
 speed unchanged: sky 39.1 tok/s, Fibonacci 64.4–64.6, 960 tokens 50.9–51.2.
+
+## Sampling (2026-10-28)
+
+`gufo-npu generate --temperature T --seed N` (`Sampler` in
+`src/core/sampling.hpp`): temperature, top-k, top-p, min-p and repetition,
+presence and frequency penalties. With MTP the draft is still the MTP head's
+argmax; each step draws the first token from the main model's distribution
+and keeps the draft when they agree, so a draft is accepted with probability
+p(draft) and the output follows the main model's distribution exactly (see
+QUALITY.md). Box, warm, 3 seeds per row (one load per run), default top-k,
+top-p and min-p (off); ranges over the seeds:
+
+| Prompt | Temperature | No draft | MTP | Drafts accepted |
+|---|---|---|---|---|
+| Sky (95 tokens) | 0 | 38.9–39.1 tok/s | 53.3–53.5 tok/s | 61% |
+|  | 0.7 | 38.8–38.9 | 50.9–53.0 | 53–58% |
+|  | 1.0 | 38.8–39.1 | 48.8–53.0 | 45–60% |
+| Fibonacci (256) | 0 | 38.6–38.7 | 64.1–64.4 | 95% |
+|  | 0.7 | 38.5 | 62.6–64.8 | 92–96% |
+|  | 1.0 | 38.4–38.5 | 61.5–63.2 | 86–93% |
+
+- Sampling itself costs under 1% of decode time without a draft: one
+  vectorized pass weighs the whole vocabulary per token.
+- Temperature 0 is greedy and bit-identical to the greedy path before the
+  sampler (same hashes).
+- With MTP, acceptance falls as temperature spreads the distribution: the sky
+  answer keeps 49–53 tok/s at temperature 1 against 53 greedy; the code
+  answer, whose tokens are nearly certain, barely moves.

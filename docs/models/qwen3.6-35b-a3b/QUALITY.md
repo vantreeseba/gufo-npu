@@ -572,3 +572,34 @@ DeltaNet heads, 256/8 experts of width 512, shared expert 512, untied head),
 and every tensor dequantizes to finite values (753 tensors, 35.5 B values,
 ~2.5 s). `tests/models/qwen35/config_test.cpp` (hosted CI) covers the same
 fields on synthetic `qwen35` / `qwen35moe` headers, plus inconsistent ones.
+
+## Sampling with MTP drafts (2026-10-28)
+
+`qwen36_npu_sampling_test` (`tests/models/qwen35/sampling_check.hpp`):
+400 continuations of 5 tokens of one chat prompt ("Write a short poem about
+the sea.") at temperature 1, top-k 20, with and without the MTP draft, each run
+on its own seed. A two-sample chi-square test (p = 1e-6) per position and for
+tokens 1 and 2 jointly finds no difference (47% of drafts accepted):
+
+| Compared | Chi-square | df | Limit |
+|---|---|---|---|
+| token 0 | 3.0 | 5 | 37.5 |
+| token 1 | 8.5 | 12 | 51.8 |
+| token 2 | 11.6 | 14 | 55.5 |
+| token 3 | 14.6 | 10 | 48.0 |
+| token 4 | 10.8 | 12 | 51.8 |
+| tokens 1 and 2 | 8.4 | 13 | 53.7 |
+
+- The rule needs no draft probabilities: the draft is a point proposal, so
+  drawing the first token from the main model and keeping the draft when they
+  agree is speculative sampling's acceptance (probability p(draft)), and a
+  miss is distributed as p without the draft.
+- `sampling_test` (CPU) checks the same loop against exact enumeration on a
+  toy model, with and without a frequency penalty, and each filter's
+  distribution.
+- Greedy (temperature 0) output is unchanged: the hashes and the
+  speculative-equals-greedy checks of the decode tests are as before.
+- The sky prompt's greedy hash is now `2c9f87d3`, both on this branch and on
+  #13's own build (the Fibonacci prompt's `9430fd17` is unchanged). It was
+  `c4d7f8e2` while 24-token prompts still took the decode path; #13 sends
+  prompts of 6 tokens or more through the prefill with CPU experts.

@@ -283,3 +283,30 @@ one), argmax 19/19.
 | NPU model vs CPU reference, teacher-forced, same weights | greedy argmax match |
 | Prefill vs one-token decode on the NPU | identical next token: met (`qwen35_npu_prefill_test`, first token equal on all 10 prompts of 1–2,049 tokens, 170/170 argmax over 17 steps each; greedy output equal for the first 26 of 48 tokens on the chat prompt) |
 | MTP head vs a reference | to be decided (no HF oracle) |
+
+## Sampling with MTP drafts (2026-10-28)
+
+`qwen35_npu_sampling_test` (`tests/models/qwen35/sampling_check.hpp`):
+1000 continuations of 5 tokens of one chat prompt ("Write a short poem about
+the sea.") at temperature 1, top-k 20, with and without the MTP draft, each run
+on its own seed. A two-sample chi-square test (p = 1e-6) per position and for
+tokens 1 and 2 jointly finds no difference (21% of drafts accepted):
+
+| Compared | Chi-square | df | Limit |
+|---|---|---|---|
+| token 0 | 3.4 | 6 | 39.7 |
+| token 1 | 23.1 | 25 | 74.5 |
+| token 2 | 43.3 | 37 | 93.6 |
+| token 3 | 21.6 | 36 | 92.0 |
+| token 4 | 24.8 | 28 | 79.4 |
+| tokens 1 and 2 | 32.8 | 38 | 95.1 |
+
+- The rule needs no draft probabilities: the draft is a point proposal, so
+  drawing the first token from the main model and keeping the draft when they
+  agree is speculative sampling's acceptance (probability p(draft)), and a
+  miss is distributed as p without the draft.
+- `sampling_test` (CPU) checks the same loop against exact enumeration on a
+  toy model, with and without a frequency penalty, and each filter's
+  distribution.
+- Greedy (temperature 0) output is unchanged: the hashes and the
+  speculative-equals-greedy checks of the decode tests are as before.

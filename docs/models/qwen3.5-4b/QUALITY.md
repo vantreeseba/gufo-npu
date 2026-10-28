@@ -161,3 +161,30 @@ the 2B 0.89): below it two logits can trade places. Outputs: the sky
 prompt keeps main's hash (`f99190db`, with and without MTP); the
 Fibonacci prompt changes from main's `64f4400a` to `a965fad4`, and its MTP
 output equals plain greedy from the new state (`a965fad4` both).
+
+## Sampling with MTP drafts (2026-10-28)
+
+`qwen35_4b_npu_sampling_test` (`tests/models/qwen35/sampling_check.hpp`):
+600 continuations of 5 tokens of one chat prompt ("Write a short poem about
+the sea.") at temperature 1, top-k 20, with and without the MTP draft, each run
+on its own seed. A two-sample chi-square test (p = 1e-6) per position and for
+tokens 1 and 2 jointly finds no difference (25% of drafts accepted):
+
+| Compared | Chi-square | df | Limit |
+|---|---|---|---|
+| token 0 | 3.6 | 4 | 35.2 |
+| token 1 | 11.6 | 17 | 60.9 |
+| token 2 | 17.5 | 24 | 72.9 |
+| token 3 | 10.2 | 15 | 57.4 |
+| token 4 | 10.9 | 23 | 71.2 |
+| tokens 1 and 2 | 15.6 | 24 | 72.9 |
+
+- The rule needs no draft probabilities: the draft is a point proposal, so
+  drawing the first token from the main model and keeping the draft when they
+  agree is speculative sampling's acceptance (probability p(draft)), and a
+  miss is distributed as p without the draft.
+- `sampling_test` (CPU) checks the same loop against exact enumeration on a
+  toy model, with and without a frequency penalty, and each filter's
+  distribution.
+- Greedy (temperature 0) output is unchanged: the hashes and the
+  speculative-equals-greedy checks of the decode tests are as before.
