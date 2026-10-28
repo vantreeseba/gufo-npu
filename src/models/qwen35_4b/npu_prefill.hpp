@@ -7,6 +7,8 @@
 #include "models/qwen35/config.hpp"
 #include "models/qwen35/decoder.hpp"
 #include "models/qwen35/generate.hpp"
+#include "models/qwen35/prompt_cache.hpp"
+#include "models/qwen35/state_capture.hpp"
 #include "models/qwen35_4b/npu_decoder.hpp"
 
 // Qwen3.5-4B prompt processing (prefill) on the NPU, on the 4B's own GEMM
@@ -26,7 +28,9 @@ namespace gufo_npu::qwen35_4b {
 
 using qwen35::Config;
 using qwen35::DecodeState;
+using qwen35::PromptCacheModel;
 using qwen35::PromptPrefill;
+using qwen35::StateCapture;
 
 class NpuPrefill {
 public:
@@ -41,8 +45,10 @@ public:
 
   // Runs `count` tokens from state.position and advances the state. With
   // `hidden`, writes each token's final residual (before output_norm), count
-  // rows of hidden values: the MTP head's input.
-  void Run(const int* tokens, int count, DecodeState& state, float* hidden);
+  // rows of hidden values: the MTP head's input. With `capture`, copies the
+  // DeltaNet layers' state at capture->position on the way.
+  void Run(const int* tokens, int count, DecodeState& state, float* hidden,
+           const StateCapture* capture = nullptr);
 
   // The MTP layer's cache: for i < count, the pair (hidden row i, tokens[i])
   // at position + i, where hidden row i is the main model's final residual
@@ -67,10 +73,19 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
+// Prompts shorter than this go through the decoder: a prefill pass costs
+// ~0.07 s however short the prompt, the decode path ~28 ms per two tokens
+// (crossover measured in BENCHMARKS.md).
+inline constexpr int kMinPrefillPrompt = 7;
+
 // The prompt hook for SpeculativeGenerate: the whole prompt through
 // `prefill`, and the MTP cache over it; the decoder then runs only the LM
 // head on the last token's final residual for its logits. Prompts too short
 // to win from a prefill pass are left to the decoder.
 PromptPrefill PrefillPrompt(NpuPrefill& prefill);
+
+// How this model runs prompt tokens for a PromptCache (prompt_cache.hpp):
+// `prefill` from kMinPrefillPrompt tokens, `decoder` below that.
+PromptCacheModel MakePromptCacheModel(NpuDecoder& decoder, NpuPrefill& prefill);
 
 }  // namespace gufo_npu::qwen35_4b

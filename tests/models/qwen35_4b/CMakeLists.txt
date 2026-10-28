@@ -38,4 +38,12 @@ if(GUFO_NPU_ENABLE_XRT AND GUFO_NPU_BUILD_KERNELS)
            COMMAND qwen35_4b_npu_prefill_test "${CMAKE_BINARY_DIR}/kernels")
   set_tests_properties(qwen35_4b_npu_prefill_test PROPERTIES
                        LABELS "qwen35_4b;npu;model" SKIP_RETURN_CODE 77)
+
+  add_executable(qwen35_4b_prompt_cache_test prompt_cache_test.cpp)
+  target_link_libraries(qwen35_4b_prompt_cache_test PRIVATE gufo_npu_qwen35_4b)
+  add_test(NAME qwen35_4b_prompt_cache_test
+           COMMAND qwen35_4b_prompt_cache_test "${CMAKE_BINARY_DIR}/kernels")
+  set_tests_properties(qwen35_4b_prompt_cache_test PROPERTIES
+                       LABELS "qwen35_4b;npu;model" SKIP_RETURN_CODE 77
+                       TIMEOUT 1800)
 endif()

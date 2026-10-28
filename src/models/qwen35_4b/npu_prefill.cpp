@@ -509,6 +509,8 @@ struct NpuPrefill::Impl {
       std::max<std::size_t>(std::thread::hardware_concurrency() / 2, 1) - 1};
 
   Profile profile;
+  // The current Run's capture request, if any.
+  const StateCapture* capture = nullptr;
   // GEMM work per token of a prefill pass and of the MTP cache fill.
   double flops_per_token = 0;
   double mtp_flops_per_token = 0;
@@ -902,7 +904,8 @@ struct NpuPrefill::Impl {
 
   // Gated DeltaNet of the lane's tokens into `mixed`; `normed` holds the
   // layer's normalized input.
-  void DeltaNet(Lane& lane, const Layer& l, DecodeState::Layer& st) {
+  void DeltaNet(Lane& lane, const Layer& l, DecodeState::Layer& st,
+                const DeltaCapture& capture) {
     const Config& cfg = config;
     const int n = lane.n;
     const int d = cfg.hidden;
@@ -965,6 +968,10 @@ struct NpuPrefill::Impl {
             simd::SiluRow(out, out, width);
           }
         });
+    if (capture.layer != nullptr) {
+      ConvWindowAfter(in, in_stride, st.conv.data(), window, channels,
+                      capture.offset, capture.layer->conv.data());
+    }
     // The window after these tokens: their last `window` inputs. Ascending
     // s reads older entries (src + window = n + s > s) before they are
     // overwritten.
@@ -1023,6 +1030,14 @@ struct NpuPrefill::Impl {
                              g[head], g[hv + head],
                              mixed + static_cast<std::size_t>(t) * value_dim +
                                  head * dk + j0);
+            if (t + 1 == capture.offset) {
+              float* cm = capture.layer->ssm.data() +
+                          static_cast<std::size_t>(head) * dk * dk + j0;
+              for (int i = 0; i < dk; ++i) {
+                std::copy_n(local + i * kDeltaColumns, kDeltaColumns,
+                            cm + static_cast<std::size_t>(i) * dk);
+              }
+            }
           }
           for (int i = 0; i < dk; ++i) {
             std::copy_n(local + i * kDeltaColumns, kDeltaColumns,
@@ -1075,7 +1090,7 @@ struct NpuPrefill::Impl {
           Attention(lane, l, st);
           profile.attention_seconds += SecondsSince(mixer_start);
         } else {
-          DeltaNet(lane, l, st);
+          DeltaNet(lane, l, st, CaptureIn(capture, il, lane.position, lane.n));
           profile.deltanet_seconds += SecondsSince(mixer_start);
         }
         ToA(lane, lane.mixed.data(), static_cast<int>(l.out->dim()));
@@ -1190,9 +1205,11 @@ const Config& NpuPrefill::config() const {
 }
 
 void NpuPrefill::Run(const int* tokens, int count, DecodeState& state,
-                     float* hidden) {
+                     float* hidden, const StateCapture* capture) {
   const BurstPool::Burst burst(impl_->pool);
+  impl_->capture = capture;
   impl_->Run(tokens, count, state, hidden);
+  impl_->capture = nullptr;
 }
 
 void NpuPrefill::FillMtp(const float* hidden, const int* tokens, int count,
@@ -1223,7 +1240,6 @@ PromptPrefill PrefillPrompt(NpuPrefill& prefill) {
     // The whole prompt goes through one prefill: the decoder then runs only
     // the LM head on its last row (NpuDecoder::Logits). Shorter prompts go
     // through the decoder alone (crossover measured in BENCHMARKS.md).
-    constexpr int kMinPrefillPrompt = 7;
     const int n = static_cast<int>(prompt.size());
     if (n < kMinPrefillPrompt) {
       return 0;
@@ -1243,6 +1259,42 @@ PromptPrefill PrefillPrompt(NpuPrefill& prefill) {
     }
     return n;
   };
+}
+
+PromptCacheModel MakePromptCacheModel(NpuDecoder& decoder,
+                                      NpuPrefill& prefill) {
+  const Config& c = prefill.config();
+  PromptCacheModel m;
+  m.hidden = c.hidden;
+  m.vocab = c.vocab;
+  m.layers = c.layers;
+  m.keep_last = 0;
+  m.min_prefill = kMinPrefillPrompt;
+  m.run = [&decoder, &prefill](const int* tokens, int count, DecodeState& state,
+                               float* hidden, const StateCapture* capture) {
+    if (count >= kMinPrefillPrompt) {
+      prefill.Run(tokens, count, state, hidden, capture);
+      return;
+    }
+    StepPrompt(
+        decoder,
+        [&decoder](const int* t, int n, DecodeState& s) {
+          decoder.Step(t, n, s);
+        },
+        decoder.config().hidden, tokens, count, state, hidden, capture);
+  };
+  m.fill_mtp = [&decoder, &prefill](const float* hidden, const int* tokens,
+                                    int count, int position, DecodeState& mtp) {
+    // As the prompt's own prefill fills it when the prompt took one.
+    if (count >= kMinPrefillPrompt - 1) {
+      prefill.FillMtp(hidden, tokens, count, position, mtp);
+      return;
+    }
+    StepMtp(decoder, decoder.config().hidden, hidden, tokens, count, position,
+            mtp);
+  };
+  m.new_state = [&decoder] { return decoder.NewState(); };
+  return m;
 }
 
 }  // namespace gufo_npu::qwen35_4b
