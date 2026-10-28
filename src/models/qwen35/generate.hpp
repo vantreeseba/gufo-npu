@@ -4,6 +4,7 @@
 #include <functional>
 #include <vector>
 
+#include "core/sampling.hpp"
 #include "models/qwen35/decoder.hpp"
 #include "models/qwen35/reference.hpp"
 
@@ -20,20 +21,23 @@ struct GenerateStats {
 // (vocab values, valid until the next call).
 using ForwardFn = std::function<const float*(const std::vector<int>& ids)>;
 
-// Greedy decoding: runs the prompt, then appends the argmax token until a
-// stop id or `max_tokens`. `on_token` sees each generated id (including the
-// stop id) as it is produced. Returns the generated ids.
+// Decoding without a draft: runs the prompt, then appends the token
+// `sampling` picks (the argmax by default) until a stop id or `max_tokens`.
+// `on_token` sees each generated id (including the stop id) as it is
+// produced; returning false ends the generation after that id. Returns the
+// generated ids.
 std::vector<int> GreedyGenerate(const ForwardFn& forward, int vocab,
                                 const std::vector<int>& prompt, int max_tokens,
                                 const std::vector<int>& stop,
-                                const std::function<void(int)>& on_token,
-                                GenerateStats* stats = nullptr);
+                                const std::function<bool(int)>& on_token,
+                                GenerateStats* stats = nullptr,
+                                const SamplingParams& sampling = {});
 
 // The same over the CPU reference; `projections` is passed to every Forward.
 std::vector<int> GreedyGenerate(const Reference& model,
                                 const std::vector<int>& prompt, int max_tokens,
                                 const std::vector<int>& stop,
-                                const std::function<void(int)>& on_token,
+                                const std::function<bool(int)>& on_token,
                                 GenerateStats* stats = nullptr,
                                 const Projections* projections = nullptr);
 

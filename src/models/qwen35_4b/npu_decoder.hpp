@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "core/gguf.hpp"
+#include "core/sampling.hpp"
 #include "core/q4nx.hpp"
 #include "models/qwen35/config.hpp"
 #include "models/qwen35/decoder.hpp"
@@ -101,18 +102,24 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
-// Greedy decoding with MTP speculation: each step verifies one MTP draft in a
-// 2-token pass and keeps it when the main model agrees, so the output is the
-// main model's greedy output. The prompt runs through `prefill` when given,
-// the rest of it two tokens per pass. With `draft` false, every step decodes
-// one token (no MTP). `on_token` sees each generated id (including a stop
-// id) as it is produced.
+// Decoding with MTP speculation: each step verifies one MTP draft in a
+// 2-token pass. The draft is a point proposal (the MTP head's argmax), so the
+// step draws the first token from the main model's distribution and keeps
+// the draft when they agree: it is accepted with probability p(draft), and a
+// miss is distributed as p without the draft, which is speculative sampling's
+// rule. The output therefore follows the main model's distribution exactly;
+// greedy `sampling` (the default) gives its greedy output. The prompt runs
+// through `prefill` when given, the rest of it two tokens per pass. With
+// `draft` false, every step decodes one token (no MTP). `on_token` sees each
+// generated id (including a stop id) as it is produced; returning false ends
+// the generation after that id.
 std::vector<int> SpeculativeGenerate(NpuDecoder& model,
                                      const std::vector<int>& prompt,
                                      int max_tokens,
                                      const std::vector<int>& stop, bool draft,
-                                     const std::function<void(int)>& on_token,
+                                     const std::function<bool(int)>& on_token,
                                      SpeculativeStats* stats = nullptr,
-                                     const PromptPrefill& prefill = {});
+                                     const PromptPrefill& prefill = {},
+                                     const SamplingParams& sampling = {});
 
 }  // namespace gufo_npu::qwen35_4b
