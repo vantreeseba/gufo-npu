@@ -1,10 +1,9 @@
 #pragma once
 
 #include <memory>
+#include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
-
-#include <nlohmann/json.hpp>
 
 // OpenAI chat messages to the model's prompt text, and the model's output
 // text back to OpenAI message parts (content, reasoning, tool calls).
@@ -20,14 +19,14 @@ struct ChatPrompt {
 struct OutputPart {
   enum class Kind { kContent, kReasoning, kToolCall };
   Kind kind = Kind::kContent;
-  std::string text;        // kContent / kReasoning: text to append
-  std::string tool_id;     // kToolCall: "call_..." id
-  std::string tool_name;   // kToolCall
-  std::string arguments;   // kToolCall: JSON object text
+  std::string text;       // kContent / kReasoning: text to append
+  std::string tool_id;    // kToolCall: "call_..." id
+  std::string tool_name;  // kToolCall
+  std::string arguments;  // kToolCall: JSON object text
 };
 
 class OutputParser {
- public:
+public:
   virtual ~OutputParser() = default;
   // Feeds decoded text (whole UTF-8 characters) and returns the parts that
   // are complete. Text that may still turn out to be markup is held back.
@@ -37,7 +36,7 @@ class OutputParser {
 };
 
 class ChatFormat {
- public:
+public:
   virtual ~ChatFormat() = default;
   // Throws std::invalid_argument for messages the model cannot take.
   virtual std::string Render(const ChatPrompt& prompt) const = 0;

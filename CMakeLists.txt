@@ -114,6 +114,8 @@ endif()
 # Per-model packages: their own NPU programs and host wiring.
 add_subdirectory(src/models/qwen35_4b)
 add_subdirectory(src/models/qwen36_35b_a3b)
+# The OpenAI-compatible server's model side (src/serve).
+add_subdirectory(src/serve)
 
 add_executable(gufo-npu src/cli/main.cpp)
 target_link_libraries(gufo-npu PRIVATE gufo_npu_qwen35_npu gufo_npu_qwen35_4b
