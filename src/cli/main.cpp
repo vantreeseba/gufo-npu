@@ -1,9 +1,11 @@
+#include <pthread.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -14,6 +16,7 @@
 #include <random>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "build_info.hpp"
@@ -35,6 +38,9 @@
 #include "models/qwen36_35b_a3b/npu_prefill.hpp"
 #include "npu/device.hpp"
 #include "npu/gemv.hpp"
+#include "serve/chat_format.hpp"
+#include "serve/engine.hpp"
+#include "serve/server.hpp"
 
 namespace {
 
@@ -71,6 +77,11 @@ constexpr char kUsage[] =
     "                           greedy chat completion; cpu is the reference,\n"
     "                           npu decodes on the NPU, by default with MTP\n"
     "                           speculation (same output, fewer passes)\n"
+    "  serve --model GGUF [--host ADDR] [--port N] [--device npu|cpu]\n"
+    "        [--kernels DIR] [--model-id NAME] [--max-queue N] [--api-key "
+    "KEY]\n"
+    "                           OpenAI-compatible server (docs/SERVING.md),\n"
+    "                           by default on 127.0.0.1:8080\n"
     "  version                  print the version\n";
 
 void PrintChecks(const std::vector<Check>& checks) {
@@ -963,6 +974,84 @@ int Generate(const std::vector<std::string_view>& args) {
 
 }  // namespace
 
+int Serve(const std::vector<std::string_view>& args) {
+  namespace serve = gufo_npu::serve;
+  serve::EngineOptions engine_options;
+  serve::ServerOptions server_options;
+  std::optional<std::string> kernels;
+  for (std::size_t i = 0; i < args.size(); ++i) {
+    const bool has_value = i + 1 < args.size();
+    if (args[i] == "--model" && has_value) {
+      engine_options.model_path = std::string(args[++i]);
+    } else if (args[i] == "--host" && has_value) {
+      server_options.host = std::string(args[++i]);
+    } else if (args[i] == "--port" && has_value) {
+      server_options.port = std::atoi(std::string(args[++i]).c_str());
+    } else if (args[i] == "--device" && has_value) {
+      engine_options.device = std::string(args[++i]);
+    } else if (args[i] == "--kernels" && has_value) {
+      kernels = std::string(args[++i]);
+    } else if (args[i] == "--model-id" && has_value) {
+      engine_options.model_id = std::string(args[++i]);
+    } else if (args[i] == "--max-queue" && has_value) {
+      server_options.max_queue = std::atoi(std::string(args[++i]).c_str());
+    } else if (args[i] == "--api-key" && has_value) {
+      server_options.api_key = std::string(args[++i]);
+    } else {
+      std::cerr << kUsage;
+      return 2;
+    }
+  }
+  if (engine_options.model_path.empty() ||
+      (engine_options.device != "npu" && engine_options.device != "cpu") ||
+      server_options.port <= 0 || server_options.port > 65535 ||
+      server_options.max_queue < 0) {
+    std::cerr << kUsage;
+    return 2;
+  }
+  if (engine_options.device == "npu") {
+    engine_options.kernels = KernelDir(kernels).string();
+  }
+
+  // SIGINT/SIGTERM stop the server: blocked in every thread (set before any
+  // starts) and taken by one waiter.
+  sigset_t signals;
+  sigemptyset(&signals);
+  sigaddset(&signals, SIGINT);
+  sigaddset(&signals, SIGTERM);
+  pthread_sigmask(SIG_BLOCK, &signals, nullptr);
+
+  std::unique_ptr<serve::Engine> engine;
+  std::unique_ptr<serve::ChatFormat> format;
+  std::unique_ptr<serve::Server> server;
+  int port = 0;
+  try {
+    const auto load_start = std::chrono::steady_clock::now();
+    engine = serve::LoadEngine(engine_options);
+    format = serve::NewQwen35ChatFormat();
+    std::fprintf(stderr, "[loaded %s in %.1f s]\n", engine->info().id.c_str(),
+                 std::chrono::duration<double>(
+                     std::chrono::steady_clock::now() - load_start)
+                     .count());
+    server = std::make_unique<serve::Server>(*engine, *format, server_options);
+    port = server->Bind();
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "serve: %s\n", e.what());
+    return 1;
+  }
+  std::thread waiter([&] {
+    int signal = 0;
+    sigwait(&signals, &signal);
+    server->Stop();
+  });
+  std::fprintf(stderr, "[serving http://%s:%d/v1]\n",
+               server_options.host.c_str(), port);
+  server->Run();
+  kill(getpid(), SIGTERM);  // wakes the waiter if Run ended on its own
+  waiter.join();
+  return 0;
+}
+
 int main(int argc, char** argv) {
   const std::vector<std::string_view> args(argv + 1, argv + argc);
   if (args.empty() || args[0] == "help" || args[0] == "--help") {
@@ -979,6 +1068,9 @@ int main(int argc, char** argv) {
   }
   if (args[0] == "generate") {
     return Generate(rest);
+  }
+  if (args[0] == "serve") {
+    return Serve(rest);
   }
   if (args[0] == "smoke") {
     return Smoke(rest);
