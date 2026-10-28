@@ -254,9 +254,20 @@ void Compare(qwen35::NpuDecoder& npu, moe::NpuPrefill& prefill,
   const DecodeState want_state = ds;
   std::vector<std::vector<float>> want_logits;
   std::vector<int> tokens;
+  // Each step's routing, all layers, to compare with the steps after prefill.
+  auto step_routing = [&] {
+    std::vector<int> r(static_cast<std::size_t>(c.layers) * used);
+    for (int il = 0; il < c.layers; ++il) {
+      std::copy_n(npu.experts(il), used,
+                  r.data() + static_cast<std::size_t>(il) * used);
+    }
+    return r;
+  };
+  std::vector<std::vector<int>> want_routing;
   const float* logits = npu.Step(&ids[k], 1, ds);
   for (int s = 0; s <= kSteps; ++s) {
     want_logits.emplace_back(logits, logits + vocab);
+    want_routing.push_back(step_routing());
     tokens.push_back(Argmax(logits, vocab));
     if (s < kSteps) {
       logits = npu.Step(&tokens.back(), 1, ds);
@@ -307,14 +318,51 @@ void Compare(qwen35::NpuDecoder& npu, moe::NpuPrefill& prefill,
 
   Error logit_err;
   std::size_t agree = 0;
+  std::string steps;  // per step: logits error / layers routed differently
   logits = npu.Step(&ids[k], 1, ps);
   for (int s = 0; s <= kSteps; ++s) {
     logit_err.Add(logits, want_logits[s].data(), vocab);
-    agree += Argmax(logits, vocab) == tokens[s];
+    {
+      // This step's logits error and the layers routed unlike the decode
+      // path's same step (expert sets compared).
+      Error step_err;
+      step_err.Add(logits, want_logits[s].data(), vocab);
+      auto got_route = step_routing();
+      auto want_route = want_routing[static_cast<std::size_t>(s)];
+      int layers_differ = 0;
+      for (int il = 0; il < c.layers; ++il) {
+        const auto off = static_cast<std::ptrdiff_t>(il) * used;
+        std::sort(got_route.begin() + off, got_route.begin() + off + used);
+        std::sort(want_route.begin() + off, want_route.begin() + off + used);
+        layers_differ +=
+            std::equal(got_route.begin() + off, got_route.begin() + off + used,
+                       want_route.begin() + off)
+                ? 0
+                : 1;
+      }
+      char buf[64];
+      std::snprintf(buf, sizeof(buf), " %d:%.1e/%d", s, step_err.Relative(),
+                    layers_differ);
+      steps += buf;
+    }
+    const int top = Argmax(logits, vocab);
+    agree += top == tokens[s];
+    if (top != tokens[s]) {
+      // Whether the change is a near tie on either side.
+      std::printf(
+          "  step %d: decode path's top-1 %d, its top-2 gap %.3f; after "
+          "prefill top-1 %d, top-2 gap %.3f, the decode path's token %.3f "
+          "below it\n",
+          s, tokens[s], Margin(want_logits[s].data(), vocab), top,
+          Margin(logits, vocab), logits[top] - logits[tokens[s]]);
+    }
     if (s < kSteps) {
       logits = npu.Step(&tokens[s], 1, ps);
     }
   }
+
+  std::printf("  steps after prefill (logits error/layers routed unlike):%s\n",
+              steps.c_str());
 
   // Routing on its own: the first token, and a second run bit for bit.
   auto own = npu.NewState();

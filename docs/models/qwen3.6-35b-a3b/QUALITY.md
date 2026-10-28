@@ -456,6 +456,31 @@ cut to 1, 2, 1,024, 1,025, 2,049 and 4,000 tokens.
 prefill gives exactly the plain greedy output after it (48 tokens, 68% of
 drafts kept).
 
+**With the search fit** (this model's fit since 2026-10-28, `qwen35::Q4nxFit`)
+argmax agrees 167/170 (pass ≥ 95%); the states after prefill are as close to
+the decode path's as with min/max or closer (len1024/1025: hidden 4.1e-2
+against 4.5e-2, conv 5.3e-2 against 5.9e-2, ssm 3.9e-2 against 5.2e-2, kv
+5.5e-2 against 6.5e-2). The test prints each top-1 change with both sides'
+top-2 gaps, and for every prompt each step's logits error and the number of
+layers routed unlike the decode path's same step:
+
+| Prompt, step | Decode path's top-2 gap | After prefill: top-2 gap |
+|---|---|---|
+| prose, step 5 | 0.042 | 0.065 |
+| len2, step 11 | 0.008 | 0.019 |
+| len1025, step 6 | 1.114 | 0.420 |
+
+Two are near ties. The third is not, but it sits in a divergence the
+min/max weights show as well: from 1,024 prompt tokens on, the steps after
+prefill route unlike the decode path in 15–34 of the 40 layers at nearly
+every step with either fit, and single steps reach logits errors of 0.3–0.65
+on main's weights too (len2049 steps 0, 2, 8 and 12; len4000 step 6) without
+changing top-1 there. At len1025 step 6 the search fit's run has a step error
+of 0.097 with 19 layers routed differently, and top-1 changes. The prefill
+itself is not less accurate; how often a long prompt's routing divergence
+flips a top-1 is luck of the positions, and the GEMM's bfp16 rounding is what
+a tighter bound needs (as above).
+
 **Where the error comes from.** It is the GEMMs' bfp16 rounding (activations
 rounded to bfp16 inside the mmul, 8 values sharing an exponent; outputs to
 bf16), compounding over 40 layers, not the batched CPU side: the family's
