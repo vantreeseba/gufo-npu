@@ -135,3 +135,29 @@ growth: the growth is all bfp16 rounding in the GEMMs (activations rounded
 to bfp16 inside the mmul, outputs to bf16), compounding over 32 layers of
 width 2560 (the 2B: 24 of 2048). That justifies the looser tolerances; a
 tighter prefill needs a more precise GEMM (EXPERIMENTS.md).
+
+### First token from the prefill (2026-10-28)
+
+PrefillPrompt now runs the whole prompt through the prefill, and the first
+token comes from its last row through the LM head alone
+(`NpuDecoder::Logits`), with no decode step for the last prompt token. The
+test now prefills every prompt token, takes the first token from `Logits`,
+and checks it against the decode path's step of the last token: the same
+token, or a near tie (decode-path top-2 gap under 2 logits) in which it may
+differ. On the ten prompts:
+
+| Check | Measured |
+|---|---|
+| First token the same as the decode path's | 10/10 |
+| Largest change of any logit, prefill row vs decode step | 0.60 (256 tokens; 0.80 with the min/max fit) |
+| Smallest decode-path top-2 gap among the prompts | 0.06 (prose; still the same token) |
+| States after the whole prompt (worst) | hidden 1.4e-1, conv 1.8e-1, DeltaNet 1.2e-1, K/V 2.0e-1 (under the same limits) |
+| Argmax over the first token and 16 teacher-forced steps | 170/170 |
+| Speculative decoding after prefill vs plain greedy (chat, 48 tokens) | identical; greedy with and without prefill agree on 48/48 |
+
+Measured with the 4B's q4nx search fit (#15). The 2-logit limit is about
+twice the largest logit change measured (0.60; 0.80 with the min/max fit,
+the 2B 0.89): below it two logits can trade places. Outputs: the sky
+prompt keeps main's hash (`f99190db`, with and without MTP); the
+Fibonacci prompt changes from main's `64f4400a` to `a965fad4`, and its MTP
+output equals plain greedy from the new state (`a965fad4` both).

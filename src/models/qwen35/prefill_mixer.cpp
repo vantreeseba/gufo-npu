@@ -195,6 +195,61 @@ __attribute__((target("avx512f"))) void AccumulateValues4Avx512(
 }
 #endif
 
+#ifdef GUFO_PREFILL_AVX512
+// DeltaColumns on two 512-bit vectors per row instead of four 256-bit
+// ones: every element takes the same fused multiply-adds in the same
+// order, so the results are bit-identical, with half the instructions.
+__attribute__((target("avx512f"))) void DeltaColumnsAvx512(
+    float* s, int dk, int stride, const float* k, const float* q,
+    const float* v, float decay, float beta, float* y) {
+  __m512 acc[2] = {_mm512_setzero_ps(), _mm512_setzero_ps()};
+  for (int i = 0; i < dk; ++i) {
+    const float* row = s + static_cast<std::size_t>(i) * stride;
+    const __m512 ki = _mm512_set1_ps(k[i] * decay);
+    for (int c = 0; c < 2; ++c) {
+      acc[c] = _mm512_fmadd_ps(_mm512_loadu_ps(row + 16 * c), ki, acc[c]);
+    }
+  }
+  __m512 delta[2];
+  __m512 out[2];
+  const __m512 b = _mm512_set1_ps(beta);
+  for (int c = 0; c < 2; ++c) {
+    delta[c] =
+        _mm512_mul_ps(b, _mm512_sub_ps(_mm512_loadu_ps(v + 16 * c), acc[c]));
+    out[c] = _mm512_setzero_ps();
+  }
+  const __m512 dc = _mm512_set1_ps(decay);
+  for (int i = 0; i < dk; ++i) {
+    float* row = s + static_cast<std::size_t>(i) * stride;
+    const __m512 ki = _mm512_set1_ps(k[i]);
+    const __m512 qi = _mm512_set1_ps(q[i]);
+    for (int c = 0; c < 2; ++c) {
+      const __m512 updated = _mm512_fmadd_ps(
+          ki, delta[c], _mm512_mul_ps(_mm512_loadu_ps(row + 16 * c), dc));
+      _mm512_storeu_ps(row + 16 * c, updated);
+      out[c] = _mm512_fmadd_ps(updated, qi, out[c]);
+    }
+  }
+  for (int c = 0; c < 2; ++c) {
+    _mm512_storeu_ps(y + 16 * c, out[c]);
+  }
+}
+#endif
+
+// The delta rule on kDeltaColumns columns with the widest vectors the CPU
+// has (same results either way).
+void DeltaColumnsBest(float* s, int dk, int stride, const float* k,
+                      const float* q, const float* v, float decay, float beta,
+                      float* y) {
+#if defined(GUFO_PREFILL_AVX512) && defined(__AVX2__) && defined(__FMA__)
+  if (HasAvx512()) {
+    DeltaColumnsAvx512(s, dk, stride, k, q, v, decay, beta, y);
+    return;
+  }
+#endif
+  DeltaColumns(s, dk, stride, k, q, v, decay, beta, y);
+}
+
 // scores[g * ld + j] = q_g . key_j for G = 4 query heads and keys j in
 // [0, count); hd a multiple of 32.
 void Scores4(const float* q, int hd, const Half* keys, std::size_t stride,
@@ -619,7 +674,7 @@ void PrefillMixer::DeltaNet(const float* in, std::size_t in_stride,
     for (int t = 0; t < n; ++t) {
       const float* ut = u + static_cast<std::size_t>(t) * channels;
       const float* g = gates + static_cast<std::size_t>(t) * 2 * hv;
-      DeltaColumns(
+      DeltaColumnsBest(
           local, dk, kDeltaColumns, ut + key_dim + kh * dk, ut + kh * dk,
           ut + 2 * key_dim + head * dk + j0, g[head], g[hv + head],
           mixed + static_cast<std::size_t>(t) * value_dim + head * dk + j0);

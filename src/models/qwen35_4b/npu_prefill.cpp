@@ -37,14 +37,14 @@ using vec::RmsNorm;
 
 constexpr int kMaxChunk = static_cast<int>(gufo_npu::npu::kGemmMaxChunk);
 
-// The model the chunk plan is chosen with, measured on the 2B (BENCHMARKS.md,
-// "Prefill GEMM" and "Where the time goes"): the GEMMs' throughput at each
-// chunk size of gufo_npu::npu::kGemmChunks (a 256-row call runs at ~11 TFLOPS,
-// a 1,024-row one at ~17), and the CPU's time per token between them (~0.14 ms
-// at 1k tokens: mixers, norms, conversions).
-constexpr double kGemmTflops[] = {11.0, 14.5, 17.0};
+// The model the chunk plan is chosen with, measured on the 4B (BENCHMARKS.md,
+// "Chunk plan"): one pass of 7.13 GFLOP per token through the GEMMs at each
+// chunk size of gufo_npu::npu::kGemmChunks (11.4 TFLOPS at 256 rows, 14.0 at
+// 512, 16.1 at 1,024), and the CPU's time per token between them (0.28-0.29
+// ms at 512-1,024 tokens: mixers, norms, conversions; the 2B's is 0.14).
+constexpr double kGemmTflops[] = {11.4, 14.0, 16.1};
 static_assert(std::size(kGemmTflops) == std::size(gufo_npu::npu::kGemmChunks));
-constexpr double kCpuSecondsPerToken = 0.14e-3;
+constexpr double kCpuSecondsPerToken = 0.29e-3;
 
 // One pass of a prefill: `lanes` chunks of `m` GEMM rows over `tokens`
 // prompt tokens (the last chunk padded).
@@ -311,6 +311,61 @@ __attribute__((target("avx512f"))) void AccumulateValues4Avx512(
   }
 }
 #endif
+
+#ifdef GUFO_PREFILL_AVX512
+// DeltaColumns on two 512-bit vectors per row instead of four 256-bit
+// ones: every element takes the same fused multiply-adds in the same
+// order, so the results are bit-identical, with half the instructions.
+__attribute__((target("avx512f"))) void DeltaColumnsAvx512(
+    float* s, int dk, int stride, const float* k, const float* q,
+    const float* v, float decay, float beta, float* y) {
+  __m512 acc[2] = {_mm512_setzero_ps(), _mm512_setzero_ps()};
+  for (int i = 0; i < dk; ++i) {
+    const float* row = s + static_cast<std::size_t>(i) * stride;
+    const __m512 ki = _mm512_set1_ps(k[i] * decay);
+    for (int c = 0; c < 2; ++c) {
+      acc[c] = _mm512_fmadd_ps(_mm512_loadu_ps(row + 16 * c), ki, acc[c]);
+    }
+  }
+  __m512 delta[2];
+  __m512 out[2];
+  const __m512 b = _mm512_set1_ps(beta);
+  for (int c = 0; c < 2; ++c) {
+    delta[c] =
+        _mm512_mul_ps(b, _mm512_sub_ps(_mm512_loadu_ps(v + 16 * c), acc[c]));
+    out[c] = _mm512_setzero_ps();
+  }
+  const __m512 dc = _mm512_set1_ps(decay);
+  for (int i = 0; i < dk; ++i) {
+    float* row = s + static_cast<std::size_t>(i) * stride;
+    const __m512 ki = _mm512_set1_ps(k[i]);
+    const __m512 qi = _mm512_set1_ps(q[i]);
+    for (int c = 0; c < 2; ++c) {
+      const __m512 updated = _mm512_fmadd_ps(
+          ki, delta[c], _mm512_mul_ps(_mm512_loadu_ps(row + 16 * c), dc));
+      _mm512_storeu_ps(row + 16 * c, updated);
+      out[c] = _mm512_fmadd_ps(updated, qi, out[c]);
+    }
+  }
+  for (int c = 0; c < 2; ++c) {
+    _mm512_storeu_ps(y + 16 * c, out[c]);
+  }
+}
+#endif
+
+// The delta rule on kDeltaColumns columns with the widest vectors the CPU
+// has (same results either way).
+void DeltaColumnsBest(float* s, int dk, int stride, const float* k,
+                      const float* q, const float* v, float decay, float beta,
+                      float* y) {
+#if defined(GUFO_PREFILL_AVX512) && defined(__AVX2__) && defined(__FMA__)
+  if (HasAvx512()) {
+    DeltaColumnsAvx512(s, dk, stride, k, q, v, decay, beta, y);
+    return;
+  }
+#endif
+  DeltaColumns(s, dk, stride, k, q, v, decay, beta, y);
+}
 
 // scores[g * ld + j] = q_g . key_j for G = 4 query heads and keys j in
 // [0, count); hd a multiple of 32.
@@ -963,11 +1018,11 @@ struct NpuPrefill::Impl {
           for (int t = 0; t < n; ++t) {
             const float* ut = u + static_cast<std::size_t>(t) * channels;
             const float* g = gates + static_cast<std::size_t>(t) * 2 * hv;
-            DeltaColumns(local, dk, kDeltaColumns, ut + key_dim + kh * dk,
-                         ut + kh * dk, ut + 2 * key_dim + head * dk + j0,
-                         g[head], g[hv + head],
-                         mixed + static_cast<std::size_t>(t) * value_dim +
-                             head * dk + j0);
+            DeltaColumnsBest(local, dk, kDeltaColumns, ut + key_dim + kh * dk,
+                             ut + kh * dk, ut + 2 * key_dim + head * dk + j0,
+                             g[head], g[hv + head],
+                             mixed + static_cast<std::size_t>(t) * value_dim +
+                                 head * dk + j0);
           }
           for (int i = 0; i < dk; ++i) {
             std::copy_n(local + i * kDeltaColumns, kDeltaColumns,
@@ -1165,14 +1220,12 @@ const NpuPrefill::Profile& NpuPrefill::profile() const {
 PromptPrefill PrefillPrompt(NpuPrefill& prefill) {
   return [&prefill](const std::vector<int>& prompt, DecodeState& state,
                     DecodeState* mtp, float* hidden) {
-    // A prefill pass costs ~0.10 s however short the prompt (98 GEMM calls
-    // of at least 256 rows each), the decode path ~28 ms per two tokens.
-    // Measured TTFT (BENCHMARKS.md): 6 tokens 0.086 s on the decode path
-    // against 0.102 s with prefill, 8 tokens 0.115 against 0.102. Shorter
-    // prompts go through the decoder alone.
+    // The whole prompt goes through one prefill: the decoder then runs only
+    // the LM head on its last row (NpuDecoder::Logits). Shorter prompts go
+    // through the decoder alone (crossover measured in BENCHMARKS.md).
     constexpr int kMinPrefillPrompt = 7;
-    const int k = static_cast<int>(prompt.size()) - 1;
-    if (static_cast<int>(prompt.size()) < kMinPrefillPrompt) {
+    const int n = static_cast<int>(prompt.size());
+    if (n < kMinPrefillPrompt) {
       return 0;
     }
     // Every id, including the last (the MTP cache reads prompt[k]), before
@@ -1182,12 +1235,13 @@ PromptPrefill PrefillPrompt(NpuPrefill& prefill) {
         throw std::out_of_range("qwen35: token id out of range");
       }
     }
-    prefill.Run(prompt.data(), k, state, hidden);
+    prefill.Run(prompt.data(), n, state, hidden);
     if (mtp != nullptr) {
-      // Pairs (h[p - 1], prompt[p]) at p = 1 .. k.
-      prefill.FillMtp(hidden, prompt.data() + 1, k, 1, *mtp);
+      // Pairs (h[p - 1], prompt[p]) at p = 1 .. n - 1; the pair at n (the
+      // first generated token) is the decoder's first draft.
+      prefill.FillMtp(hidden, prompt.data() + 1, n - 1, 1, *mtp);
     }
-    return k;
+    return n;
   };
 }
 

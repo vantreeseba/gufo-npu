@@ -518,3 +518,41 @@ The fp16 cache is read directly rather than through an fp32 copy: the
 kernels converting it in registers (0.216 s at 4k) beat the same kernels
 over an fp32 cache (0.276 s, the previous build), so a float view, which
 adds the conversion pass on top of that, cannot win.
+
+### TTFT quick wins (2026-10-28)
+
+Two changes from the TTFT research (`docs/research/TTFT.md` on
+`research/ttft`), measured with `gufo-npu bench prefill` (each length once to
+warm up, then three runs, back to back so the NPU never idles into its
+5 s autosuspend), two interleaved rounds of three builds, alone on the NPU:
+
+| Prompt tokens | main | + AVX-512 DeltaNet | + first token from prefill |
+|---|---|---|---|
+| 35 | 0.107, 0.106 s | 0.107, 0.106 | **0.086, 0.086** (−21 ms against main) |
+| 1,024 | 0.317, 0.315 | 0.312, 0.311 | **0.291, 0.290** (−26 ms) |
+| 4,096 | 1.235, 1.229 | 1.226, 1.223 | **1.195, 1.199** (−35 ms) |
+
+- **First token from the prefill.** PrefillPrompt now prefills the whole
+  prompt; the first token comes from the LM head alone on its last row
+  (`NpuDecoder::Logits`, one submission, ~6 ms) instead of a decode step
+  for the last prompt token (~29 ms). The research estimated −23 ms; the
+  measured gain is 20 ms on short prompts. Quality in QUALITY.md ("First
+  token from the prefill").
+- **AVX-512 delta rule** in the prefill's DeltaNet (`prefill_mixer.cpp`,
+  picked at run time like the attention kernels): bit-identical (same
+  hashes), DeltaNet at 4k 0.258 → 0.246 s. The research estimated −0.1 s;
+  the 32-column jobs are bound by their two passes over the 16 KB state
+  slice more than by instruction count, so the gain is ~1% of TTFT.
+- **Short prompts.** The crossover stays at 7 tokens (decode path for
+  shorter prompts): with the prefill path forced on, 6 tokens 0.076 s on the
+  decode path against 0.082 s with prefill, 7 tokens 0.097 against 0.082.
+  Through the prefill, TTFT is now 0.081 s for any prompt up to 12 tokens.
+
+Outputs (`gufo-npu generate --device npu`): the sky prompt without
+drafting (`a49f1c4c`) and the 960-token prompt with MTP (`8edbce90`) are
+unchanged. The Fibonacci prompt with MTP changes, `69e1c62d` → `fdb595fb`
+(239 → 256 generated tokens). Its text is the same for the first 607 of
+~700 characters, then a near tie picks "```\n\n**Example usage:**" over
+"\n\n\n# Example usage"; the MTP output equals plain greedy from the new
+state (`fdb595fb` both), as before the change (`69e1c62d` both). Decode
+speed unchanged: sky 39.1 tok/s, Fibonacci 64.4–64.6, 960 tokens 50.9–51.2.

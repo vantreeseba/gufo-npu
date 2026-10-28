@@ -98,3 +98,24 @@ with and without prefill agree on all 48 tokens checked, where the 2B agrees
 on 26), so `qwen35_4b_npu_prefill_test` keeps tolerances set from the 4B's
 measurements. A tighter prefill would need a more precise GEMM, e.g. the
 second, lo-part pass the 2B's prefill notes (about twice the GEMM time).
+
+## TTFT quick wins (2026-10-28)
+
+- **First token from the prefill's last row** (LM head alone, no decode
+  step for the last prompt token): retained, TTFT −47 ms at every length
+  (35 tokens 0.236 → 0.188 s). First token the same on all 10 test prompts;
+  the test allows a different one only at a decode-path top-2 gap under 2
+  logits (QUALITY.md). With the min/max fit both hashes were unchanged;
+  with the search fit (#15) the Fibonacci reply differs from main's
+  (`64f4400a` → `a965fad4`) and still equals plain greedy.
+- **AVX-512 delta rule** in this model's copy of the prefill mixers:
+  retained, bit-identical, ~1% of TTFT. Open: this model still carries its
+  own copy of the mixer code from before the family `PrefillMixer`
+  (`src/models/qwen35/prefill_mixer.*`) existed; moving onto it would drop
+  several hundred lines of duplicate kernels (the family mixer takes any
+  multiple of 4 query heads per kv head), checked by the same hashes and
+  prefill test.
+- **Chunk planner on the 4B's own measurements** (CPU 0.29 ms per token,
+  twice the 2B's; GEMMs 11.4/14.0/16.1 TFLOPS): retained, −7% at 300 and 600
+  tokens, −4% at 1,500, the same passes (and times) from 800 tokens up
+  (BENCHMARKS.md, "Chunk plan").

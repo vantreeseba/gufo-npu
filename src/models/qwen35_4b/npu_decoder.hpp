@@ -70,6 +70,12 @@ public:
   // the MTP head's input.
   const float* hidden(int t = 0) const;
 
+  // The LM head alone (output_norm, then the logits) on one final residual
+  // `hidden` (config().hidden values), e.g. a prompt's last row from a
+  // prefill; one NPU submission. Returns vocab logits, valid until the next
+  // call; hidden(0) becomes `hidden`.
+  const float* Logits(const float* hidden);
+
   // MTP draft: for each of `count` (1 or 2) positions p = position + i, the
   // pair (hidden[i], tokens[i]), where hidden[i] is the main model's final
   // residual at p - 1 and tokens[i] the token at p. Appends to the MTP
