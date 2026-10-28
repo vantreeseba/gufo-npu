@@ -68,30 +68,73 @@ Request fields:
 | `stop` | Up to 16 strings. Matched in the generated text, also across tokens; the stop string itself is never sent. |
 | `stream`, `stream_options.include_usage` | Streaming, and a final usage chunk. |
 | `chat_template_kwargs.enable_thinking`, `reasoning_effort` | Thinking (a think block before the answer, returned as `reasoning_content`). Off by default. `reasoning_effort` `none` or `minimal` turns it off, `low`, `medium` or `high` on; `enable_thinking` wins when both are set. |
-| `n` | Only 1. |
+| `n` | 1 to 8 choices, generated one after another (later ones reuse the prompt cache). With `seed`, choice *i* samples with `seed + i`, so choices differ and repeat. |
+| `logprobs`, `top_logprobs` | Each generated token's log probability and up to 20 alternatives (see below). |
+| `logit_bias` | Token id to a bias in [-100, 100], added to the logit before sampling (greedy too): -100 bans a token, 100 all but forces it. Ids outside the vocabulary are refused. |
+| `parallel_tool_calls` | `false` ends the reply after its first tool call (anything after it is dropped). Default `true`. |
 | `response_format` | Only `{"type": "text"}`. |
-| `logprobs`, `top_logprobs` | Not supported (400). |
 
-Other fields (`user`, `metadata`, `parallel_tool_calls`, ...) are ignored.
+Other fields (`user`, `metadata`, ...) are ignored.
 
 The reply:
 
-- `choices[0].message` has `content`, `reasoning_content` when the model
+- `choices[i].message` has `content`, `reasoning_content` when the model
   thought, and `tool_calls` (`{"id": "call_...", "type": "function",
   "function": {"name", "arguments"}}`, arguments as a JSON string).
   `content` is `null` when the reply is only tool calls.
 - `finish_reason` is `stop` (end of turn or a stop string), `length`
   (`max_tokens` or the context) or `tool_calls`.
-- `usage` has `prompt_tokens`, `completion_tokens`, `total_tokens` and
+- `usage` has `prompt_tokens` (the prompt counted once, whatever `n`),
+  `completion_tokens` (all choices), `total_tokens` and
   `prompt_tokens_details.cached_tokens` (prompt tokens restored from a
-  prompt-cache checkpoint).
+  prompt-cache checkpoint, for the first choice).
+- `choices[i].logprobs` is `null` unless `logprobs` is true; then it is
+  `{"content": [{"token", "logprob", "bytes", "top_logprobs": [{"token",
+  "logprob", "bytes"}, ...]}, ...]}`, one entry per generated token (the
+  end-of-turn token has none). `token` is the token's text (bytes that are
+  not whole UTF-8 characters show as U+FFFD; `bytes` has them exactly).
 
 Streaming sends `chat.completion.chunk` events: first `{"role":
 "assistant", "content": ""}`, then `content`, `reasoning_content` and
-`tool_calls` deltas as they are generated (a tool call arrives whole, in one
-delta with its `index`), then an empty delta with `finish_reason`, the usage
-chunk if asked for, and `data: [DONE]`. Text is sent in whole UTF-8
-characters.
+`tool_calls` deltas as they are generated, then an empty delta with
+`finish_reason`; with `n` > 1 each choice does this in turn, its chunks
+carrying its `index`. Then the usage chunk if asked for, and `data:
+[DONE]`. Text is sent in whole UTF-8 characters. A tool call is sent in
+OpenAI's fragment shape once the model has finished writing it: a delta
+with its `index`, `id`, `type` and `function.name` (empty `arguments`), then
+one with the `arguments`. With `logprobs`, each chunk carries the entries of
+the tokens generated since the previous chunk (`logprobs.content`); entries
+of text held back (a possible stop string or markup) ride on a later chunk.
+
+#### Log probabilities
+
+`logprob` is the model's own log-softmax over the whole vocabulary for that
+position: before `temperature`, `top_k`/`top_p`/`min_p`, penalties and
+`logit_bias`, as OpenAI reports them. So the values do not depend on the
+sampling settings, and at temperature 0 the chosen token is the first of
+`top_logprobs`. With MTP drafting, an accepted draft token's values come
+from the verify pass that accepted it: the same distribution decoding
+without drafts samples from, up to rounding. Computing them costs one pass over the vocabulary per token,
+only when asked for.
+
+### `POST /v1/completions`
+
+The legacy text-completion API. The prompt goes to the model as it is,
+without the chat template.
+
+| Field | Support |
+|---|---|
+| `prompt` | A string, an array of strings, an array of token ids, or an array of such arrays. Each prompt gets `n` choices: choice `index` = prompt × `n` + choice; at most 8 in all. |
+| `max_tokens` | Default 16 (OpenAI's for this API); ceiling the rest of the context. |
+| `temperature`, `top_p`, `top_k`, `min_p`, penalties, `seed`, `logit_bias`, `stop`, `n`, `stream`, `stream_options.include_usage` | As for chat completions. `best_of` must equal `n`. |
+| `echo` | Puts the prompt before the generated text. |
+| `logprobs` | 0 to 5: the legacy shape, `{"tokens", "token_logprobs", "top_logprobs": [{token: logprob}], "text_offset"}`. Refused together with `echo` (prompt tokens have no logprobs here). |
+| `suffix` | Refused (400). |
+
+Generation also ends at the chat template's end-of-turn tokens
+(`<|im_end|>`, `<|endoftext|>`). The reply is `{"object": "text_completion",
+"choices": [{"text", "index", "logprobs", "finish_reason"}], "usage"}`;
+streaming sends the same shape per piece of text, then `data: [DONE]`.
 
 ### `GET /v1/models`, `GET /v1/models/{id}`
 
@@ -223,8 +266,10 @@ client (`pip install openai httpx`). Each takes `--base-url` (default
 ## Not supported yet
 
 - More than one model per process, or switching models per request.
-- `n > 1`, log probabilities, JSON mode and structured outputs, forced tool
-  calls (`tool_choice: "required"` or a named function).
+- JSON mode and structured outputs, forced tool calls (`tool_choice:
+  "required"` or a named function).
+- Tool-call arguments streamed while the model writes them (a call is sent
+  once complete).
 - Images and audio.
-- The legacy `/v1/completions` and the `/v1/responses` APIs; embeddings.
+- The `/v1/responses` API; embeddings.
 - TLS (put a reverse proxy in front for that) and CORS headers.
