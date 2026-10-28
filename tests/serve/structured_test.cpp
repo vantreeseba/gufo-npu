@@ -1057,7 +1057,12 @@ void Benchmark() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  // --bench: only the mask benchmark (the image build prints it).
+  if (argc > 1 && std::string(argv[1]) == "--bench") {
+    Benchmark();
+    return failures > 0 ? 1 : 0;
+  }
   Schemas();
   Specifics();
   ToolCalls();
