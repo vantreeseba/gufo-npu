@@ -94,9 +94,9 @@ std::vector<Case> Build(npu::GemvRuntime& rt, const Variant& v,
     packed = q4nx::PackRows(
         {{gufo_npu::gguf::GgmlType::kBF16,
           reinterpret_cast<const std::uint8_t*>(bits.data()), v.rows}},
-        v.dim, q4nx::SwiGluOrder(v.rows / 2));
+        v.dim, q4nx::Fit::kSearch, q4nx::SwiGluOrder(v.rows / 2));
   } else {
-    packed = q4nx::PackFloat(w.data(), v.rows, v.dim);
+    packed = q4nx::PackFloat(w.data(), v.rows, v.dim, q4nx::Fit::kSearch);
   }
   w.clear();
   w.shrink_to_fit();

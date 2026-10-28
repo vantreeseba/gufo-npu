@@ -44,8 +44,8 @@ q4nx::Segment SegmentOf(const gguf::TensorInfo& t, std::size_t first = 0,
           rows != 0 ? rows : static_cast<std::size_t>(t.Rows())};
 }
 
-q4nx::Matrix PackOne(const gguf::TensorInfo& t) {
-  return q4nx::Pack(t.type, t.data, t.Rows(), t.RowElements());
+q4nx::Matrix PackOne(const gguf::TensorInfo& t, q4nx::Fit fit) {
+  return q4nx::Pack(t.type, t.data, t.Rows(), t.RowElements(), fit);
 }
 
 // A Q4_K row as q4nx holds it: per 256 values d and dmin rounded to bf16,
@@ -117,7 +117,7 @@ void GemvF32(const std::vector<float>& rows, std::size_t in, const float* x,
 
 }  // namespace
 
-Q4nxProjections::Q4nxProjections(const gguf::File& file)
+Q4nxProjections::Q4nxProjections(const gguf::File& file, q4nx::Fit fit)
     : config_(ReadConfig(file)) {
   const Config& c = config_;
   const auto hidden = static_cast<std::size_t>(c.hidden);
@@ -131,21 +131,21 @@ Q4nxProjections::Q4nxProjections(const gguf::File& file)
       layer->in = q4nx::PackRows(
           {SegmentOf(t("attn_q.weight")), SegmentOf(t("attn_k.weight")),
            SegmentOf(t("attn_v.weight"))},
-          hidden);
-      layer->out = PackOne(t("attn_output.weight"));
+          hidden, fit);
+      layer->out = PackOne(t("attn_output.weight"), fit);
     } else {
       layer->in = q4nx::PackRows(
           {SegmentOf(t("attn_qkv.weight")), SegmentOf(t("attn_gate.weight"))},
-          hidden);
+          hidden, fit);
       layer->alpha = ToFloats(t("ssm_alpha.weight"));
       layer->beta = ToFloats(t("ssm_beta.weight"));
-      layer->out = PackOne(t("ssm_out.weight"));
+      layer->out = PackOne(t("ssm_out.weight"), fit);
     }
     if (c.IsMoe()) {
       layer->ffn_in = q4nx::PackRows({SegmentOf(t("ffn_gate_shexp.weight")),
                                       SegmentOf(t("ffn_up_shexp.weight"))},
-                                     hidden);
-      layer->down = PackOne(t("ffn_down_shexp.weight"));
+                                     hidden, fit);
+      layer->down = PackOne(t("ffn_down_shexp.weight"), fit);
       layer->router = ToFloats(t("ffn_gate_inp.weight"));
       const auto shared_gate = ToFloats(t("ffn_gate_inp_shexp.weight"));
       layer->router.insert(layer->router.end(), shared_gate.begin(),
@@ -161,24 +161,24 @@ Q4nxProjections::Q4nxProjections(const gguf::File& file)
           layer->expert_in.push_back(
               q4nx::PackRows({SegmentOf(*layer->gate_exps, first * ef, ef),
                               SegmentOf(*layer->up_exps, first * ef, ef)},
-                             hidden));
+                             hidden, fit));
         }
         if (layer->down_exps->type != gguf::GgmlType::kQ4_K) {
           layer->expert_down.push_back(q4nx::PackRows(
-              {SegmentOf(*layer->down_exps, first * hidden, hidden)}, ef));
+              {SegmentOf(*layer->down_exps, first * hidden, hidden)}, ef, fit));
         }
       }
     } else {
       layer->ffn_in = q4nx::PackRows(
           {SegmentOf(t("ffn_gate.weight")), SegmentOf(t("ffn_up.weight"))},
-          hidden);
-      layer->down = PackOne(t("ffn_down.weight"));
+          hidden, fit);
+      layer->down = PackOne(t("ffn_down.weight"), fit);
     }
     layers_.push_back(std::move(layer));
   }
   const auto& head = c.tied_embeddings ? file.Tensor("token_embd.weight")
                                        : file.Tensor("output.weight");
-  lm_head_ = q4nx::Pack(head.type, head.data, head.Rows(), hidden);
+  lm_head_ = q4nx::Pack(head.type, head.data, head.Rows(), hidden, fit);
 }
 
 Q4nxProjections::~Q4nxProjections() = default;

@@ -72,12 +72,13 @@ int main(int argc, char** argv) {
     const auto up = q4nx::PackRows(
         {{gufo_npu::gguf::GgmlType::kBF16,
           reinterpret_cast<const std::uint8_t*>(bits.data()), 2 * kFfn}},
-        kHidden, q4nx::SwiGluOrder(kFfn));
+        kHidden, q4nx::Fit::kSearch, q4nx::SwiGluOrder(kFfn));
     std::vector<float> d(std::size_t{kHidden} * kFfn);
     for (auto& v : d) {
       v = weight(rng);
     }
-    const auto down = q4nx::PackFloat(d.data(), kHidden, kFfn);
+    const auto down =
+        q4nx::PackFloat(d.data(), kHidden, kFfn, q4nx::Fit::kSearch);
     std::memcpy(arena_buf.as<std::uint8_t>() + arena.UpOffset(e),
                 up.bytes.data(), up.bytes.size());
     std::memcpy(arena_buf.as<std::uint8_t>() + arena.DownOffset(e),

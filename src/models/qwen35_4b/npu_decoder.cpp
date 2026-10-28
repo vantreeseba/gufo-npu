@@ -45,7 +45,7 @@ q4nx::Segment SegmentOf(const gguf::TensorInfo& t) {
 }
 
 q4nx::Matrix PackOne(const gguf::TensorInfo& t) {
-  return q4nx::Pack(t.type, t.data, t.Rows(), t.RowElements());
+  return q4nx::Pack(t.type, t.data, t.Rows(), t.RowElements(), kQ4nxFit);
 }
 
 // A GEMV input region: token t's slot at t * npu::kSlot fp32 ([H | D] for a
@@ -128,12 +128,12 @@ struct NpuDecoder::Impl {
       in_w = q4nx::PackRows(
           {SegmentOf(t("attn_q.weight")), SegmentOf(t("attn_k.weight")),
            SegmentOf(t("attn_v.weight"))},
-          hidden);
+          hidden, kQ4nxFit);
       out_t = &t("attn_output.weight");
     } else {
       in_w = q4nx::PackRows(
           {SegmentOf(t("attn_qkv.weight")), SegmentOf(t("attn_gate.weight"))},
-          hidden);
+          hidden, kQ4nxFit);
       b.alpha = ToFloats(t("ssm_alpha.weight"));
       b.beta = ToFloats(t("ssm_beta.weight"));
       out_t = &t("ssm_out.weight");
@@ -146,7 +146,7 @@ struct NpuDecoder::Impl {
         runtime,
         q4nx::PackRows(
             {SegmentOf(t("ffn_gate.weight")), SegmentOf(t("ffn_up.weight"))},
-            hidden, q4nx::SwiGluOrder(c.ffn)),
+            hidden, kQ4nxFit, q4nx::SwiGluOrder(c.ffn)),
         Prologue::kResNorm, Epilogue::kSwiGlu);
     b.down = std::make_unique<Q4nxGemv>(runtime, PackOne(t("ffn_down.weight")),
                                         Prologue::kAct, Epilogue::kStore);
@@ -195,7 +195,8 @@ struct NpuDecoder::Impl {
       layers.push_back(MakeBlock(file, il));
     }
     lm = std::make_unique<Q4nxGemv>(
-        runtime, q4nx::Pack(embed->type, embed->data, embed->Rows(), hidden),
+        runtime,
+        q4nx::Pack(embed->type, embed->data, embed->Rows(), hidden, kQ4nxFit),
         Prologue::kResNorm, Epilogue::kStore);
     lm_x = std::make_unique<Buffer>(runtime, npu::kInputBytes);
     lm_y = std::make_unique<Buffer>(runtime, lm->y_bytes());
@@ -245,8 +246,8 @@ struct NpuDecoder::Impl {
              embed->data + static_cast<std::size_t>(id) * row_bytes, 1});
       }
       draft_lm = std::make_unique<Q4nxGemv>(
-          runtime, q4nx::PackRows(draft_rows, hidden), Prologue::kResNorm,
-          Epilogue::kStore);
+          runtime, q4nx::PackRows(draft_rows, hidden, kQ4nxFit),
+          Prologue::kResNorm, Epilogue::kStore);
       mtp_lm_x = std::make_unique<Buffer>(runtime, npu::kInputBytes);
       mtp_lm_y = std::make_unique<Buffer>(runtime, draft_lm->y_bytes());
       SetNormWeight(*mtp_lm_x,

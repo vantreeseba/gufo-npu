@@ -19,8 +19,10 @@ namespace gufo_npu::qwen35 {
 
 class Q4nxProjections : public Projections {
 public:
-  // Keeps pointers into `file`, which must outlive this.
-  explicit Q4nxProjections(const gguf::File& file);
+  // Keeps pointers into `file`, which must outlive this. `fit` must be
+  // the one the model's NPU path packs with (qwen35::Q4nxFit, or the
+  // model package's own), so both run the same weights.
+  Q4nxProjections(const gguf::File& file, q4nx::Fit fit);
   ~Q4nxProjections() override;
 
   void Apply(Stage stage, int layer, const float* x, int tokens,

@@ -2,6 +2,31 @@
 
 What was tried while bringing the 4B up, what it showed, and what is open.
 
+## q4nx fit: search, not min/max (2026-10-27)
+
+Retained: `qwen35_4b::kQ4nxFit` is `q4nx::Fit::kSearch` (llama.cpp's
+weighted least-squares Q4_K fit) for the decoder, the MTP block, the draft
+head and the prefill's weights; main packed them with min/max. Most of this
+GGUF's matrices are Q5_K, Q6_K or Q8_0 and requantize. On the 35B's
+held-out evaluation (1,515 positions of six pinned texts,
+`tools/reference/fetch_text.py`; KL against the GGUF as stored, its
+harness run on this model, 2026-10-27):
+
+| Weights through q4nx | min/max: KL, top-1 | search: KL, top-1 |
+|---|---|---|
+| every matrix (what the NPU runs) | 0.0301, 91.82% | **0.0235, 93.14%** |
+| every matrix but the tied LM head | 0.0230, 93.60% | 0.0187, 94.26% |
+
+On the oracle prompts the set the NPU runs agrees with llama.cpp on 270 of
+301 positions instead of 266, and `qwen35_4b_npu_decode_test` gives
+269/301 instead of 266/301 (NPU against the CPU over the same weights
+300/301). The prefill test still passes (170/170 after prefill, MTP equal to
+greedy). Output hashes change, as the weights do: sky without a draft
+`f99190db` (was `2eb62ce4`), Fibonacci with MTP `64f4400a` (was `e5fd099a`).
+Speed is unchanged, 18.69-18.78 tok/s on sky and 31.4-31.6 on Fibonacci with
+MTP. The decoder packs and uploads in 4.7 s. Importance weighting is the
+next candidate (qwen3.6-35b-a3b/EXPERIMENTS.md).
+
 ## Decode GEMV geometry (2026-10-27)
 
 The 2B's core program bakes its geometry in at compile time: the token

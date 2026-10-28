@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "core/gguf.hpp"
+#include "core/q4nx.hpp"
 #include "models/qwen35/config.hpp"
 #include "models/qwen35/decoder.hpp"
 #include "models/qwen35/generate.hpp"
@@ -30,6 +31,11 @@
 // head scores only the draft vocabulary, and the main model still checks
 // each draft over every token.
 namespace gufo_npu::qwen35_4b {
+
+// The q4nx fit for this model's requantized weights (decoder, MTP block,
+// draft head and prefill): the search fit lowers KL against the GGUF by a
+// fifth and raises top-1 on held-out text (qwen3.5-4b/EXPERIMENTS.md).
+inline constexpr q4nx::Fit kQ4nxFit = q4nx::Fit::kSearch;
 
 using qwen35::Config;
 using qwen35::DecodeState;

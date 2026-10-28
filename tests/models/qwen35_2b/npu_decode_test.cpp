@@ -86,7 +86,8 @@ int main(int argc, char** argv) {
       "packed and uploaded the NPU decoder in %.1f s\n",
       std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
           .count());
-  const qwen35::Q4nxProjections projections(*file);
+  const qwen35::Q4nxProjections projections(
+      *file, qwen35::Q4nxFit(qwen35::ReadConfig(*file)));
   qwen35::Decoder cpu(*file, projections);
   const auto vocab = static_cast<std::size_t>(npu.config().vocab);
 

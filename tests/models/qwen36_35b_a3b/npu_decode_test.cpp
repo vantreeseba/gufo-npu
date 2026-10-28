@@ -175,7 +175,8 @@ int main(int argc, char** argv) {
           .count());
   const auto& c = npu.config();
   start = std::chrono::steady_clock::now();
-  const qwen35::Q4nxProjections projections(*file);
+  const qwen35::Q4nxProjections projections(
+      *file, qwen35::Q4nxFit(qwen35::ReadConfig(*file)));
   FollowRouting follow(projections, c);
   qwen35::Decoder cpu(*file, follow);
   std::printf(
