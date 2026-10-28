@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <random>
 #include <unordered_map>
@@ -12,6 +13,23 @@
 // models' greedy paths.
 namespace gufo_npu {
 
+// Restricts which tokens may come next, e.g. to keep the output valid JSON
+// (structured outputs). One object serves one generation at a time: the
+// Sampler resets it when constructed, asks it which tokens are allowed
+// before each draw and advances it with each generated token (Accept).
+class TokenConstraint {
+public:
+  virtual ~TokenConstraint() = default;
+  // Back to the start of a generation.
+  virtual void Reset() = 0;
+  // mask[id] = 1 when `id` may come next, else 0, for ids in [0, vocab).
+  virtual void Allowed(int vocab, std::vector<std::uint8_t>& mask) = 0;
+  // Whether `id` may come next (one token; cheaper than Allowed).
+  virtual bool IsAllowed(int id) = 0;
+  // `id` was generated.
+  virtual void Advance(int id) = 0;
+};
+
 struct SamplingParams {
   float temperature = 0.0f;  // 0: greedy
   float top_p = 1.0f;        // nucleus mass kept; 1: off
@@ -21,6 +39,10 @@ struct SamplingParams {
   float frequency_penalty = 0.0f;
   float repetition_penalty = 1.0f;  // 1: off
   std::optional<std::uint64_t> seed;
+  // Optional: tokens it disallows are never drawn (their logits count as
+  // -inf before penalties, temperature and the filters). Without one,
+  // sampling is exactly as before.
+  std::shared_ptr<TokenConstraint> constraint;
 
   bool greedy() const { return temperature <= 0.0f; }
 };
@@ -52,7 +74,7 @@ public:
   // The next token for `logits` (`vocab` values, not modified).
   int Sample(const float* logits, int vocab);
 
-  // Records a generated token for the penalties.
+  // Records a generated token for the penalties (and the constraint).
   void Accept(int id);
 
   // The candidates Sample draws from and their probabilities (summing to
@@ -73,11 +95,15 @@ private:
   // the vocab, zero for non-candidates) or list_ (id, weight); total_ sums
   // them.
   void Candidates(const float* logits, int vocab);
+  // With a constraint: `logits` with the disallowed tokens at -inf.
+  const float* Masked(const float* logits, int vocab);
 
   SamplingParams params_;
   std::mt19937_64 rng_;
   std::unordered_map<int, int> counts_;  // generated token -> occurrences
   std::vector<float> penalized_;
+  std::vector<float> masked_;
+  std::vector<std::uint8_t> allowed_;
   std::vector<float> weights_;
   std::vector<std::pair<int, double>> list_;
   std::vector<int> ids_;

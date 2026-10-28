@@ -105,6 +105,7 @@ Tokenizer::Tokenizer(const gguf::File& file)
   }
 
   bytes_.resize(tokens_.size());
+  special_.assign(tokens_.size(), 0);
   vocab_.reserve(tokens_.size());
   for (std::size_t id = 0; id < tokens_.size(); ++id) {
     const auto& token = tokens_[id];
@@ -118,6 +119,7 @@ Tokenizer::Tokenizer(const gguf::File& file)
     }
     if (type == kTypeControl || type == kTypeUserDefined) {
       bytes_[id] = token;
+      special_[id] = 1;
       added_.emplace_back(token, static_cast<int>(id));
       continue;
     }
