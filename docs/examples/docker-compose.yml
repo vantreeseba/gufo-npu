@@ -1,0 +1,104 @@
+# gufo-npu: OpenAI-compatible servers on the XDNA2 NPU (docs/SERVING.md).
+#
+# The default service serves all three models from one server: clients pick
+# one per request by id (qwen3.5-2b, qwen3.5-4b, qwen3.6-35b-a3b), and the
+# server keeps one of them on the NPU at a time, switching on demand
+# (docs/SERVING.md, "Several models"). It reads every model's GGUF at start,
+# so set all three paths.
+#
+# The per-model services (profiles 35b, 4b, 2b) are the alternative: one
+# model, no switching. Run one service at a time: the NPU is shared, and
+# several servers at once is untested and splits its bandwidth.
+#
+#   cp docs/examples/gufo-npu.env.example .env   # then set the model paths
+#   docker compose -f docs/examples/docker-compose.yml --env-file .env up -d   # all models
+#   docker compose -f docs/examples/docker-compose.yml --env-file .env --profile 35b up -d qwen3.6-35b-a3b
+#
+# Then point OpenAI clients at http://<host>:8080/v1.
+
+x-gufo-npu: &gufo-npu
+  image: ghcr.io/vantreeseba/gufo-npu:${GUFO_NPU_TAG:-main}
+  # `main` moves with every merge: fetch it on each `up` instead of reusing
+  # an older local copy.
+  pull_policy: always
+  restart: unless-stopped
+  devices:
+    - /dev/accel/accel0:/dev/accel/accel0
+  ulimits:
+    memlock: -1          # weights are pinned for the NPU
+  # Uncomment when the host's amdxdna driver is newer than the image's XRT:
+  # volumes:
+  #   - /opt/xilinx/xrt:/opt/xilinx/xrt:ro
+  stop_grace_period: 30s
+
+services:
+  gufo-npu:
+    <<: *gufo-npu
+    container_name: gufo-npu
+    volumes:
+      - ${QWEN35_2B_GGUF:-./set-QWEN35_2B_GGUF.gguf}:/models/qwen3.5-2b.gguf:ro
+      - ${QWEN35_4B_GGUF:-./set-QWEN35_4B_GGUF.gguf}:/models/qwen3.5-4b.gguf:ro
+      - ${QWEN36_35B_GGUF:-./set-QWEN36_35B_GGUF.gguf}:/models/qwen3.6-35b-a3b.gguf:ro
+    ports:
+      - "${GUFO_NPU_BIND:-127.0.0.1}:${GUFO_NPU_HOST_PORT:-8080}:8080"
+    command:
+      - serve
+      - --model
+      - /models/qwen3.6-35b-a3b.gguf
+      - --model
+      - /models/qwen3.5-4b.gguf
+      - --model
+      - /models/qwen3.5-2b.gguf
+      - --preload
+      - ${GUFO_NPU_PRELOAD:-qwen3.6-35b-a3b}
+      - --unload-after
+      - "${GUFO_NPU_UNLOAD_AFTER:-0}"
+      - --host
+      - 0.0.0.0
+    # Switching loads the requested model (2B ~4 s, 4B ~12 s, 35B ~19 s);
+    # the 35B pins ~22 GB while loaded.
+
+  qwen3.6-35b-a3b:
+    <<: *gufo-npu
+    profiles: ["35b"]
+    container_name: gufo-npu-35b
+    volumes:
+      - ${QWEN36_35B_GGUF:-./set-QWEN36_35B_GGUF.gguf}:/models/model.gguf:ro
+    ports:
+      - "${GUFO_NPU_BIND:-127.0.0.1}:${GUFO_NPU_HOST_PORT:-8080}:8080"
+    command:
+      - serve
+      - --model
+      - /models/model.gguf
+      - --host
+      - 0.0.0.0
+      - --model-id
+      - qwen3.6-35b-a3b
+      - --prompt-cache
+      - "2"
+      - --context-length
+      - "32768"
+    # Needs ~22 GB of pinned memory and ~20 s to load; the image's health
+    # check reports healthy once /health answers.
+
+  qwen3.5-4b:
+    <<: *gufo-npu
+    profiles: ["4b"]
+    container_name: gufo-npu-4b
+    volumes:
+      - ${QWEN35_4B_GGUF:-./set-QWEN35_4B_GGUF.gguf}:/models/model.gguf:ro
+    ports:
+      - "${GUFO_NPU_BIND:-127.0.0.1}:${GUFO_NPU_HOST_PORT:-8080}:8080"
+    command: [serve, --model, /models/model.gguf, --host, 0.0.0.0,
+              --model-id, qwen3.5-4b]
+
+  qwen3.5-2b:
+    <<: *gufo-npu
+    profiles: ["2b"]
+    container_name: gufo-npu-2b
+    volumes:
+      - ${QWEN35_2B_GGUF:-./set-QWEN35_2B_GGUF.gguf}:/models/model.gguf:ro
+    ports:
+      - "${GUFO_NPU_BIND:-127.0.0.1}:${GUFO_NPU_HOST_PORT:-8080}:8080"
+    command: [serve, --model, /models/model.gguf, --host, 0.0.0.0,
+              --model-id, qwen3.5-2b]
