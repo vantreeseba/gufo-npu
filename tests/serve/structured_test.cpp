@@ -1079,8 +1079,8 @@ void CrossFeatures() {
     if (!choice.is_object() || !choice["message"]["content"].is_string()) {
       return false;
     }
-    const json v = json::parse(
-        choice["message"]["content"].get<std::string>(), nullptr, false);
+    const json v = json::parse(choice["message"]["content"].get<std::string>(),
+                               nullptr, false);
     return !v.is_discarded() && Validate(v, schema, schema);
   };
   const auto format = gufo_npu::serve::NewQwen35ChatFormat();

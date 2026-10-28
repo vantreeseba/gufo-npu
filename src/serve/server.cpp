@@ -372,9 +372,9 @@ struct Server::Impl {
 
   // The constraint a request's response_format or tool_choice asks for,
   // or none.
-  std::shared_ptr<TokenConstraint> Constraint(const ChatRequest& chat,
-                                             const Engine& engine,
-                                             const std::vector<int>& stop_ids) {
+  std::shared_ptr<TokenConstraint> Constraint(
+      const ChatRequest& chat, const Engine& engine,
+      const std::vector<int>& stop_ids) {
     std::shared_ptr<const Grammar> grammar;
     try {
       if (chat.tool_required) {
@@ -907,7 +907,9 @@ struct Server::Impl {
         };
         if (c.logprobs) {
           hooks.top_logprobs = *c.logprobs;
-          hooks.logprob = [&](TokenLogprobs&& lp) { AddLegacy(*job.engine, legacy, lp); };
+          hooks.logprob = [&](TokenLogprobs&& lp) {
+            AddLegacy(*job.engine, legacy, lp);
+          };
         }
         Outcome out =
             Run(job, job.gens[p], i, std::make_unique<PlainTextParser>(),
