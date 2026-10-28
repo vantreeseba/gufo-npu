@@ -94,6 +94,7 @@ struct NpuDecoder::Impl {
   std::unique_ptr<Q4nxGemv> lm;
   std::unique_ptr<Buffer> lm_x, lm_y, lm_r, scratch;
   std::unique_ptr<Chain> first[kMaxTokens];  // layer 0's input projection
+  std::unique_ptr<Chain> lm_only;            // the LM head on lm_x alone
 
   // The MTP head: eh_proj into its block's input, the block, then an LM
   // head over the draft vocabulary (draft_ids, ascending) with
@@ -201,6 +202,8 @@ struct NpuDecoder::Impl {
     lm_r = std::make_unique<Buffer>(runtime, npu::kResidualBytes);
     output_norm = ToFloats(file.Tensor("output_norm.weight"));
     SetNormWeight(*lm_x, file.Tensor("output_norm.weight"));
+    lm_only = std::make_unique<Chain>(runtime);
+    lm_only->Add(*lm, *lm_x, *lm_y, *lm_r, 1);
 
     // Wiring. in_l: residual -> ffn_x.H. out_l: -> ffn_x.D. ffn_l: residual
     // -> next.H. down_l: -> next.D. Layer 0's D stays zero.
@@ -377,6 +380,25 @@ const float* NpuDecoder::hidden(int t) const {
          static_cast<std::size_t>(t) * impl_->config.hidden;
 }
 
+const float* NpuDecoder::Logits(const float* hidden) {
+  Impl& m = *impl_;
+  const Config& c = m.config;
+  const int d = c.hidden;
+  // Token 0's slot of the LM head's input: H = hidden, D = 0, so its input
+  // stage normalizes `hidden` itself. The next Step rewrites the region.
+  Buffer slot = m.lm_x->Sub(0, kSlotBytes);
+  float* x = slot.as<float>();
+  std::memcpy(x, hidden, static_cast<std::size_t>(d) * sizeof(float));
+  std::fill(x + npu::kHidden, x + npu::kHidden + d, 0.0f);
+  slot.ToDevice();
+  m.Submit(*m.lm_only);
+  m.lm_y->FromDevice();
+  std::memcpy(m.logits.data(), m.lm_y->as<float>(), c.vocab * sizeof(float));
+  std::memcpy(m.final_hidden.data(), hidden,
+              static_cast<std::size_t>(d) * sizeof(float));
+  return m.logits.data();
+}
+
 const std::vector<float>& NpuDecoder::Step(int token, DecodeState& state) {
   const float* logits = Step(&token, 1, state);
   std::memcpy(impl_->one_logits.data(), logits,
@@ -545,12 +567,15 @@ std::vector<int> SpeculativeGenerate(NpuDecoder& model,
   const int prefilled =
       prefill ? prefill(prompt, state, draft ? &mtp : nullptr, hidden.data())
               : 0;
-  // The decoder runs at least the last prompt token: its logits start the
-  // output.
-  if (prefilled < 0 || prefilled > n - 1) {
+  if (prefilled < 0 || prefilled > n) {
     throw std::logic_error("generate: prompt prefill ran " +
                            std::to_string(prefilled) + " of " +
                            std::to_string(n) + " tokens");
+  }
+  // A prefill of the whole prompt leaves only the LM head on its last row:
+  // its logits start the output.
+  if (prefilled == n) {
+    logits = model.Logits(hidden.data() + static_cast<std::size_t>(n - 1) * d);
   }
   for (int p = prefilled; p < n; p += 2) {
     const int count = std::min(2, n - p);

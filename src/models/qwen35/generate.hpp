@@ -49,9 +49,12 @@ struct SpeculativeStats {
 };
 
 // Prompt processing ahead of the decoder (NpuPrefill): runs prompt tokens
-// [0, k) into a fresh `state` and returns k (< prompt.size()), writing each
+// [0, k) into a fresh `state` and returns k (<= prompt.size()), writing each
 // token's final residual to rows [0, k) of `hidden`; with `mtp`, also fills
-// the MTP cache at positions [1, k] (pairs (hidden row p - 1, prompt[p])).
+// the MTP cache at positions 1 .. min(k, prompt.size() - 1) (pairs (hidden
+// row p - 1, prompt[p])). When k is the whole prompt, the decoder computes
+// only the LM head on hidden row k - 1 for the first token; otherwise it
+// runs the rest of the prompt.
 using PromptPrefill =
     std::function<int(const std::vector<int>& prompt, DecodeState& state,
                       DecodeState* mtp, float* hidden)>;

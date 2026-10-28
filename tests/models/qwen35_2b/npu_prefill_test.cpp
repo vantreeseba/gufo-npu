@@ -22,17 +22,20 @@
 // CPU mixers) against the decode path (NpuDecoder, two tokens per pass) over
 // the same q4nx weights, on the oracle prompts and on prompts of 1, 2, 256,
 // 257, 600, 1,100 and 2,049 tokens (one and two chunks of 256, 512- and
-// 1,024-row chunks). For every prompt but its last token:
+// 1,024-row chunks). Over the whole prompt, as PrefillPrompt runs it:
 //   - the final residual of every position (prefill's hidden rows vs the
 //     decoder's);
 //   - the state the decoder continues from, layer by layer: each DeltaNet
 //     layer's conv window and recurrent state, each attention layer's K/V
 //     cache;
 //   - the MTP layer's K/V cache filled by NpuPrefill::FillMtp against
-//     NpuDecoder::FillMtp, from the same hidden rows;
-//   - then the decoder runs the last token and 16 greedy steps from both
-//     states, teacher-forced on the decode path's tokens: logits relative
-//     error and argmax.
+//     NpuDecoder::FillMtp, from the same hidden rows (positions before the
+//     last);
+//   - the first token from the LM head alone on prefill's last row
+//     (NpuDecoder::Logits) against the decode path's step of the last
+//     token: the same, or a near tie in the decode path's own top two;
+//   - then 16 greedy steps from both states, teacher-forced on the decode
+//     path's tokens: logits relative error and argmax.
 // Then MTP speculative decoding after prefill must give exactly the plain
 // greedy output after prefill.
 //   GUFO_NPU_QWEN35_2B_Q4_GGUF  UD-Q4_K_XL GGUF of Qwen3.5-2B
@@ -55,6 +58,12 @@ constexpr double kMaxHiddenError = 6e-2;
 constexpr double kMaxStateError = 8e-2;
 constexpr double kMaxLogitError = 5e-2;
 constexpr double kMinArgmaxAgreement = 0.95;
+// The first token's logits from prefill's last row move by at most 0.89
+// against the decode path's (measured on these prompts, 2026-10-28; 4B
+// 0.80), so two logits can trade places only when they are within ~1.8 of
+// each other. Every first token was the same; at a gap under 2 logits it may
+// differ.
+constexpr double kFirstTokenTie = 2.0;
 
 std::vector<int> ReadIds(const fs::path& path) {
   std::ifstream in(path);
@@ -133,7 +142,42 @@ struct Totals {
   int failures = 0;
   std::size_t agree = 0;
   std::size_t positions = 0;
+  int prompts = 0;
+  int first_differs = 0;
+  double max_first_change = 0;
 };
+
+// The first generated token comes from the prefill's last row through the
+// LM head alone (NpuDecoder::Logits), the decode path's from its own step of
+// the last prompt token. They may pick different tokens only where the
+// decode path's own top two are within kFirstTokenTie logits.
+struct FirstToken {
+  bool same = false;
+  bool ok = false;
+  double gap = 0;         // decode path: top-1 minus top-2 logit
+  double max_change = 0;  // largest |prefill - decode| over the vocabulary
+};
+
+FirstToken CompareFirst(const float* got, const float* want, int vocab,
+                        Totals& totals) {
+  FirstToken f;
+  const int best = Argmax(want, vocab);
+  float second = -INFINITY;
+  for (int i = 0; i < vocab; ++i) {
+    if (i != best) {
+      second = std::max(second, want[i]);
+    }
+    f.max_change =
+        std::max(f.max_change, std::abs(static_cast<double>(got[i]) - want[i]));
+  }
+  f.gap = want[best] - second;
+  f.same = Argmax(got, vocab) == best;
+  f.ok = f.same || f.gap < kFirstTokenTie;
+  ++totals.prompts;
+  totals.first_differs += f.same ? 0 : 1;
+  totals.max_first_change = std::max(totals.max_first_change, f.max_change);
+  return f;
+}
 
 void Compare(qwen35::NpuDecoder& npu, qwen35::NpuPrefill& prefill,
              const std::string& name, const std::vector<int>& ids,
@@ -144,10 +188,10 @@ void Compare(qwen35::NpuDecoder& npu, qwen35::NpuPrefill& prefill,
   const int n = static_cast<int>(ids.size());
   const int k = n - 1;  // prompt tokens before the last
 
-  // Decode path: tokens [0, k) two per pass, then the last token and
+  // Decode path: tokens [0, k) two per pass, then the last token alone and
   // greedy steps.
   auto ds = npu.NewState();
-  std::vector<float> want_hidden(static_cast<std::size_t>(k) * d);
+  std::vector<float> want_hidden(static_cast<std::size_t>(n) * d);
   for (int p = 0; p < k; p += 2) {
     const int count = std::min(2, k - p);
     npu.Step(&ids[p], count, ds);
@@ -158,10 +202,11 @@ void Compare(qwen35::NpuDecoder& npu, qwen35::NpuPrefill& prefill,
       std::copy_n(npu.hidden(t), d, want_hidden.data() + (p + t) * d);
     }
   }
-  const DecodeState want_state = ds;
   std::vector<std::vector<float>> want_logits;
   std::vector<int> tokens;
   const float* logits = npu.Step(&ids[k], 1, ds);
+  std::copy_n(npu.hidden(0), d, want_hidden.data() + k * d);
+  const DecodeState want_state = ds;  // after the whole prompt
   for (int s = 0; s <= kSteps; ++s) {
     want_logits.emplace_back(logits, logits + vocab);
     tokens.push_back(Argmax(logits, vocab));
@@ -170,11 +215,13 @@ void Compare(qwen35::NpuDecoder& npu, qwen35::NpuPrefill& prefill,
     }
   }
 
-  // Prefill: the same k tokens, then the decoder from that state.
+  // Prefill: the whole prompt (as PrefillPrompt runs it), then the LM head
+  // alone on its last row for the first token, then the decoder from that
+  // state.
   auto ps = npu.NewState();
-  std::vector<float> hidden(static_cast<std::size_t>(k) * d);
+  std::vector<float> hidden(static_cast<std::size_t>(n) * d);
   const auto start = std::chrono::steady_clock::now();
-  prefill.Run(ids.data(), k, ps, hidden.data());
+  prefill.Run(ids.data(), n, ps, hidden.data());
   const double seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
           .count();
@@ -210,15 +257,12 @@ void Compare(qwen35::NpuDecoder& npu, qwen35::NpuPrefill& prefill,
 
   Error logit_err;
   std::size_t agree = 0;
-  logits = npu.Step(&ids[k], 1, ps);
-  bool first_same = false;
+  logits = npu.Logits(hidden.data() + static_cast<std::size_t>(k) * d);
+  const FirstToken first =
+      CompareFirst(logits, want_logits[0].data(), vocab, totals);
   for (int s = 0; s <= kSteps; ++s) {
     logit_err.Add(logits, want_logits[s].data(), vocab);
-    const bool same = Argmax(logits, vocab) == tokens[s];
-    agree += same;
-    if (s == 0) {
-      first_same = same;
-    }
+    agree += Argmax(logits, vocab) == tokens[s];
     if (s < kSteps) {
       logits = npu.Step(&tokens[s], 1, ps);
     }
@@ -226,17 +270,19 @@ void Compare(qwen35::NpuDecoder& npu, qwen35::NpuPrefill& prefill,
   ok = ok && hidden_err.Relative() < kMaxHiddenError &&
        state_err.conv < kMaxStateError && state_err.ssm < kMaxStateError &&
        state_err.kv < kMaxStateError && mtp_err.Relative() < kMaxStateError &&
-       logit_err.Relative() < kMaxLogitError && first_same;
+       logit_err.Relative() < kMaxLogitError && first.ok;
   totals.failures += ok ? 0 : 1;
   totals.agree += agree;
   totals.positions += kSteps + 1;
   std::printf(
       "%s %s: %d prompt tokens (prefill %.3f s); rel err: hidden %.2e, conv "
       "%.2e, ssm %.2e, kv %.2e, MTP kv %.2e, logits %.2e; argmax %zu/%d "
-      "(first token %s)\n",
+      "(first token %s: decode top-2 gap %.3f, largest logit change %.3f)\n",
       ok ? "ok  " : "FAIL", name.c_str(), n, seconds, hidden_err.Relative(),
       state_err.conv, state_err.ssm, state_err.kv, mtp_err.Relative(),
-      logit_err.Relative(), agree, kSteps + 1, first_same ? "same" : "DIFFERS");
+      logit_err.Relative(), agree, kSteps + 1,
+      first.same ? "same" : "differs at a near tie", first.gap,
+      first.max_change);
 }
 
 }  // namespace
@@ -302,6 +348,12 @@ int main(int argc, char** argv) {
       "%s argmax after prefill vs decode: %zu/%zu (%.1f%%, need %.0f%%)\n",
       agree_ok ? "ok  " : "FAIL", totals.agree, totals.positions, 100 * rate,
       100 * kMinArgmaxAgreement);
+  std::printf(
+      "     first token from the prefill's last row: %d of %d prompts differ "
+      "from the decode path (each at a top-2 gap under %.2f logits); largest "
+      "logit change %.3f\n",
+      totals.first_differs, totals.prompts, kFirstTokenTie,
+      totals.max_first_change);
 
   // Speculative decoding after prefill must give the plain greedy output
   // after prefill, token for token.

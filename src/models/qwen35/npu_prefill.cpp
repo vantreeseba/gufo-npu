@@ -549,14 +549,14 @@ const NpuPrefill::Profile& NpuPrefill::profile() const {
 PromptPrefill PrefillPrompt(NpuPrefill& prefill) {
   return [&prefill](const std::vector<int>& prompt, DecodeState& state,
                     DecodeState* mtp, float* hidden) {
-    // A prefill pass costs ~0.10 s however short the prompt (98 GEMM calls
-    // of at least 256 rows each), the decode path ~28 ms per two tokens.
-    // Measured TTFT (BENCHMARKS.md): 6 tokens 0.086 s on the decode path
-    // against 0.102 s with prefill, 8 tokens 0.115 against 0.102. Shorter
-    // prompts go through the decoder alone.
+    // The whole prompt goes through one prefill: the decoder then runs only
+    // the LM head on its last row (NpuDecoder::Logits). A prefill pass costs
+    // ~0.07 s however short the prompt (98 GEMM calls of at least 256 rows
+    // each), the decode path ~28 ms per two tokens. Shorter prompts go
+    // through the decoder alone (crossover measured in BENCHMARKS.md).
     constexpr int kMinPrefillPrompt = 7;
-    const int k = static_cast<int>(prompt.size()) - 1;
-    if (static_cast<int>(prompt.size()) < kMinPrefillPrompt) {
+    const int n = static_cast<int>(prompt.size());
+    if (n < kMinPrefillPrompt) {
       return 0;
     }
     // Every id, including the last (the MTP cache reads prompt[k]), before
@@ -566,12 +566,13 @@ PromptPrefill PrefillPrompt(NpuPrefill& prefill) {
         throw std::out_of_range("qwen35: token id out of range");
       }
     }
-    prefill.Run(prompt.data(), k, state, hidden);
+    prefill.Run(prompt.data(), n, state, hidden);
     if (mtp != nullptr) {
-      // Pairs (h[p - 1], prompt[p]) at p = 1 .. k.
-      prefill.FillMtp(hidden, prompt.data() + 1, k, 1, *mtp);
+      // Pairs (h[p - 1], prompt[p]) at p = 1 .. n - 1; the pair at n (the
+      // first generated token) is the decoder's first draft.
+      prefill.FillMtp(hidden, prompt.data() + 1, n - 1, 1, *mtp);
     }
-    return k;
+    return n;
   };
 }
 

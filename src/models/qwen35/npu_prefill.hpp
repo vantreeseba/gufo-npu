@@ -59,10 +59,10 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
-// The prompt hook for SpeculativeGenerate: every prompt token but the last
-// through `prefill`, and the MTP cache over them; the decoder then runs the
-// last token for its logits. Prompts under 7 tokens, which the decoder runs
-// faster than one prefill pass, are left to the decoder.
+// The prompt hook for SpeculativeGenerate: the whole prompt through
+// `prefill`, and the MTP cache over it; the decoder then runs only the LM
+// head on the last token's final residual for its logits. Prompts too short
+// to win from a prefill pass are left to the decoder.
 PromptPrefill PrefillPrompt(NpuPrefill& prefill);
 
 }  // namespace gufo_npu::qwen35
