@@ -69,12 +69,12 @@ autosuspend. TTFT is SpeculativeGenerate's prompt phase (prefill, MTP cache,
 first token, first draft). Two interleaved rounds of three builds, then the
 final build, alone on the NPU:
 
-| Prompt tokens | main | + AVX-512 DeltaNet | + first token from prefill | + chunk planner (final) |
-|---|---|---|---|---|
-| 35 | 0.237, 0.236 s | 0.235, 0.236 | 0.188, 0.189 | **0.188** (−48 ms against main) |
-| 1,024 | 0.719, 0.727 | 0.709, 0.710 | 0.661, 0.662 | **0.660** (−63 ms) |
-| 4,096 | 2.930, 2.929 | 2.886, 2.915 | 2.854, 2.837 | **2.844** (−86 ms) |
-| 9,000 | 7.930, 7.880 | 7.799, 7.841 | 7.772, 7.717 | **7.787** (−118 ms) |
+| Prompt tokens | main | + AVX-512 DeltaNet | + first token from prefill | + chunk planner (final) | Prompt tok/s (final) |
+|---|---|---|---|---|---|
+| 35 | 0.237, 0.236 s | 0.235, 0.236 | 0.188, 0.189 | **0.188** (−48 ms against main) | 186 |
+| 1,024 | 0.719, 0.727 | 0.709, 0.710 | 0.661, 0.662 | **0.660** (−63 ms) | 1,552 |
+| 4,096 | 2.930, 2.929 | 2.886, 2.915 | 2.854, 2.837 | **2.844** (−86 ms) | 1,440 |
+| 9,000 | 7.930, 7.880 | 7.799, 7.841 | 7.772, 7.717 | **7.787** (−118 ms) | 1,156 |
 
 - **First token from the prefill.** PrefillPrompt prefills the whole
   prompt; the first token comes from the LM head alone on its last row
@@ -213,3 +213,74 @@ top-p and min-p (off); ranges over the seeds:
 - With MTP, acceptance falls as temperature spreads the distribution: 26–27
   tok/s on the sky answer at temperature 1 against 27.5 greedy, 30.7–30.9
   against 31.2 on the code answer.
+
+## Where the work runs (computed, 2026-10-28)
+
+The share of the work on the NPU and on the CPU, **computed** from the
+model's shapes and where gufo-npu places each op, not measured;
+`python3 tools/bench/work_split.py` prints these tables.
+- **FLOPs** count 2 per multiply-add and 1 per elementwise op.
+- **Decode bytes** are the weights, recurrent state and K/V cache read per
+  step. **Prefill bytes** are each weight read once per prompt.
+- **Work is not time.** The NPU's matrix products are bound by its ~56 GB/s
+  read ceiling, and the CPU does fewer FLOPs per second, so CPU ops take a
+  larger share of the measured times above than of the work.
+- Attention's share grows with the context in decode and with the prompt in
+  prefill. Everything else is per token.
+
+Placement:
+- **Decode:** every projection (DeltaNet and attention inputs, mixer
+  output, FFN gate/up and down), the LM head, and the MTP head's
+  projections and 32k draft LM head run as q4nx GEMVs on the NPU, with the
+  norms, residual adds and SwiGLU fused into them. The CPU runs the token
+  mixers (DeltaNet's conv, delta rule and gated norm with its fp32
+  alpha/beta projections; attention over the fp16 K/V cache) and the argmax.
+- **Prefill:** every projection runs as a bfp16 GEMM on the NPU. The CPU
+  runs the mixers, the norms, SwiGLU and the residual adds. The first
+  token's LM head and the MTP cache's two projections run on the NPU.
+
+#### Qwen3.5-4B: decode, per step (FLOPs / bytes read)
+
+| Op group | Runs on | Short (~128 context) | 1,024 context | 9,000 context | Short, MTP step |
+|---|---|---|---|---|---|
+| dense projections | NPU | 83.7% / 82.3% | 82.6% / 81.4% | 73.6% / 73.8% | 80.2% / 78.6% |
+| LM head | NPU | 14.9% / 14.7% | 14.7% / 14.5% | 13.1% / 13.2% | 14.3% / 14.0% |
+| DeltaNet | CPU | 1.2% / 2.8% | 1.1% / 2.7% | 1.0% / 2.5% | 1.1% / 2.6% |
+| attention | CPU | 0.2% / 0.2% | 1.6% / 1.3% | 12.2% / 10.6% | 0.2% / 0.2% |
+| norms/activations | NPU | <0.1% / – | <0.1% / – | <0.1% / – | <0.1% / – |
+| MTP draft | NPU | – / – | – / – | – / – | 4.1% / 4.5% |
+| MTP draft | CPU | – / – | – / – | – / – | <0.1% / <0.1% |
+| sampling | CPU | <0.1% / <0.1% | <0.1% / <0.1% | <0.1% / <0.1% | <0.1% / 0.1% |
+| **NPU total** | | **98.6% / 97.0%** | **97.3% / 95.9%** | **86.8% / 86.9%** | **98.7% / 97.1%** |
+| Work per step | | 8.5 GFLOP / 2.50 GB | 8.6 GFLOP / 2.53 GB | 9.7 GFLOP / 2.79 GB | 17.8 GFLOP / 2.62 GB |
+
+#### Qwen3.5-4B: prefill, per prompt (FLOPs; weight bytes at 9,000 tokens)
+
+| Op group | Runs on | 35 tokens | 1,024 tokens | 4,096 tokens | 9,000 tokens | Weight bytes |
+|---|---|---|---|---|---|---|
+| dense projections | NPU | 96.9% | 96.6% | 94.1% | 90.2% | 87.3% |
+| LM head | NPU | 0.5% | <0.1% | <0.1% | <0.1% | 8.0% |
+| DeltaNet | CPU | 1.3% | 1.3% | 1.3% | 1.2% | 0.3% |
+| attention | CPU | <0.1% | 0.9% | 3.6% | 7.5% | – |
+| norms/activations | CPU | <0.1% | <0.1% | <0.1% | <0.1% | – |
+| MTP draft | NPU | 1.2% | 1.1% | 1.0% | 1.0% | 3.5% |
+| MTP draft | CPU | <0.1% | <0.1% | <0.1% | <0.1% | 0.8% |
+| sampling | CPU | <0.1% | <0.1% | <0.1% | <0.1% | <0.1% |
+| **NPU total** | | **98.6%** | **97.7%** | **95.1%** | **91.2%** | **98.8%** |
+| Work per prompt | | 0.26 TFLOP | 7.56 TFLOP | 31.04 TFLOP | 71.11 TFLOP | 4.59 GB |
+
+**FastFlowLM** (v1.0.10) keeps more than 99.9% of the FLOPs on the NPU in
+every mode, computed with the same shapes: at most 0.02% in prefill and
+0.003% in decode on the CPU.
+- **NPU:** its programs run the projections, the DeltaNet conv and delta
+  rule, attention and the LM head.
+- **CPU:** it samples the next token, and in prefill only does elementwise
+  steps: SwiGLU, the attention gate, DeltaNet's gate activations and its
+  gated norm.
+- **Source:** the engine library's symbols, call graph and xclbin names
+  (`GateDeltaNet_prefill`, `conv`, `attn`, `layer`, `lm_head`), not FLM's
+  docs, whose README says it runs "fully on AMD Ryzen™ AI NPU — no GPU or
+  CPU load". This model's packs load `libqwen3_5vl_npu.so` (inferred: its
+  xclbin folder carries that engine's vision programs). Its decode entry
+  point (`qwen3_5vl_npu::Impl::forward`) only submits NPU runs, and the
+  `cpu_func` helpers are called only from its prefill contexts.
