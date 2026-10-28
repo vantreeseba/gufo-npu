@@ -283,3 +283,38 @@ one), argmax 19/19.
 | NPU model vs CPU reference, teacher-forced, same weights | greedy argmax match |
 | Prefill vs one-token decode on the NPU | identical next token: met (`qwen35_npu_prefill_test`, first token equal on all 10 prompts of 1–2,049 tokens, 170/170 argmax over 17 steps each; greedy output equal for the first 26 of 48 tokens on the chat prompt) |
 | MTP head vs a reference | to be decided (no HF oracle) |
+
+## Prompt cache (2026-10-28)
+
+`qwen35_prompt_cache_test` (labels `qwen35_2b;npu;model`; how the cache works is in
+[BENCHMARKS.md](BENCHMARKS.md), "Prompt cache across requests"). A chat
+over ~1k tokens of notes, turns 2 and 3, each state against the whole
+prompt through the model's own `PrefillPrompt`: the decode state (every
+layer's conv window, DeltaNet state and K/V cache), the MTP layer's K/V
+cache and the last prompt row's final residual.
+
+| Check | Turn 2 / turn 3 |
+|---|---|
+| The previous turn's checkpoint restored, the rest (~40 tokens) through the prefill | **bit-identical** (every error 0) |
+| An exact repeat: the checkpoint restored, the generation prompt through the prefill | **bit-identical** |
+| A 5-token remainder through the decoder (below the prefill threshold) | hidden 9.6e-2 / 1.0e-1, states 4.7e-2 / 4.9e-2 |
+| The same prompt entirely through the decode path, for scale | hidden 1.1e-1 / 1.1e-1, states 5.4e-2 / 5.6e-2 |
+| The checkpoint the decoder took mid-remainder, continued through the prefill | hidden 3.2e-2 / 3.1e-2, states 3.9e-2 / 3.8e-2 |
+| Greedy MTP output, 3 turns at ~1k and ~4k tokens of history, two rounds: with the cache (hits) and on a miss, against `PrefillPrompt` | **identical** every turn |
+
+- **Bit-identical restore:** the prefill's arithmetic for a token does not
+  depend on where a pass starts. Its GEMM rows are independent, the
+  DeltaNet runs token by token, and attention reads the same cache, so a
+  checkpoint plus the rest equals one prefill exactly.
+- **The decoder's remainders** differ from the prefill as the decode path
+  always does (bfp16 GEMMs against q4nx GEMVs), and no more: within the
+  limits of the model's prefill test (hidden 6e-2 (or 1.5× the decode path's), states 8e-2).
+- **Untouched without a cache:** the capture is off unless a checkpoint
+  is asked for, and outputs keep their hashes: `a49f1c4c` (sky, no draft), `fdb595fb` (Fibonacci, MTP) and `8edbce90` (960 tokens, MTP), unchanged.
+- **Cache logic** (`qwen35_prompt_cache_logic_test`, CPU, label
+  `qwen35_family`): on a toy model with an order-dependent recurrent
+  layer, a restored run leaves exactly the uncached state over four
+  turns, with and without the MTP cache and with the last token left to
+  the decoder; short prompts go to the decoder untouched; a repeat runs
+  only the generation prompt; least-recently-used and byte-budget
+  eviction; and a draft request skips checkpoints without the MTP cache.

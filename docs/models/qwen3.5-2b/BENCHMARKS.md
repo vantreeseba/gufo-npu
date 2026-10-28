@@ -556,3 +556,49 @@ unchanged. The Fibonacci prompt with MTP changes, `69e1c62d` → `fdb595fb`
 "\n\n\n# Example usage"; the MTP output equals plain greedy from the new
 state (`fdb595fb` both), as before the change (`69e1c62d` both). Decode
 speed unchanged: sky 39.1 tok/s, Fibonacci 64.4–64.6, 960 tokens 50.9–51.2.
+
+## Prompt cache across requests (2026-10-28)
+
+`PromptCache` (`src/models/qwen35/prompt_cache.hpp`) keeps the decode state
+after a prompt prefix, so a multi-turn chat runs only what is new each turn.
+DeltaNet state is recurrent and cannot be cut back to an earlier position,
+so reuse starts from checkpoints:
+
+- **Where:** before the prompt's last `<|im_start|>`, the history through
+  the last user message. The GGUF's chat template renders earlier
+  assistant turns as `<|im_start|>assistant\n{content}`, without the think
+  block the generation prompt opens (`<think>\n\n</think>\n\n`), so the
+  next request matches the previous prompt only up to there.
+- **How:** the prefill copies the DeltaNet layers' conv window and state
+  as its pass goes past that position (`StateCapture`); the attention and
+  MTP caches are cut to it afterwards. A checkpoint costs a copy, not a
+  pass. Remainders below the prefill threshold run through the decoder.
+- **Kept:** two checkpoints, least recently used out first (configurable,
+  with an optional byte budget).
+
+`qwen35_prompt_cache_test` (labels `qwen35_2b;npu;model`), warm (each conversation's second round),
+2026-10-28. A conversation over a document of numbered notes, three turns of
+24 greedy MTP tokens. Time to the first token (`SpeculativeStats`), per
+turn, three ways: the model's own `PrefillPrompt` (no cache), through the
+cache with nothing to restore (a miss), and through the cache (turn 1 is a
+miss).
+
+| History | Turn | Prompt tokens | Restored | No cache | Cache miss | Cache hit |
+|---|---|---|---|---|---|---|
+| ~1k | 1 | 1,124 | – | 0.385 s | 0.381 s | **0.382 s** |
+| ~1k | 2 | 1,157 | 1,117 | 0.384 s | 0.386 s | **0.100 s** |
+| ~1k | 3 | 1,190 | 1,150 | 0.389 s | 0.393 s | **0.096 s** |
+| ~4k | 1 | 4,091 | – | 1.199 s | 1.193 s | **1.223 s** |
+| ~4k | 2 | 4,124 | 4,084 | 1.282 s | 1.296 s | **0.130 s** |
+| ~4k | 3 | 4,157 | 4,117 | 1.283 s | 1.303 s | **0.122 s** |
+
+- **Turns 2 and 3** restore the previous turn's checkpoint and run ~40
+  tokens (the previous reply, the next question and the generation
+  prompt): time to the first token falls 4× at ~1k tokens of
+  history and 10× at ~4k, and stays flat as the history grows.
+- **A miss** costs the checkpoint copy on top of the plain prefill:
+  0–20 ms.
+- **Memory per checkpoint:** 34.5 MiB at 1,124 tokens, 75.1 MiB
+  at 4,091 and 131.6 MiB at 8,221: 18 DeltaNet layers' states (~19 MiB) plus 14 KiB per token (6 attention layers' fp16 K/V, 12 KiB, and the MTP layer's, 2 KiB). Two checkpoints of
+  8k-token conversations hold ~263 MiB of host memory.
+- Two separate runs of the test agreed within 0.03 s.
