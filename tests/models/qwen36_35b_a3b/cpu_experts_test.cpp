@@ -69,8 +69,8 @@ int main() {
           kFfn},
          {GgmlType::kF32, reinterpret_cast<const std::uint8_t*>(up.data()),
           kFfn}},
-        kHidden, order);
-    x.down = q4nx::PackFloat(down.data(), kHidden, kFfn);
+        kHidden, q4nx::Fit::kSearch, order);
+    x.down = q4nx::PackFloat(down.data(), kHidden, kFfn, q4nx::Fit::kSearch);
     if (x.up.bytes.size() != ExpertArena::kUpBytes ||
         x.down.bytes.size() != ExpertArena::kDownBytes) {
       std::fprintf(stderr, "FAIL: experts pack to the wrong size\n");
