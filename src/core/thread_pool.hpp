@@ -81,7 +81,10 @@ private:
   }
 
   void Work(std::size_t) {
-    std::size_t seen = generation_.load(std::memory_order_acquire);
+    // Start from the pool's first generation, not the current one: a Run
+    // issued before this thread got here has already bumped the generation
+    // and counts on this worker's check-in.
+    std::size_t seen = 0;
     for (;;) {
       std::size_t spins = 0;
       std::size_t now;

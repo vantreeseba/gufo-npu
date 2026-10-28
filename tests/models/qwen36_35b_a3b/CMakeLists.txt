@@ -41,6 +41,14 @@ add_test(NAME qwen36_decoder_test COMMAND qwen36_decoder_test)
 set_tests_properties(qwen36_decoder_test PROPERTIES SKIP_RETURN_CODE 77
                      LABELS "qwen36_35b_a3b;model" TIMEOUT 3600)
 
+# The prefill's CPU expert step on random q4nx experts (no NPU, no model).
+add_executable(qwen36_cpu_experts_test cpu_experts_test.cpp)
+target_link_libraries(qwen36_cpu_experts_test PRIVATE gufo_npu_qwen36_35b_a3b)
+target_compile_options(qwen36_cpu_experts_test PRIVATE -O2)
+add_test(NAME qwen36_cpu_experts_test COMMAND qwen36_cpu_experts_test)
+set_tests_properties(qwen36_cpu_experts_test PROPERTIES
+                     LABELS "qwen36_35b_a3b;kernels" TIMEOUT 600)
+
 if(GUFO_NPU_ENABLE_XRT AND GUFO_NPU_BUILD_KERNELS)
   set(kernels "${CMAKE_BINARY_DIR}/kernels")
 
@@ -57,6 +65,12 @@ if(GUFO_NPU_ENABLE_XRT AND GUFO_NPU_BUILD_KERNELS)
   add_test(NAME qwen36_npu_prefill_test
            COMMAND qwen36_npu_prefill_test "${kernels}")
   set_tests_properties(qwen36_npu_prefill_test PROPERTIES
+                       LABELS "qwen36_35b_a3b;npu;model" SKIP_RETURN_CODE 77
+                       TIMEOUT 3600)
+  # The same with the experts on the NPU (ExpertBackend::kNpu).
+  add_test(NAME qwen36_npu_prefill_npu_experts_test
+           COMMAND qwen36_npu_prefill_test "${kernels}" npu)
+  set_tests_properties(qwen36_npu_prefill_npu_experts_test PROPERTIES
                        LABELS "qwen36_35b_a3b;npu;model" SKIP_RETURN_CODE 77
                        TIMEOUT 3600)
 

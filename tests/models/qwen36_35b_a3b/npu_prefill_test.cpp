@@ -20,7 +20,8 @@
 
 // Qwen3.6-35B-A3B prompt processing on the NPU (qwen36_35b_a3b::NpuPrefill:
 // q4nx converted to bfp16 on the device, bfp16 GEMMs, CPU mixers and
-// routing) against the decode path (NpuDecoder, one token per pass) over the
+// routing, the experts on the CPU or, with the argument `npu`, on the NPU)
+// against the decode path (NpuDecoder, one token per pass) over the
 // same q4nx weights, on the oracle prompts and on prompts of 1, 2, 1,024,
 // 1,025, 2,049 and 4,000 tokens (dense blocks of 1,024; experts split into
 // several 1,024-row calls; several expert groups per layer).
@@ -413,10 +414,14 @@ void Compare(qwen35::NpuDecoder& npu, moe::NpuPrefill& prefill,
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc != 2) {
-    std::fprintf(stderr, "usage: qwen36_npu_prefill_test <kernel-dir>\n");
+  const std::string backend = argc == 3 ? argv[2] : "cpu";
+  if ((argc != 2 && argc != 3) || (backend != "cpu" && backend != "npu")) {
+    std::fprintf(stderr,
+                 "usage: qwen36_npu_prefill_test <kernel-dir> [cpu|npu]\n");
     return 2;
   }
+  const auto experts =
+      backend == "cpu" ? moe::ExpertBackend::kCpu : moe::ExpertBackend::kNpu;
   const char* model = std::getenv("GUFO_NPU_QWEN36_MODEL");
   const char* oracle = std::getenv("GUFO_NPU_QWEN36_ORACLE");
   if (model == nullptr || oracle == nullptr || *model == '\0' ||
@@ -433,9 +438,11 @@ int main(int argc, char** argv) {
   qwen35::NpuDecoder npu(*file, argv[1]);
   const double decoder_s = Seconds(start);
   start = std::chrono::steady_clock::now();
-  moe::NpuPrefill prefill(*file, npu, argv[1]);
-  std::printf("loaded the NPU decoder in %.1f s and the prefill in %.1f s\n",
-              decoder_s, Seconds(start));
+  moe::NpuPrefill prefill(*file, npu, argv[1], experts);
+  std::printf(
+      "loaded the NPU decoder in %.1f s and the prefill (experts on the %s) "
+      "in %.1f s\n",
+      decoder_s, backend.c_str(), Seconds(start));
 
   Totals totals;
   std::vector<int> all;
