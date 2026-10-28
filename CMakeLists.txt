@@ -140,6 +140,7 @@ add_library(gufo_npu_serve STATIC
   src/serve/openai.cpp
   src/serve/reply.cpp
   src/serve/server.cpp
+  src/serve/structured.cpp
   src/serve/text.cpp
 )
 target_link_libraries(gufo_npu_serve PUBLIC gufo_npu_core nlohmann_json
