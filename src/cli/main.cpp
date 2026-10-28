@@ -57,12 +57,14 @@ constexpr char kUsage[] =
     "  bench mtp --model GGUF --prompt TEXT [--tokens N] [--kernels DIR]\n"
     "                           MTP draft acceptance on a greedy NPU decode\n"
     "  bench prefill --model GGUF [--tokens 35,125,1024] [--runs N]\n"
-    "                [--decode-path] [--kernels DIR]\n"
+    "                [--decode-path] [--experts cpu|npu] [--kernels DIR]\n"
     "                           time to first token on the NPU per prompt\n"
     "                           length (prefill, MTP cache, first token), "
     "warm;\n"
     "                           --decode-path also times the prompt through\n"
-    "                           the decoder alone\n"
+    "                           the decoder alone; --experts picks where\n"
+    "                           Qwen3.6-35B-A3B's prefill runs its experts\n"
+    "                           (default cpu)\n"
     "  generate --model GGUF --prompt TEXT [--system TEXT] [--max-tokens N]\n"
     "           [--think] [--device cpu|npu] [--draft mtp|none] [--kernels "
     "DIR]\n"
@@ -563,17 +565,17 @@ int BenchMtp(const std::vector<std::string_view>& args) {
 
 // bench prefill for Qwen3.6-35B-A3B: its own NPU prefill
 // (qwen36_35b_a3b::NpuPrefill, through PrefillPrompt, so prompts shorter
-// than kMinPrefillPrompt take the decode path), per length the time to the
+// than MinPrefillPrompt take the decode path), per length the time to the
 // first token and where the prefill's time went (per run).
 int BenchMoePrefill(gufo_npu::qwen35::NpuDecoder& npu,
                     const gufo_npu::gguf::File& file,
                     const std::filesystem::path& kernels,
                     const std::vector<int>& ids,
-                    const std::vector<int>& lengths, int runs,
-                    bool decode_path) {
+                    const std::vector<int>& lengths, int runs, bool decode_path,
+                    gufo_npu::qwen36_35b_a3b::ExpertBackend experts) {
   namespace qwen35 = gufo_npu::qwen35;
   namespace moe = gufo_npu::qwen36_35b_a3b;
-  moe::NpuPrefill prefill(file, npu, kernels);
+  moe::NpuPrefill prefill(file, npu, kernels, experts);
   const auto hook = moe::PrefillPrompt(prefill);
   std::printf("%8s %10s %8s %8s %12s %7s %7s %6s %7s %7s %7s %7s %7s %7s %7s\n",
               "tokens", "TTFT mean", "min", "max", "prompt tok/s", "deq s",
@@ -650,12 +652,18 @@ int BenchPrefill(const std::vector<std::string_view>& args) {
   std::vector<int> lengths = {35, 125, 1024, 2048, 4096};
   int runs = 3;
   bool decode_path = false;
+  auto experts = gufo_npu::qwen36_35b_a3b::ExpertBackend::kCpu;
   for (std::size_t i = 0; i < args.size(); ++i) {
     const bool has_value = i + 1 < args.size();
     if (args[i] == "--model" && has_value) {
       model = std::string(args[++i]);
     } else if (args[i] == "--decode-path") {
       decode_path = true;
+    } else if (args[i] == "--experts" && has_value &&
+               (args[i + 1] == "cpu" || args[i + 1] == "npu")) {
+      experts = args[++i] == "cpu"
+                    ? gufo_npu::qwen36_35b_a3b::ExpertBackend::kCpu
+                    : gufo_npu::qwen36_35b_a3b::ExpertBackend::kNpu;
     } else if (args[i] == "--tokens" && has_value) {
       lengths = ParseInts(args[++i]);
     } else if (args[i] == "--runs" && has_value) {
@@ -692,7 +700,7 @@ int BenchPrefill(const std::vector<std::string_view>& args) {
   qwen35::NpuDecoder npu(*file, KernelDir(kernels));
   if (moe) {
     return BenchMoePrefill(npu, *file, KernelDir(kernels), ids, lengths, runs,
-                           decode_path);
+                           decode_path, experts);
   }
   qwen35::NpuPrefill prefill(*file, KernelDir(kernels));
   const auto hook = qwen35::PrefillPrompt(prefill);

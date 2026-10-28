@@ -35,17 +35,29 @@ namespace gufo_npu::qwen36_35b_a3b {
 // Tokens per pass: the prompt is processed in passes of at most this many.
 inline constexpr int kMaxPromptChunk = 16384;
 
+// Where the routed and shared experts run (expert_step.hpp):
+//   kCpu  cpu_experts.hpp: the decoder's q4nx arenas read in place on the
+//         CPU. The NPU then only runs the dense matrices, so their bfp16
+//         copies are converted once, at construction, and kept (one visit
+//         to the dequant program in all).
+//   kNpu  npu_experts.hpp: each expert with tokens converted per pass on
+//         the NPU and run as GEMMs, with the next layer's dense matrices
+//         converted beside it (two program switches per layer).
+enum class ExpertBackend { kCpu, kNpu };
+
 class NpuPrefill {
 public:
   // Reads `decoder`'s device weights in place; `file` and `decoder` must
   // outlive it. Throws for models other than Qwen3.6-35B-A3B's shapes.
   NpuPrefill(const gguf::File& file, qwen35::NpuDecoder& decoder,
-             const std::filesystem::path& kernel_dir);
+             const std::filesystem::path& kernel_dir,
+             ExpertBackend experts = ExpertBackend::kCpu);
   ~NpuPrefill();
   NpuPrefill(const NpuPrefill&) = delete;
   NpuPrefill& operator=(const NpuPrefill&) = delete;
 
   const qwen35::Config& config() const;
+  ExpertBackend experts() const;
 
   // Runs `count` tokens from state.position and advances the state. With
   // `hidden`, writes each token's final residual (before output_norm), count
@@ -85,8 +97,10 @@ public:
     double deltanet_seconds = 0;
     double attention_seconds = 0;
     double router_seconds = 0;  // router logits, top k, grouping
-    double expert_seconds = 0;  // gathering rows, SwiGLU, scatter-add
-    double other_seconds = 0;   // the rest (embedding, norms, conversions)
+    // The experts' CPU work: gathering rows, SwiGLU and the scatter-add
+    // (kNpu), or all of it (kCpu).
+    double expert_seconds = 0;
+    double other_seconds = 0;  // the rest (embedding, norms, conversions)
   };
   const Profile& profile() const;
 
@@ -97,11 +111,19 @@ private:
 
 // The prompt hook for SpeculativeGenerate: every prompt token but the last
 // through `prefill`, and the MTP cache over them; the decoder then runs the
-// last token for its logits. Prompts shorter than kMinPrefillPrompt, which
-// the decoder's two-token passes run faster, are left to the decoder:
-// measured (BENCHMARKS.md), a prefill pass costs ~2.78 s at 64 tokens plus
-// ~9 ms per token, the decode path ~30 ms per token, even at ~108.
-inline constexpr int kMinPrefillPrompt = 108;
+// last token for its logits. Prompts shorter than MinPrefillPrompt(experts),
+// which the decoder's two-token passes run faster, are left to the decoder
+// (measured, BENCHMARKS.md; the decode path costs ~30 ms per token). With
+// kCpu a prefill pass costs ~0.15 s at 4 tokens plus ~2 ms per token (time
+// to first token 0.134 s by the decode path against 0.157 s at 4 tokens,
+// 0.240 s against 0.175 s at 8); with kNpu ~2.78 s at 64 tokens plus ~9 ms
+// per token, even with the decode path at ~108.
+inline constexpr int kMinPrefillPromptNpu = 108;
+inline constexpr int kMinPrefillPromptCpu = 6;
+constexpr int MinPrefillPrompt(ExpertBackend experts) {
+  return experts == ExpertBackend::kCpu ? kMinPrefillPromptCpu
+                                        : kMinPrefillPromptNpu;
+}
 qwen35::PromptPrefill PrefillPrompt(NpuPrefill& prefill);
 
 }  // namespace gufo_npu::qwen36_35b_a3b
