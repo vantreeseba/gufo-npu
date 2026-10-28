@@ -1,7 +1,10 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <vector>
 
 #include "core/gguf.hpp"
@@ -29,6 +32,30 @@ struct DecodeState {
     std::vector<float> conv_saved;
   };
   std::vector<Layer> layers;
+};
+
+// Decode states for reuse across requests. Acquire returns a state equal to
+// `fresh()`'s (the same sizes and values, empty K/V caches) that keeps the
+// buffers, and their capacity, of a released one: a long-running server
+// then does not reallocate its K/V caches and DeltaNet states for every
+// request. glibc keeps such freed buffers in its heaps, so a server's memory
+// would grow with each new mix of prompt lengths.
+class StatePool {
+public:
+  // Keeps up to `keep` released states.
+  explicit StatePool(std::function<DecodeState()> fresh, std::size_t keep = 3);
+  StatePool(const StatePool&) = delete;
+  StatePool& operator=(const StatePool&) = delete;
+
+  DecodeState Acquire();
+  void Release(DecodeState&& state);
+
+private:
+  std::function<DecodeState()> fresh_;
+  std::size_t keep_;
+  std::optional<DecodeState> proto_;
+  std::vector<DecodeState> free_;
+  std::mutex mutex_;
 };
 
 // The token mixers between a layer's input and output projections: Gated

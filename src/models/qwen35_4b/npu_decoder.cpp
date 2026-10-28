@@ -88,6 +88,9 @@ struct NpuDecoder::Impl {
 
   Config config;
   Mixer mixer;
+  // Reused across generations (AcquireState, PromptHidden).
+  qwen35::StatePool states{[this] { return mixer.NewState(); }};
+  std::vector<float> prompt_hidden;
   gufo_npu::npu::GemvRuntime runtime;
   const gguf::TensorInfo* embed = nullptr;
   std::vector<Block> layers;
@@ -364,6 +367,23 @@ DecodeState NpuDecoder::NewMtpState() const {
   return impl_->mixer.NewState();
 }
 
+DecodeState NpuDecoder::AcquireState() {
+  return impl_->states.Acquire();
+}
+
+void NpuDecoder::ReleaseState(DecodeState&& state) {
+  impl_->states.Release(std::move(state));
+}
+
+float* NpuDecoder::PromptHidden(std::size_t floats) {
+  auto& h = impl_->prompt_hidden;
+  if (h.size() < floats) {
+    h.resize(floats);
+  }
+  std::fill_n(h.begin(), floats, 0.0f);
+  return h.data();
+}
+
 double NpuDecoder::npu_seconds() const {
   return impl_->npu_seconds;
 }
@@ -538,8 +558,21 @@ std::vector<int> SpeculativeGenerate(
   const auto d = static_cast<std::size_t>(c.hidden);
   SpeculativeStats local;
   local.prompt_tokens = static_cast<int>(prompt.size());
-  auto state = model.NewState();
-  auto mtp = model.NewMtpState();
+  // The decoder's pooled states, handed back however the generation ends.
+  struct Lease {
+    NpuDecoder& model;
+    DecodeState state;
+    ~Lease() {
+      try {
+        model.ReleaseState(std::move(state));
+      } catch (...) {
+      }
+    }
+  };
+  Lease main_lease{model, model.AcquireState()};
+  Lease mtp_lease{model, model.AcquireState()};
+  DecodeState& state = main_lease.state;
+  DecodeState& mtp = mtp_lease.state;
   std::vector<int> out;
   Sampler sampler(sampling);
   auto is_stop = [&](int id) {
@@ -557,11 +590,10 @@ std::vector<int> SpeculativeGenerate(
   // the token at p, for the MTP cache.
   auto start = std::chrono::steady_clock::now();
   const int n = static_cast<int>(prompt.size());
-  std::vector<float> hidden(static_cast<std::size_t>(n) * d);
+  float* hidden = model.PromptHidden(static_cast<std::size_t>(n) * d);
   const float* logits = nullptr;
   const int prefilled =
-      prefill ? prefill(prompt, state, draft ? &mtp : nullptr, hidden.data())
-              : 0;
+      prefill ? prefill(prompt, state, draft ? &mtp : nullptr, hidden) : 0;
   if (prefilled < 0 || prefilled > n) {
     throw std::logic_error("generate: prompt prefill ran " +
                            std::to_string(prefilled) + " of " +
@@ -570,7 +602,7 @@ std::vector<int> SpeculativeGenerate(
   // A prefill of the whole prompt leaves only the LM head on its last row:
   // its logits start the output.
   if (prefilled == n) {
-    logits = model.Logits(hidden.data() + static_cast<std::size_t>(n - 1) * d);
+    logits = model.Logits(hidden + static_cast<std::size_t>(n - 1) * d);
   }
   for (int p = prefilled; p < n; p += 2) {
     const int count = std::min(2, n - p);
@@ -579,7 +611,7 @@ std::vector<int> SpeculativeGenerate(
       model.Resolve(state, true);
     }
     for (int t = 0; t < count; ++t) {
-      std::copy_n(model.hidden(t), d, hidden.data() + (p + t) * d);
+      std::copy_n(model.hidden(t), d, hidden + (p + t) * d);
     }
     logits += static_cast<std::size_t>(count - 1) * vocab;
   }
@@ -589,10 +621,10 @@ std::vector<int> SpeculativeGenerate(
     // The MTP cache over the prompt: pair (h[p - 1], token p) at p.
     for (int p = prefilled + 1; p < n; p += 2) {
       const int count = std::min(2, n - p);
-      const float* hs[2] = {hidden.data() + (p - 1) * d, hidden.data() + p * d};
+      const float* hs[2] = {hidden + (p - 1) * d, hidden + p * d};
       model.FillMtp(hs, &prompt[p], count, p, mtp);
     }
-    const float* hs[1] = {hidden.data() + (n - 1) * d};
+    const float* hs[1] = {hidden + (n - 1) * d};
     y2 = model.Draft(hs, &y1, 1, n, mtp);
   }
   local.prefill_seconds = SecondsSince(start);

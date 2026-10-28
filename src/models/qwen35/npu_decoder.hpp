@@ -92,6 +92,16 @@ public:
                int position, DecodeState& state);
   DecodeState NewMtpState() const;
 
+  // States for a generation from the decoder's pool (StatePool): equal to
+  // NewState()'s, keeping a released state's buffers. The MTP state is made
+  // the same way. Release hands one back when the generation is over.
+  DecodeState AcquireState();
+  void ReleaseState(DecodeState&& state);
+  // A generation's per-prompt-token final residuals, `floats` values,
+  // zeroed; reused (grow-only) across generations, valid until the next
+  // call.
+  float* PromptHidden(std::size_t floats);
+
   // MoE models: the experts layer `layer` chose for the last Step's first
   // token, config().experts_used of them by descending weight.
   const int* experts(int layer) const;
