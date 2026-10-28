@@ -59,6 +59,11 @@ target_include_directories(gufo_npu_core PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
   "${CMAKE_CURRENT_BINARY_DIR}/generated")
 
+# The server's chat format: OpenAI messages to the Qwen3.5 / Qwen3.6 chat
+# template and the model's output back to content, reasoning and tool calls.
+add_library(gufo_npu_serve_chat STATIC src/serve/chat_format_qwen35.cpp)
+target_link_libraries(gufo_npu_serve_chat PUBLIC gufo_npu_core nlohmann_json)
+
 # Qwen3.5 / Qwen3.6 model code (CPU reference).
 add_library(gufo_npu_qwen35 STATIC
   src/models/qwen35/chat.cpp

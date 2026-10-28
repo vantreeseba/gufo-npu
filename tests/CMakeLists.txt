@@ -84,3 +84,12 @@ add_subdirectory(models/qwen35)
 add_subdirectory(models/qwen35_2b)
 add_subdirectory(models/qwen36_35b_a3b)
 add_subdirectory(models/qwen35_4b)
+
+# The server's chat format against the GGUF chat template (fixtures rendered
+# by tools/reference/qwen35_chat_template.py); no model needed.
+add_executable(chat_format_test serve/chat_format_test.cpp)
+target_link_libraries(chat_format_test PRIVATE gufo_npu_serve_chat
+                      gufo_npu_qwen35)
+add_test(NAME chat_format_test
+         COMMAND chat_format_test "${CMAKE_CURRENT_SOURCE_DIR}/serve/fixtures")
+set_tests_properties(chat_format_test PROPERTIES LABELS serve)
