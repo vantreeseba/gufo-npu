@@ -639,6 +639,71 @@ int BenchMoePrefill(gufo_npu::qwen35::NpuDecoder& npu,
   return 0;
 }
 
+// bench prefill for a dense model: its NpuDecoder and NpuPrefill (the
+// family's, or the 4B's own), with SpeculativeGenerate found by argument.
+template<typename Decoder, typename Prefill>
+int BenchDensePrefill(Decoder& npu, Prefill& prefill,
+                      const gufo_npu::qwen35::PromptPrefill& hook,
+                      const std::vector<int>& ids,
+                      const std::vector<int>& lengths, int runs,
+                      bool decode_path) {
+  namespace qwen35 = gufo_npu::qwen35;
+  std::printf("%8s %10s %8s %8s %12s %6s %8s %8s %8s %8s %8s\n", "tokens",
+              "TTFT mean", "min", "max", "prompt tok/s", "GEMMs", "GEMM s",
+              "sync s", "DN s", "attn s", "other s");
+  for (const int length : lengths) {
+    const std::vector<int> prompt(ids.begin(), ids.begin() + length);
+    if (decode_path) {
+      // The same prompt through the decoder alone, two tokens per pass.
+      std::vector<double> ttft;
+      for (int run = 0; run <= runs; ++run) {
+        qwen35::SpeculativeStats stats;
+        SpeculativeGenerate(npu, prompt, 1, {}, true, {}, &stats);
+        if (run > 0) {
+          ttft.push_back(stats.prefill_seconds);
+        }
+      }
+      double mean = 0;
+      for (const double t : ttft) {
+        mean += t / runs;
+      }
+      std::printf("%8d %10.3f %8.3f %8.3f %12.0f  (decode path)\n", length,
+                  mean, *std::min_element(ttft.begin(), ttft.end()),
+                  *std::max_element(ttft.begin(), ttft.end()), length / mean);
+    }
+    std::vector<double> ttft;
+    typename Prefill::Profile first;
+    typename Prefill::Profile last;
+    for (int run = 0; run <= runs; ++run) {
+      if (run == 1) {
+        first = prefill.profile();
+      }
+      qwen35::SpeculativeStats stats;
+      SpeculativeGenerate(npu, prompt, 1, {}, true, {}, &stats, hook);
+      if (run > 0) {
+        ttft.push_back(stats.prefill_seconds);
+      }
+    }
+    last = prefill.profile();
+    double mean = 0;
+    for (const double t : ttft) {
+      mean += t / runs;
+    }
+    std::printf(
+        "%8d %10.3f %8.3f %8.3f %12.0f %6ld %8.3f %8.3f %8.3f %8.3f %8.3f\n",
+        length, mean, *std::min_element(ttft.begin(), ttft.end()),
+        *std::max_element(ttft.begin(), ttft.end()), length / mean,
+        (last.gemms - first.gemms) / runs,
+        (last.gemm_seconds - first.gemm_seconds) / runs,
+        (last.sync_seconds - first.sync_seconds) / runs,
+        (last.deltanet_seconds - first.deltanet_seconds) / runs,
+        (last.attention_seconds - first.attention_seconds) / runs,
+        (last.other_seconds - first.other_seconds) / runs);
+    std::fflush(stdout);
+  }
+  return 0;
+}
+
 // Time to first token of `generate --device npu` per prompt length: prompt
 // processing (NpuPrefill), the MTP cache over the prompt and the first
 // token, as SpeculativeGenerate runs them with MTP drafting. The prompts are
@@ -689,67 +754,25 @@ int BenchPrefill(const std::vector<std::string_view>& args) {
                          "blue."}},
         false));
   }
+  // Qwen3.5-4B on its own NPU programs (as generate picks it).
+  const auto config = qwen35::ReadConfig(*file);
+  if (config.architecture == "qwen35" &&
+      static_cast<std::size_t>(config.hidden) ==
+          gufo_npu::qwen35_4b::npu::kHidden) {
+    gufo_npu::qwen35_4b::NpuDecoder npu(*file, KernelDir(kernels));
+    gufo_npu::qwen35_4b::NpuPrefill prefill(*file, KernelDir(kernels));
+    return BenchDensePrefill(npu, prefill,
+                             gufo_npu::qwen35_4b::PrefillPrompt(prefill), ids,
+                             lengths, runs, decode_path);
+  }
   qwen35::NpuDecoder npu(*file, KernelDir(kernels));
   if (moe) {
     return BenchMoePrefill(npu, *file, KernelDir(kernels), ids, lengths, runs,
                            decode_path);
   }
   qwen35::NpuPrefill prefill(*file, KernelDir(kernels));
-  const auto hook = qwen35::PrefillPrompt(prefill);
-  std::printf("%8s %10s %8s %8s %12s %6s %8s %8s %8s %8s %8s\n", "tokens",
-              "TTFT mean", "min", "max", "prompt tok/s", "GEMMs", "GEMM s",
-              "sync s", "DN s", "attn s", "other s");
-  for (const int length : lengths) {
-    const std::vector<int> prompt(ids.begin(), ids.begin() + length);
-    if (decode_path) {
-      // The same prompt through the decoder alone, two tokens per pass.
-      std::vector<double> ttft;
-      for (int run = 0; run <= runs; ++run) {
-        qwen35::SpeculativeStats stats;
-        qwen35::SpeculativeGenerate(npu, prompt, 1, {}, true, {}, &stats);
-        if (run > 0) {
-          ttft.push_back(stats.prefill_seconds);
-        }
-      }
-      double mean = 0;
-      for (const double t : ttft) {
-        mean += t / runs;
-      }
-      std::printf("%8d %10.3f %8.3f %8.3f %12.0f  (decode path)\n", length,
-                  mean, *std::min_element(ttft.begin(), ttft.end()),
-                  *std::max_element(ttft.begin(), ttft.end()), length / mean);
-    }
-    std::vector<double> ttft;
-    qwen35::NpuPrefill::Profile first;
-    qwen35::NpuPrefill::Profile last;
-    for (int run = 0; run <= runs; ++run) {
-      if (run == 1) {
-        first = prefill.profile();
-      }
-      qwen35::SpeculativeStats stats;
-      qwen35::SpeculativeGenerate(npu, prompt, 1, {}, true, {}, &stats, hook);
-      if (run > 0) {
-        ttft.push_back(stats.prefill_seconds);
-      }
-    }
-    last = prefill.profile();
-    double mean = 0;
-    for (const double t : ttft) {
-      mean += t / runs;
-    }
-    std::printf(
-        "%8d %10.3f %8.3f %8.3f %12.0f %6ld %8.3f %8.3f %8.3f %8.3f %8.3f\n",
-        length, mean, *std::min_element(ttft.begin(), ttft.end()),
-        *std::max_element(ttft.begin(), ttft.end()), length / mean,
-        (last.gemms - first.gemms) / runs,
-        (last.gemm_seconds - first.gemm_seconds) / runs,
-        (last.sync_seconds - first.sync_seconds) / runs,
-        (last.deltanet_seconds - first.deltanet_seconds) / runs,
-        (last.attention_seconds - first.attention_seconds) / runs,
-        (last.other_seconds - first.other_seconds) / runs);
-    std::fflush(stdout);
-  }
-  return 0;
+  return BenchDensePrefill(npu, prefill, qwen35::PrefillPrompt(prefill), ids,
+                           lengths, runs, decode_path);
 }
 
 int Generate(const std::vector<std::string_view>& args) {
