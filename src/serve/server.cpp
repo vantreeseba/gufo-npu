@@ -16,6 +16,7 @@
 #include <utility>
 #include <vector>
 
+#include "serve/engine_pool.hpp"
 #include "serve/metrics.hpp"
 #include "serve/openai.hpp"
 #include "serve/reply.hpp"
@@ -63,6 +64,7 @@ json ToolCall(const OutputPart& part) {
 
 // A chat completion between its admission and its reply.
 struct Job {
+  Engine* engine = nullptr;  // the requested model's
   ChatRequest chat;
   GenerateRequest gen;
   std::unique_ptr<Scheduler::Ticket> ticket;
@@ -82,17 +84,14 @@ struct Outcome {
 }  // namespace
 
 struct Server::Impl {
-  Impl(Engine& engine, const ChatFormat& format, ServerOptions options)
-      : engine(engine),
+  Impl(Engine* single, EnginePool* pool, const ChatFormat& format,
+       ServerOptions options)
+      : single(single),
+        pool(pool),
         format(format),
         options(std::move(options)),
         scheduler(this->options.max_queue),
         created(static_cast<std::int64_t>(std::time(nullptr))) {
-    for (const auto& token : format.StopTokens()) {
-      if (const int id = engine.FindToken(token); id >= 0) {
-        stop_ids.push_back(id);
-      }
-    }
     // Waiting requests hold a worker each; keep some for /health etc.
     const std::size_t workers =
         static_cast<std::size_t>(std::max(0, this->options.max_queue)) + 8;
@@ -139,28 +138,44 @@ struct Server::Impl {
 
     http.Get(
         "/health", [this](const httplib::Request&, httplib::Response& res) {
-          res.set_content(Dump({{"status", "ok"}, {"model", engine.info().id}}),
-                          "application/json");
+          json health = {{"status", "ok"}};
+          if (pool) {
+            const auto s = pool->status();
+            health["model"] = s.loaded ? json(*s.loaded) : json(nullptr);
+            health["loading"] = s.loading ? json(*s.loading) : json(nullptr);
+          } else {
+            health["model"] = single->info().id;
+          }
+          res.set_content(Dump(health), "application/json");
         });
     http.Get("/v1/models",
              [this](const httplib::Request&, httplib::Response& res) {
+               json data = json::array();
+               for (Engine* engine : Engines()) {
+                 data.push_back(Model(*engine));
+               }
                res.set_content(
-                   Dump({{"object", "list"}, {"data", json::array({Model()})}}),
+                   Dump({{"object", "list"}, {"data", std::move(data)}}),
                    "application/json");
              });
     http.Get(R"(/v1/models/(.+))", [this](const httplib::Request& req,
                                           httplib::Response& res) {
-      if (req.matches[1] != engine.info().id) {
+      Engine* engine = FindModel(req.matches[1]);
+      if (engine == nullptr) {
         SendError(res, ApiError(404, "invalid_request_error", "model_not_found",
                                 "no such model", "model"));
         return;
       }
-      res.set_content(Dump(Model()), "application/json");
+      res.set_content(Dump(Model(*engine)), "application/json");
     });
     http.Get("/metrics", [this](const httplib::Request&,
                                 httplib::Response& res) {
-      res.set_content(metrics.Render(scheduler.waiting(), scheduler.running()),
-                      "text/plain; version=0.0.4");
+      std::string text =
+          metrics.Render(scheduler.waiting(), scheduler.running());
+      if (pool) {
+        text += pool->RenderMetrics();
+      }
+      res.set_content(text, "text/plain; version=0.0.4");
     });
     http.Post("/v1/chat/completions",
               [this](const httplib::Request& req, httplib::Response& res) {
@@ -168,11 +183,63 @@ struct Server::Impl {
               });
   }
 
-  json Model() const {
-    return {{"id", engine.info().id},
-            {"object", "model"},
-            {"created", created},
-            {"owned_by", "gufo-npu"}};
+  json Model(const Engine& engine) const {
+    json model = {{"id", engine.info().id},
+                  {"object", "model"},
+                  {"created", created},
+                  {"owned_by", "gufo-npu"}};
+    if (pool) {  // extension: which model is on the device
+      model["loaded"] = pool->status().loaded == engine.info().id;
+    }
+    return model;
+  }
+
+  std::vector<Engine*> Engines() const {
+    return pool ? pool->engines() : std::vector<Engine*>{single};
+  }
+
+  Engine* FindModel(const std::string& id) const {
+    if (pool) {
+      return pool->Find(id);
+    }
+    return single->info().id == id ? single : nullptr;
+  }
+
+  // The engine a request names. One model: any name (or none) is it.
+  // Several: the named one (404 if unknown), or the default without a name.
+  Engine& RequestedEngine(const nlohmann::ordered_json& body) const {
+    if (!pool) {
+      return *single;
+    }
+    if (const auto all = pool->engines(); all.size() == 1) {
+      return *all.front();
+    }
+    const auto it = body.find("model");
+    if (it == body.end() || it->is_null() ||
+        (it->is_string() && it->get<std::string>().empty())) {
+      return pool->Default();
+    }
+    if (!it->is_string()) {
+      throw InvalidRequest("model must be a string", "model");
+    }
+    Engine* engine = pool->Find(it->get<std::string>());
+    if (engine == nullptr) {
+      throw ApiError(404, "invalid_request_error", "model_not_found",
+                     "the model " + it->get<std::string>() +
+                         " does not exist; GET /v1/models lists the models",
+                     "model");
+    }
+    return *engine;
+  }
+
+  std::vector<int> StopIds(const Engine& engine) const {
+    std::vector<int> ids;
+    for (const auto& token : format.StopTokens()) {
+      if (const int id = engine.FindToken(token); id >= 0) {
+        ids.push_back(id);
+      }
+    }
+    return ids;
   }
 
   void Chat(const httplib::Request& req, httplib::Response& res) {
@@ -186,6 +253,8 @@ struct Server::Impl {
         throw InvalidRequest("the request body is not valid JSON");
       }
       job->chat = ParseChatRequest(body);
+      job->engine = &RequestedEngine(body);
+      Engine& engine = *job->engine;
       std::string text;
       try {
         text = format.Render(job->chat.prompt);
@@ -205,7 +274,7 @@ struct Server::Impl {
       const int room = context > 0 ? context - prompt : INT_MAX;
       job->gen.max_tokens = std::min(job->chat.max_tokens.value_or(room), room);
       job->gen.sampling = job->chat.sampling;
-      job->gen.stop_ids = stop_ids;
+      job->gen.stop_ids = StopIds(engine);
     } catch (const ApiError& e) {
       metrics.Request(e.status);
       SendError(res, e);
@@ -219,7 +288,7 @@ struct Server::Impl {
       return;
     }
     job->id = NewId("chatcmpl-");
-    job->model = engine.info().id;
+    job->model = job->engine->info().id;
     job->created = static_cast<std::int64_t>(std::time(nullptr));
 
     if (job->chat.stream) {
@@ -248,6 +317,7 @@ struct Server::Impl {
     }
     std::atomic<bool> cancel{false};
     job.gen.cancel = &cancel;
+    Engine& engine = *job.engine;
     ReplyStream reply(engine, job.gen.stop_ids, job.chat.stop,
                       format.NewParser(job.chat.prompt), std::move(emit));
     bool first = true;
@@ -432,18 +502,24 @@ struct Server::Impl {
     res.set_content(Dump(body), "application/json");
   }
 
-  Engine& engine;
+  Engine* single;     // one model, or
+  EnginePool* pool;   // several
   const ChatFormat& format;
   ServerOptions options;
   httplib::Server http;
   Scheduler scheduler;
   Metrics metrics;
-  std::vector<int> stop_ids;
   std::int64_t created;
 };
 
 Server::Server(Engine& engine, const ChatFormat& format, ServerOptions options)
-    : impl_(std::make_unique<Impl>(engine, format, std::move(options))) {}
+    : impl_(std::make_unique<Impl>(&engine, nullptr, format,
+                                   std::move(options))) {}
+
+Server::Server(EnginePool& pool, const ChatFormat& format,
+               ServerOptions options)
+    : impl_(std::make_unique<Impl>(nullptr, &pool, format,
+                                   std::move(options))) {}
 
 Server::~Server() = default;
 
