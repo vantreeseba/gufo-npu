@@ -60,8 +60,8 @@ struct Running {
 };
 
 json Post(const Running& s, const ordered_json& body) {
-  auto res = s.Client().Post("/v1/chat/completions", body.dump(),
-                             "application/json");
+  auto res =
+      s.Client().Post("/v1/chat/completions", body.dump(), "application/json");
   if (!res || res->status != 200) {
     std::fprintf(stderr, "status %d: %s\n", res ? res->status : -1,
                  res ? res->body.c_str() : "");
@@ -73,8 +73,8 @@ json Post(const Running& s, const ordered_json& body) {
 // The `data:` events of a streamed request, without the final [DONE].
 std::vector<json> Stream(const Running& s, ordered_json body) {
   body["stream"] = true;
-  auto res = s.Client().Post("/v1/chat/completions", body.dump(),
-                             "application/json");
+  auto res =
+      s.Client().Post("/v1/chat/completions", body.dump(), "application/json");
   std::vector<json> events;
   if (!res || res->status != 200) {
     return events;
@@ -112,8 +112,7 @@ ordered_json WeatherTool() {
 
 // A tool call in Qwen3.5's markup, split across tokens at awkward places.
 std::vector<std::string> ToolCallPieces() {
-  return {"I'll check.\n\n<tool",
-          "_call>\n<function=get_",
+  return {"I'll check.\n\n<tool", "_call>\n<function=get_",
           "weather>\n<parameter=city>\nPar",
           "is\n</parameter>\n<parameter=days>\n3\n</para",
           "meter>\n</function>\n</tool_call>"};
@@ -127,9 +126,9 @@ void TestReasoning(FakeEngine& engine, const Running& s) {
       {"chat_template_kwargs", {{"enable_thinking", true}}}};
   const auto r = Post(s, body);
   const auto& message = r["choices"][0]["message"];
-  Check(message.value("reasoning_content", "") ==
-            "The sky scatters blue light.",
-        "reasoning: reasoning_content");
+  Check(
+      message.value("reasoning_content", "") == "The sky scatters blue light.",
+      "reasoning: reasoning_content");
   Check(message.value("content", "") == "Rayleigh scattering.",
         "reasoning: content");
 
@@ -164,11 +163,11 @@ void TestToolRoundTrip(FakeEngine& engine, const Running& s,
   Check(calls.is_array() && calls.size() == 1 &&
             calls[0]["function"]["name"] == "get_weather",
         "tool call: one get_weather call");
-  const auto args = calls.is_array() && !calls.empty()
-                        ? json::parse(calls[0]["function"]["arguments"]
-                                          .get<std::string>(),
-                                      nullptr, false)
-                        : json();
+  const auto args =
+      calls.is_array() && !calls.empty()
+          ? json::parse(calls[0]["function"]["arguments"].get<std::string>(),
+                        nullptr, false)
+          : json();
   Check(args == json({{"city", "Paris"}, {"days", 3}}),
         "tool call: arguments typed by the schema");
   Check(choice["message"].value("content", "") == "I'll check.",

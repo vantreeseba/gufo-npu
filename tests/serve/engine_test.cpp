@@ -149,7 +149,8 @@ int main(int argc, char** argv) {
     return engine->Generate(request, {}).tokens;
   };
   const auto s1 = sampled(1);
-  Expect(!s1.empty() && sampled(1) == s1, "the same seed samples the same tokens");
+  Expect(!s1.empty() && sampled(1) == s1,
+         "the same seed samples the same tokens");
   Expect(sampled(2) != s1 || sampled(3) != s1,
          "other seeds sample other tokens");
 

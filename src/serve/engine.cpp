@@ -194,8 +194,8 @@ struct Package {
 
 private:
   Prefill MakePrefill(const gguf::File& file, const fs::path& kernels) {
-    if constexpr (std::is_constructible_v<Prefill, const gguf::File&,
-                                          Decoder&, const fs::path&>) {
+    if constexpr (std::is_constructible_v<Prefill, const gguf::File&, Decoder&,
+                                          const fs::path&>) {
       return Prefill(file, decoder, kernels);
     } else {
       return Prefill(file, kernels);
@@ -228,16 +228,17 @@ RunFn MakeRun(P* package, GenerateFn generate, HookFn prefill_hook) {
 void AttachQwen35_2B(ModelEngine& engine, const fs::path& kernels,
                      int checkpoints) {
   using P = Package<qwen35::NpuDecoder, qwen35::NpuPrefill>;
-  auto m = std::make_shared<P>(
-      engine, kernels, checkpoints,
-      [](qwen35::NpuDecoder& d, qwen35::NpuPrefill& p) {
-        return qwen35::MakePromptCacheModel(d, p);
-      });
+  auto m =
+      std::make_shared<P>(engine, kernels, checkpoints,
+                          [](qwen35::NpuDecoder& d, qwen35::NpuPrefill& p) {
+                            return qwen35::MakePromptCacheModel(d, p);
+                          });
   const bool can_draft = m->decoder.can_draft();
   RunFn run = MakeRun(
       m.get(),
       [](auto&&... args) {
-        return qwen35::SpeculativeGenerate(std::forward<decltype(args)>(args)...);
+        return qwen35::SpeculativeGenerate(
+            std::forward<decltype(args)>(args)...);
       },
       [](P& p) { return qwen35::PrefillPrompt(p.prefill); });
   engine.Attach(std::move(m), std::move(run), can_draft);
@@ -277,7 +278,8 @@ void AttachQwen36_35B_A3B(ModelEngine& engine, const fs::path& kernels,
   RunFn run = MakeRun(
       m.get(),
       [](auto&&... args) {
-        return qwen35::SpeculativeGenerate(std::forward<decltype(args)>(args)...);
+        return qwen35::SpeculativeGenerate(
+            std::forward<decltype(args)>(args)...);
       },
       [](P& p) { return qwen36_35b_a3b::PrefillPrompt(p.prefill); });
   engine.Attach(std::move(m), std::move(run), can_draft);
@@ -289,11 +291,10 @@ void AttachReference(ModelEngine& engine) {
   qwen35::Reference* reference = m.get();
   engine.Attach(
       m,
-      [reference](const std::vector<int>& prompt, int max_tokens,
-                  const std::vector<int>& stop, bool,
-                  const SamplingParams& sampling,
-                  const std::function<bool(int)>& on_token,
-                  GenerateResult& result) {
+      [reference](
+          const std::vector<int>& prompt, int max_tokens,
+          const std::vector<int>& stop, bool, const SamplingParams& sampling,
+          const std::function<bool(int)>& on_token, GenerateResult& result) {
         auto state = reference->NewState();
         std::vector<float> logits;
         const auto vocab = static_cast<std::size_t>(reference->config().vocab);

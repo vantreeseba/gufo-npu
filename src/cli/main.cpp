@@ -1022,8 +1022,7 @@ int Serve(const std::vector<std::string_view>& args) {
     } else if (args[i] == "--max-queue" && has_value) {
       server_options.max_queue = std::atoi(std::string(args[++i]).c_str());
     } else if (args[i] == "--context-length" && has_value) {
-      engine_options.context_length =
-          std::atoi(std::string(args[++i]).c_str());
+      engine_options.context_length = std::atoi(std::string(args[++i]).c_str());
     } else if (args[i] == "--prompt-cache" && has_value) {
       engine_options.prompt_cache = std::atoi(std::string(args[++i]).c_str());
     } else if (args[i] == "--api-key" && has_value) {
