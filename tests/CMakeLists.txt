@@ -32,6 +32,11 @@ add_executable(burst_pool_test core/burst_pool_test.cpp)
 target_link_libraries(burst_pool_test PRIVATE gufo_npu_core)
 add_test(NAME burst_pool_test COMMAND burst_pool_test)
 
+add_executable(thread_pool_test core/thread_pool_test.cpp)
+target_link_libraries(thread_pool_test PRIVATE gufo_npu_core)
+add_test(NAME thread_pool_test COMMAND thread_pool_test)
+set_tests_properties(thread_pool_test PROPERTIES TIMEOUT 300)
+
 add_executable(simd_test core/simd_test.cpp)
 target_link_libraries(simd_test PRIVATE gufo_npu_core)
 # The vector paths, as the prefill builds them.
