@@ -13,8 +13,8 @@ toolchain so every bottleneck can be fixed. See [docs/PLAN.md](docs/PLAN.md).
 
 | Model | Inference modes | Hugging Face weights | Benchmarks | Quality |
 |---|---|---|---|---|
-| [Qwen3.5-2B](docs/models/qwen3.5-2b/README.md) | NPU decode, MTP with a 32k draft vocabulary, NPU prefill | Unsloth [UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.5-2B-MTP-GGUF/blob/e05864f8066d874d5f85aaff007ae57a2a7d1efe/Qwen3.5-2B-UD-Q4_K_XL.gguf) | Up to **63.5 tok/s** decode (FLM 28.5); **0.11 s** to first token at 35 tokens, 1.23 s at 4k (FLM 0.60 s, 3.34 s) · [Benchmarks](docs/models/qwen3.5-2b/BENCHMARKS.md) | [Quality](docs/models/qwen3.5-2b/QUALITY.md) |
-| [Qwen3.5-4B](docs/models/qwen3.5-4b/README.md) | NPU decode on its own NPU programs, MTP with a 32k draft vocabulary, NPU prefill | Unsloth [UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.5-4B-MTP-GGUF/blob/86835bf9949e4d14d6860f7910b1340ad4f271a9/Qwen3.5-4B-UD-Q4_K_XL.gguf) | Up to **30.6 tok/s** decode with MTP, 18.8 without (FLM published: 15.9 at 1k†); **0.84 s** to first token at ~1k tokens · [Benchmarks](docs/models/qwen3.5-4b/BENCHMARKS.md) | [Quality](docs/models/qwen3.5-4b/QUALITY.md) |
+| [Qwen3.5-2B](docs/models/qwen3.5-2b/README.md) | NPU decode, MTP with a 32k draft vocabulary, NPU prefill | Unsloth [UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.5-2B-MTP-GGUF/blob/e05864f8066d874d5f85aaff007ae57a2a7d1efe/Qwen3.5-2B-UD-Q4_K_XL.gguf) | Up to **63.5 tok/s** decode (FLM 28.5); **0.09 s** to first token at 35 tokens, 1.20 s at 4k (FLM 0.60 s, 3.34 s) · [Benchmarks](docs/models/qwen3.5-2b/BENCHMARKS.md) | [Quality](docs/models/qwen3.5-2b/QUALITY.md) |
+| [Qwen3.5-4B](docs/models/qwen3.5-4b/README.md) | NPU decode on its own NPU programs, MTP with a 32k draft vocabulary, NPU prefill | Unsloth [UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.5-4B-MTP-GGUF/blob/86835bf9949e4d14d6860f7910b1340ad4f271a9/Qwen3.5-4B-UD-Q4_K_XL.gguf) | Up to **30.6 tok/s** decode with MTP, 18.8 without (FLM published: 15.9 at 1k†); **0.66 s** to first token at 1k tokens · [Benchmarks](docs/models/qwen3.5-4b/BENCHMARKS.md) | [Quality](docs/models/qwen3.5-4b/QUALITY.md) |
 | [Qwen3.6-35B-A3B](docs/models/qwen3.6-35b-a3b/README.md) | NPU decode (MoE), MTP with a 32k draft vocabulary, NPU prefill, CPU decode | Unsloth [UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/blob/5bc3e238d916f48a861bac2f8a1990a0e9b7e98d/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf) | Up to **28.9 tok/s** decode on the NPU with MTP, ~20 without (FLM 17.1); **5.6 s** to first token at ~1k tokens, 16.0 s at 8.5k (FLM 8.75 s, 34.2 s); 23.0 tok/s decode on the CPU · [Benchmarks](docs/models/qwen3.6-35b-a3b/BENCHMARKS.md) | [Quality](docs/models/qwen3.6-35b-a3b/QUALITY.md) |
 
 ### Against FastFlowLM on the same machine
@@ -24,9 +24,9 @@ toolchain so every bottleneck can be fixed. See [docs/PLAN.md](docs/PLAN.md).
 | Qwen3.5-2B | Decode, short prompt | 53–64 tok/s with MTP, 39 without | 28.5 tok/s |
 | | Decode, 2k context | 48.4 tok/s with MTP | 28.0 (1k), 26.4 (4k) |
 | | Decode, 9k context | 33.2 tok/s without drafting | 24.6 (8.5k) |
-| | Time to first token, 35 tokens | 0.11 s | 0.60 s |
-| | Time to first token, ~1k tokens | 0.31 s | 1.80 s |
-| | Time to first token, ~4k tokens | 1.23 s | 3.34 s |
+| | Time to first token, 35 tokens | 0.086 s | 0.60 s |
+| | Time to first token, ~1k tokens | 0.29 s | 1.80 s |
+| | Time to first token, ~4k tokens | 1.20 s | 3.34 s |
 | Qwen3.6-35B-A3B | Decode, short prompt | 26.5–28.9 tok/s with MTP, 19.4–20.3 without | 17.1 tok/s |
 | | Decode, ~1k context | 26.0–26.5 tok/s with MTP, 18.7–19.8 without | 16.9 tok/s |
 | | Time to first token, short | 0.87–1.02 s | 3.49 s |
@@ -38,11 +38,13 @@ toolchain so every bottleneck can be fixed. See [docs/PLAN.md](docs/PLAN.md).
 | | Decode, ~1k context | 25.4 tok/s with MTP, 18.3 without | 15.9 tok/s† |
 | | Decode, ~2k context | 24.2 tok/s with MTP, 17.8 without | 15.6 tok/s† |
 | | Decode, ~9k context | 17.7 tok/s with MTP, 14.7 without | 14.0 tok/s (8k)† |
-| | Time to first token, ~1k tokens | 0.84 s | ~2.9 s† |
-| | Time to first token, ~4k tokens | 3.29 s | ~7.7 s† |
+| | Time to first token, 35 tokens | 0.19 s | – |
+| | Time to first token, 1k tokens | 0.66 s | ~3.2 s† |
+| | Time to first token, 4k tokens | 2.84 s | ~7.5 s† |
+| | Time to first token, 9k tokens | 7.79 s | ~15 s† |
 
-- **How these were measured:** Strix Halo, Ryzen AI MAX+ 395, 2026-10-27. Greedy decoding, warm, three or more runs each.
-  - gufo-npu runs in-process through `gufo-npu generate`.
+- **How these were measured:** Strix Halo, Ryzen AI MAX+ 395, 2026-10-27 (the 2B's and 4B's times to first token 2026-10-28). Greedy decoding, warm, three or more runs each.
+  - gufo-npu runs in-process: decode through `gufo-npu generate`, the 2B's and 4B's times to first token through `gufo-npu bench prefill` (back to back, so the NPU never idles into its 5 s autosuspend).
   - FastFlowLM runs through its OpenAI-compatible server (streaming, temperature 0), so its time to first token includes a local HTTP round trip.
   - Each model's BENCHMARKS.md has the exact prompts and every run.
 - **† Qwen3.5-4B's FastFlowLM numbers are FLM's own published results on Kraken Point** (Ryzen AI 7 350; FastFlowLM v0.9.38), **not measured on this box**: Lemonade, which serves FLM here, is stopped. Its times to first token are our prompt lengths at FLM's published prefill rates. FLM's 35B decodes at 17.5 tok/s on Kraken Point and 16.9 here.

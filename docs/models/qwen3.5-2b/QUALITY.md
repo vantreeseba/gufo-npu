@@ -203,6 +203,38 @@ logits < 5e-2 (relative L2), the first token equal, argmax agreement >=
   fp32; the residual stream accumulates it. The DeltaNet and attention
   mixers run in fp32 on the CPU with the decoder's arithmetic.
 
+### First token from the prefill (2026-10-28)
+
+PrefillPrompt now runs the whole prompt through NpuPrefill, and the first
+token comes from its last row through the LM head alone
+(`NpuDecoder::Logits`), with no decode step for the last prompt token. The
+same test now prefills every prompt token (states compared after the whole
+prompt), takes the first token's logits from `Logits` on prefill's last
+row, and checks it against the decode path's step of the last token: the
+same token, or a near tie in the decode path's own top two. On the ten
+prompts above:
+
+| Check | Measured |
+|---|---|
+| First token the same as the decode path's | 10/10 |
+| Largest change of any logit, prefill row vs decode step | 0.89 (len600) |
+| Smallest decode-path top-2 gap among the prompts | 0.26 (prose; still the same token) |
+| States after the whole prompt (worst) | hidden 4.0e-2, conv 3.9e-2, DeltaNet 5.8e-2, K/V 3.9e-2 (under the same limits) |
+| Argmax over the first token and 16 teacher-forced steps | 170/170 |
+| Speculative decoding after prefill vs plain greedy (chat, 48 tokens) | identical |
+
+The near-tie limit is 2 logits. A token changes only if its logit and the
+runner-up's move across each other, which takes a gap smaller than about
+twice the largest logit change (0.89 here, 0.80 on the 4B), so 1.8. A
+first token may differ only below 2 logits; none did.
+
+The outputs on the decode benchmarks change only where a near tie falls
+the other way. The sky prompt without drafting and the 960-token prompt
+with MTP keep their hashes (`a49f1c4c`, `8edbce90`). The Fibonacci prompt
+with MTP changes (`69e1c62d` → `fdb595fb`, 239 → 256 generated tokens):
+its MTP output still equals plain greedy from the same prefilled state
+([BENCHMARKS.md](BENCHMARKS.md), "TTFT quick wins").
+
 ## Fast decoder vs reference
 
 `qwen35_decoder_test` (label `model`; needs `GUFO_NPU_QWEN35_2B_Q4_GGUF` and
