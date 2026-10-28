@@ -32,8 +32,8 @@ std::string NormalizeModelId(std::string_view name);
 // The default per-request limit on prompt + generated tokens. The decoders'
 // K/V caches and the prefills grow with the prompt, so the real limits are
 // memory and time; this is the length the engine is checked at
-// (docs/SERVING.md). Raise it with EngineOptions::context_length, up to the
-// GGUF's trained context length.
+// (docs/serve/ENGINE.md). Raise it with EngineOptions::context_length, up to
+// the GGUF's trained context length.
 inline constexpr int kDefaultContextLength = 32768;
 
 }  // namespace gufo_npu::serve

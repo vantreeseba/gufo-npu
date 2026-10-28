@@ -43,6 +43,7 @@ constexpr char kUsage[] =
 
 struct Memory {
   long rss_kb = 0;
+  long anon_kb = 0;  // RSS without file pages (the GGUF's mapping)
   long locked_kb = 0;
   long pinned_kb = 0;
 };
@@ -58,6 +59,7 @@ Memory ReadMemory() {
       }
     };
     value("VmRSS:", m.rss_kb);
+    value("RssAnon:", m.anon_kb);
     value("VmLck:", m.locked_kb);
     value("VmPin:", m.pinned_kb);
   }
@@ -232,12 +234,13 @@ int main(int argc, char** argv) {
   const Memory loaded = ReadMemory();
   const auto& info = engine->info();
   std::printf("model %s (%s), context %d, draft %s; loaded in %.1f s; RSS "
-              "%.2f GB (+%.2f), locked %.2f GB, pinned %.2f GB\n",
+              "%.2f GB (+%.2f), anonymous %.2f GB, locked %.2f GB, pinned "
+              "%.2f GB\n",
               info.id.c_str(), info.architecture.c_str(), info.context_length,
               info.can_draft ? "available" : "none", load_seconds,
               loaded.rss_kb / 1048576.0,
               (loaded.rss_kb - before.rss_kb) / 1048576.0,
-              loaded.locked_kb / 1048576.0, loaded.pinned_kb / 1048576.0);
+              loaded.anon_kb / 1048576.0, loaded.locked_kb / 1048576.0, loaded.pinned_kb / 1048576.0);
   std::fflush(stdout);
 
   const auto& tokenizer = engine->tokenizer();
@@ -256,6 +259,7 @@ int main(int argc, char** argv) {
   std::vector<double> ttfts;
   std::vector<double> rates;
   std::vector<long> rss;
+  std::vector<long> anon;
   int done = 0;
   int failed = 0;
   const auto run = [&](const Request& r) {
@@ -289,16 +293,17 @@ int main(int argc, char** argv) {
     ttfts.push_back(result.prefill_seconds);
     rates.push_back(rate);
     rss.push_back(m.rss_kb);
+    anon.push_back(m.anon_kb);
     ++done;
     std::printf("%-6s prompt %5d  out %4zu/%-4d %-6s ttft %7.3f s  "
-                "%6.2f tok/s  drafts %3d/%-3d  RSS %.2f GB  locked %.2f GB\n",
+                "%6.2f tok/s  drafts %3d/%-3d  RSS %.2f GB  anon %.2f GB\n",
                 r.name.c_str(), result.prompt_tokens, result.tokens.size(),
                 r.max_tokens,
                 result.finish == serve::FinishReason::kStop     ? "stop"
                 : result.finish == serve::FinishReason::kLength ? "length"
                                                                 : "cancel",
                 result.prefill_seconds, rate, result.accepted, result.steps,
-                m.rss_kb / 1048576.0, m.locked_kb / 1048576.0);
+                m.rss_kb / 1048576.0, m.anon_kb / 1048576.0);
     std::fflush(stdout);
     if (!out_dir.empty()) {
       const fs::path base = fs::path(out_dir) / r.name;
@@ -346,10 +351,13 @@ int main(int argc, char** argv) {
   const std::size_t q = std::max<std::size_t>(1, n / 4);
   std::printf("summary: %d requests, %d failed, %d reference mismatches; "
               "RSS after load %.2f GB, after the first request %.2f GB, at "
-              "the end %.2f GB\n",
+              "the end %.2f GB; anonymous %.2f, %.2f, %.2f GB\n",
               done, failed, mismatches, loaded.rss_kb / 1048576.0,
               rss.empty() ? 0 : rss.front() / 1048576.0,
-              rss.empty() ? 0 : rss.back() / 1048576.0);
+              rss.empty() ? 0 : rss.back() / 1048576.0,
+              loaded.anon_kb / 1048576.0,
+              anon.empty() ? 0 : anon.front() / 1048576.0,
+              anon.empty() ? 0 : anon.back() / 1048576.0);
   std::printf("drift: decode %.2f tok/s in the first quarter, %.2f in the "
               "last; mean TTFT %.3f s, %.3f s\n",
               Mean(rates, 0, q), Mean(rates, n - q, n), Mean(ttfts, 0, q),
