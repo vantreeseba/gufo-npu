@@ -85,8 +85,11 @@ constexpr char kUsage[] =
     "  serve --model GGUF [--host ADDR] [--port N] [--device npu|cpu]\n"
     "        [--kernels DIR] [--model-id NAME] [--max-queue N] [--api-key "
     "KEY]\n"
+    "        [--context-length N] [--prompt-cache N]\n"
     "                           OpenAI-compatible server (docs/SERVING.md),\n"
-    "                           by default on 127.0.0.1:8080\n"
+    "                           by default on 127.0.0.1:8080; --prompt-cache\n"
+    "                           keeps N checkpoints of earlier prompts for\n"
+    "                           multi-turn reuse (default 2, 0: off)\n"
     "  version                  print the version\n";
 
 void PrintChecks(const std::vector<Check>& checks) {
@@ -1018,6 +1021,11 @@ int Serve(const std::vector<std::string_view>& args) {
       engine_options.model_id = std::string(args[++i]);
     } else if (args[i] == "--max-queue" && has_value) {
       server_options.max_queue = std::atoi(std::string(args[++i]).c_str());
+    } else if (args[i] == "--context-length" && has_value) {
+      engine_options.context_length =
+          std::atoi(std::string(args[++i]).c_str());
+    } else if (args[i] == "--prompt-cache" && has_value) {
+      engine_options.prompt_cache = std::atoi(std::string(args[++i]).c_str());
     } else if (args[i] == "--api-key" && has_value) {
       server_options.api_key = std::string(args[++i]);
     } else {
@@ -1028,7 +1036,8 @@ int Serve(const std::vector<std::string_view>& args) {
   if (engine_options.model_path.empty() ||
       (engine_options.device != "npu" && engine_options.device != "cpu") ||
       server_options.port <= 0 || server_options.port > 65535 ||
-      server_options.max_queue < 0) {
+      server_options.max_queue < 0 || engine_options.context_length < 0 ||
+      engine_options.prompt_cache < 0) {
     std::cerr << kUsage;
     return 2;
   }

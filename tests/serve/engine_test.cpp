@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -137,18 +138,43 @@ int main(int argc, char** argv) {
          "a reply ends at <|im_end|> (" + std::to_string(full.tokens.size()) +
              " tokens), finish stop");
 
-  bool threw = false;
-  try {
+  // Sampling: a seed makes the draws repeatable.
+  const auto sampled = [&](std::uint64_t seed) {
     GenerateRequest request;
     request.prompt = sky;
-    request.max_tokens = 8;
-    request.sampling.temperature = 0.7f;
-    engine->Generate(request, {});
-  } catch (const std::invalid_argument&) {
-    threw = true;
-  }
-  Expect(threw, "sampling is refused until the sampler lands");
+    request.max_tokens = 32;
+    request.stop_ids = StopIds(*engine);
+    request.sampling.temperature = 1.0f;
+    request.sampling.seed = seed;
+    return engine->Generate(request, {}).tokens;
+  };
+  const auto s1 = sampled(1);
+  Expect(!s1.empty() && sampled(1) == s1, "the same seed samples the same tokens");
+  Expect(sampled(2) != s1 || sampled(3) != s1,
+         "other seeds sample other tokens");
 
+  // The prompt cache: turn 2 of a chat reuses turn 1's history and decodes
+  // the same tokens as an engine without the cache.
+  const std::string question = LongText(4) + " Summarize it in one line.";
+  const auto turn1 = Chat(*engine, question);
+  const auto reply1 = Run(*engine, turn1, 32);
+  std::vector<int> answer(reply1.tokens.begin(), reply1.tokens.end());
+  if (!answer.empty() && answer.back() == StopIds(*engine)[0]) {
+    answer.pop_back();
+  }
+  const std::vector<qwen35::Message> history = {
+      {"user", question},
+      {"assistant", engine->tokenizer().Decode(answer)},
+      {"user", "Now in three words."}};
+  const auto turn2 =
+      engine->tokenizer().Encode(qwen35::RenderChat(history, false));
+  const auto cached = Run(*engine, turn2, 32);
+  Expect(cached.cached_prompt_tokens > 0 &&
+             cached.cached_prompt_tokens < static_cast<int>(turn2.size()),
+         "turn 2 reuses " + std::to_string(cached.cached_prompt_tokens) +
+             " of " + std::to_string(turn2.size()) + " prompt tokens");
+
+  bool threw = false;
   // A small context limit: generation stops at it, longer prompts are
   // refused.
   options.context_length = static_cast<int>(sky.size()) + 10;
@@ -167,6 +193,14 @@ int main(int argc, char** argv) {
     threw = true;
   }
   Expect(threw, "a prompt over the context limit is refused");
+
+  options.context_length = 0;
+  options.prompt_cache = 0;
+  small.reset();
+  auto uncached = gufo_npu::serve::LoadEngine(options);
+  const auto fresh = Run(*uncached, turn2, 32);
+  Expect(fresh.cached_prompt_tokens == 0 && fresh.tokens == cached.tokens,
+         "without the cache turn 2 decodes the same tokens");
 
   return failures == 0 ? 0 : 1;
 }

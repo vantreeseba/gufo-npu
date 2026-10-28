@@ -82,6 +82,9 @@ struct EngineOptions {
   // Most prompt + generated tokens per request; 0: kDefaultContextLength,
   // capped by the GGUF's trained context length (model_registry.hpp).
   int context_length = 0;
+  // Prompt-cache checkpoints kept between requests (reuse of a multi-turn
+  // chat's history); 0: off. The CPU reference has no cache.
+  int prompt_cache = 2;
 };
 
 // Loads the GGUF's model on the device, picking the model package by
