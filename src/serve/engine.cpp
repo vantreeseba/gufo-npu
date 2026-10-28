@@ -1,7 +1,5 @@
 #include "serve/engine.hpp"
 
-#include <malloc.h>
-
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -64,21 +62,6 @@ using RunFn = std::function<void(
     const std::vector<int>& stop, bool draft, const SamplingParams& sampling,
     const std::function<bool(int)>& on_token, GenerateResult& result)>;
 
-// Requests size their prompt buffers by length, and glibc keeps freed
-// large buffers in its heaps (its mmap threshold rises with each large free),
-// so a long-running server's memory grows with every new mix of lengths:
-// 0.3 to 3.3 GB anonymous memory over a 5-minute 2B soak. Between requests,
-// once the heaps hold more than kKeepFreeBytes unused, their free pages go
-// back to the system; up to that, the next request reuses them without page
-// faults (trimming after every request costs ~20 ms per prompt-cache hit).
-constexpr std::size_t kKeepFreeBytes = std::size_t{1} << 30;
-
-void ReleaseFreeMemory() {
-  if (mallinfo2().fordblks > kKeepFreeBytes) {
-    malloc_trim(0);
-  }
-}
-
 void CopyStats(const qwen35::SpeculativeStats& stats, GenerateResult& result) {
   result.prefill_seconds = stats.prefill_seconds;
   result.decode_seconds = stats.decode_seconds;
@@ -139,7 +122,6 @@ public:
     } else {
       result.finish = FinishReason::kLength;
     }
-    ReleaseFreeMemory();
     return result;
   }
 
