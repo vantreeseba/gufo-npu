@@ -51,6 +51,16 @@ add_executable(q4nx_test core/q4nx_test.cpp)
 target_link_libraries(q4nx_test PRIVATE gufo_npu_core)
 add_test(NAME q4nx_test COMMAND q4nx_test)
 
+# The OpenAI-compatible server over a scripted engine (no model, no NPU).
+add_executable(serve_text_test serve/text_test.cpp)
+target_link_libraries(serve_text_test PRIVATE gufo_npu_serve)
+add_test(NAME serve_text_test COMMAND serve_text_test)
+add_executable(serve_server_test serve/server_test.cpp)
+target_link_libraries(serve_server_test PRIVATE gufo_npu_serve cpp_httplib)
+add_test(NAME serve_server_test COMMAND serve_server_test)
+set_tests_properties(serve_text_test serve_server_test PROPERTIES
+                     LABELS serve TIMEOUT 120)
+
 add_executable(tokenizer_test core/tokenizer_test.cpp)
 target_link_libraries(tokenizer_test PRIVATE gufo_npu_core nlohmann_json)
 add_test(NAME tokenizer_test
