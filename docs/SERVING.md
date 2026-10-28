@@ -46,6 +46,7 @@ needs the host's XRT (see the Dockerfile).
 | `--api-key KEY` | none | When set, `/v1/*` needs `Authorization: Bearer KEY`. `/health` and `/metrics` stay open. |
 | `--context-length N` | 32,768 | Most prompt + generated tokens per request, up to the model's trained 262,144. Memory per token: [docs/serve/ENGINE.md](serve/ENGINE.md#context-length). |
 | `--prompt-cache N` | `2` | Checkpoints of earlier prompts kept for multi-turn reuse; `0` turns the cache off. |
+| `--draft mtp\|none` | `mtp` | MTP speculative decoding (when the GGUF has the MTP layer). Output is the same either way; `none` is for comparisons. |
 | `--preload ID` | the first `--model` | The model loaded at start. |
 | `--unload-after SECONDS` | `0` (never) | Unload a model that has been idle this long, freeing its device and pinned memory; the next request loads it again. |
 

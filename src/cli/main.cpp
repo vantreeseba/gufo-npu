@@ -86,6 +86,7 @@ constexpr char kUsage[] =
     "        [--device npu|cpu] [--kernels DIR] [--model-id NAME]\n"
     "        [--max-queue N] [--api-key KEY] [--context-length N]\n"
     "        [--prompt-cache N] [--preload ID] [--unload-after SECONDS]\n"
+    "        [--draft mtp|none]\n"
     "                           OpenAI-compatible server (docs/SERVING.md),\n"
     "                           by default on 127.0.0.1:8080; --prompt-cache\n"
     "                           keeps N checkpoints of earlier prompts for\n"
@@ -1038,6 +1039,13 @@ int Serve(const std::vector<std::string_view>& args) {
       engine_options.prompt_cache = std::atoi(std::string(args[++i]).c_str());
     } else if (args[i] == "--api-key" && has_value) {
       server_options.api_key = std::string(args[++i]);
+    } else if (args[i] == "--draft" && has_value) {
+      const std::string_view draft = args[++i];
+      if (draft != "mtp" && draft != "none") {
+        std::cerr << kUsage;
+        return 2;
+      }
+      server_options.draft = draft == "mtp";
     } else {
       std::cerr << kUsage;
       return 2;

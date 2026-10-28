@@ -310,6 +310,7 @@ struct Server::Impl {
     gen.max_tokens = std::min(max_tokens.value_or(room), room);
     gen.sampling = sampling;
     gen.stop_ids = StopIds(engine);
+    gen.draft = options.draft;
     return gen;
   }
 

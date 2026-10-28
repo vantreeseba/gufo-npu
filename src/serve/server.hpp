@@ -18,6 +18,7 @@ struct ServerOptions {
   int port = 8080;      // 0: any free port (tests)
   int max_queue = 8;    // requests waiting behind the running one; then 429
   std::string api_key;  // when set, /v1/* needs "Authorization: Bearer KEY"
+  bool draft = true;    // MTP speculation when the model can (same output)
 };
 
 class Server {
