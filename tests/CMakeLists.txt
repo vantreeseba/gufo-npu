@@ -97,3 +97,4 @@ target_link_libraries(chat_format_test PRIVATE gufo_npu_serve_chat
 add_test(NAME chat_format_test
          COMMAND chat_format_test "${CMAKE_CURRENT_SOURCE_DIR}/serve/fixtures")
 set_tests_properties(chat_format_test PROPERTIES LABELS serve)
+add_subdirectory(serve)

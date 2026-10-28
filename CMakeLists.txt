@@ -130,6 +130,8 @@ endif()
 # Per-model packages: their own NPU programs and host wiring.
 add_subdirectory(src/models/qwen35_4b)
 add_subdirectory(src/models/qwen36_35b_a3b)
+# The OpenAI-compatible server's model side (src/serve).
+add_subdirectory(src/serve)
 
 # OpenAI-compatible server (docs/SERVING.md): HTTP, OpenAI JSON, queue and
 # metrics over the Engine and ChatFormat interfaces. CPU-only.
@@ -142,15 +144,11 @@ add_library(gufo_npu_serve STATIC
 )
 target_link_libraries(gufo_npu_serve PUBLIC gufo_npu_core nlohmann_json
                       PRIVATE cpp_httplib)
-# TEMPORARY (remove at integration): a placeholder for LoadEngine until the
-# engine part lands.
-add_library(gufo_npu_serve_stubs STATIC src/serve/engine_stub.cpp)
-target_link_libraries(gufo_npu_serve_stubs PUBLIC gufo_npu_serve)
 
 add_executable(gufo-npu src/cli/main.cpp)
 target_link_libraries(gufo-npu PRIVATE gufo_npu_qwen35_npu gufo_npu_qwen35_4b
-                      gufo_npu_qwen36_35b_a3b gufo_npu_serve_chat
-                      gufo_npu_serve_stubs)
+                      gufo_npu_qwen36_35b_a3b gufo_npu_serve
+                      gufo_npu_serve_chat gufo_npu_serve_engine)
 install(TARGETS gufo-npu RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 if(BUILD_TESTING)

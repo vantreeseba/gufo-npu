@@ -79,6 +79,9 @@ struct EngineOptions {
   std::string device = "npu";          // "npu" or "cpu" (the CPU reference)
   std::optional<std::string> kernels;  // kernel dir; default: installed
   std::string model_id;                // ModelInfo::id; default: from the GGUF
+  // Most prompt + generated tokens per request; 0: kDefaultContextLength,
+  // capped by the GGUF's trained context length (model_registry.hpp).
+  int context_length = 0;
 };
 
 // Loads the GGUF's model on the device, picking the model package by
