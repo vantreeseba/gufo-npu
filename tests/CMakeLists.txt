@@ -37,6 +37,10 @@ target_link_libraries(thread_pool_test PRIVATE gufo_npu_core)
 add_test(NAME thread_pool_test COMMAND thread_pool_test)
 set_tests_properties(thread_pool_test PROPERTIES TIMEOUT 300)
 
+add_executable(sampling_test core/sampling_test.cpp)
+target_link_libraries(sampling_test PRIVATE gufo_npu_core)
+add_test(NAME sampling_test COMMAND sampling_test)
+
 add_executable(simd_test core/simd_test.cpp)
 target_link_libraries(simd_test PRIVATE gufo_npu_core)
 # The vector paths, as the prefill builds them.

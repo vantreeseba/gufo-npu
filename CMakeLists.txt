@@ -47,6 +47,7 @@ add_library(gufo_npu_core STATIC
   src/core/gguf.cpp
   src/core/q4nx.cpp
   src/core/quant.cpp
+  src/core/sampling.cpp
   src/core/tokenizer.cpp
 )
 target_link_libraries(gufo_npu_core PUBLIC ICU::uc ICU::i18n)
@@ -75,6 +76,10 @@ set_source_files_properties(src/models/qwen35/decoder.cpp
   COMPILE_OPTIONS "-march=x86-64-v3;-O3")
 # The q4nx packer's fit vectorizes too; no fused multiply-adds, so Unpack and
 # Gemv round exactly as written (tests compare unpacked weights bit for bit).
+# Sampling weighs the whole vocabulary once per token; its exp loop
+# vectorizes once compares may not trap (nothing here reads FP exceptions).
+set_source_files_properties(src/core/sampling.cpp PROPERTIES
+  COMPILE_OPTIONS "-march=x86-64-v3;-O3;-fno-trapping-math")
 set_source_files_properties(src/core/q4nx.cpp PROPERTIES
   COMPILE_OPTIONS "-march=x86-64-v3;-O3;-ffp-contract=off")
 
