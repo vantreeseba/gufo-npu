@@ -43,6 +43,17 @@ struct ChatRequest {
   std::vector<std::string> stop;
   bool stream = false;
   bool include_usage = false;  // stream_options.include_usage
+
+  // Structured output (response_format): constrained to a JSON object or
+  // to JSON matching a schema.
+  enum class Format { kText, kJsonObject, kJsonSchema };
+  Format format = Format::kText;
+  nlohmann::ordered_json json_schema;  // kJsonSchema
+  bool json_strict = false;            // json_schema.strict
+  // tool_choice "required", or a named function (tool_name): the reply is
+  // constrained to tool calls.
+  bool tool_required = false;
+  std::string tool_name;
 };
 
 // Reads a /v1/chat/completions body, parsed as ordered JSON so messages

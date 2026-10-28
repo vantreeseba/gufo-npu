@@ -1,5 +1,6 @@
 #include "serve/openai.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -144,9 +145,39 @@ ChatRequest ParseChatRequest(const json& body) {
   if (const json* choice = Field(body, "tool_choice")) {
     if (*choice == "none") {
       req.prompt.tools = json::array();
+    } else if (*choice == "required") {
+      if (req.prompt.tools.empty()) {
+        throw InvalidRequest("tool_choice \"required\" needs tools",
+                             "tool_choice");
+      }
+      req.tool_required = true;
+    } else if (choice->is_object()) {
+      const json* fn = Field(*choice, "function");
+      if (choice->value("type", "") != "function" || fn == nullptr ||
+          !fn->is_object() || !fn->contains("name") ||
+          !(*fn)["name"].is_string()) {
+        throw InvalidRequest(
+            "tool_choice must be \"auto\", \"none\", \"required\" or "
+            "{\"type\": \"function\", \"function\": {\"name\": ...}}",
+            "tool_choice");
+      }
+      req.tool_name = (*fn)["name"].get<std::string>();
+      const bool known =
+          std::any_of(req.prompt.tools.begin(), req.prompt.tools.end(),
+                      [&](const json& tool) {
+                        return tool["function"]["name"] == req.tool_name;
+                      });
+      if (!known) {
+        throw InvalidRequest(
+            "tool_choice names \"" + req.tool_name + "\", which is not in tools",
+            "tool_choice");
+      }
+      req.tool_required = true;
     } else if (*choice != "auto") {
-      throw Unsupported("tool_choice supports \"auto\" and \"none\"",
-                        "tool_choice");
+      throw InvalidRequest(
+          "tool_choice must be \"auto\", \"none\", \"required\" or a "
+          "function",
+          "tool_choice");
     }
   }
   req.prompt.thinking = Thinking(body);
@@ -159,9 +190,27 @@ ChatRequest ParseChatRequest(const json& body) {
     throw Unsupported("logprobs are not supported", "logprobs");
   }
   if (const json* format = Field(body, "response_format")) {
-    if (!format->is_object() || format->value("type", "") != "text") {
-      throw Unsupported("response_format supports only {\"type\": \"text\"}",
-                        "response_format");
+    const std::string type =
+        format->is_object() ? format->value("type", "") : "";
+    if (type == "json_object") {
+      req.format = ChatRequest::Format::kJsonObject;
+    } else if (type == "json_schema") {
+      const json* spec = Field(*format, "json_schema");
+      const json* schema =
+          spec != nullptr && spec->is_object() ? Field(*spec, "schema") : nullptr;
+      if (schema == nullptr || !(schema->is_object() || schema->is_boolean())) {
+        throw InvalidRequest(
+            "response_format json_schema needs {\"json_schema\": "
+            "{\"name\": ..., \"schema\": {...}}}",
+            "response_format");
+      }
+      req.format = ChatRequest::Format::kJsonSchema;
+      req.json_schema = *schema;
+      req.json_strict = Bool(*spec, "strict").value_or(false);
+    } else if (type != "text") {
+      throw Unsupported(
+          "response_format type must be text, json_object or json_schema",
+          "response_format");
     }
   }
 
