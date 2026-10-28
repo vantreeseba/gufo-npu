@@ -70,20 +70,22 @@ struct MtpHead::Impl {
     output_norm = ToFloats(file.Tensor("output_norm.weight"));
     attn_norm = ToFloats(t("attn_norm.weight"));
     post_norm = ToFloats(t("post_attention_norm.weight"));
+    const q4nx::Fit fit = Q4nxFit(config);
     const auto& eh_t = t("nextn.eh_proj.weight");
-    eh_proj = q4nx::Pack(eh_t.type, eh_t.data, eh_t.Rows(), eh_t.RowElements());
+    eh_proj =
+        q4nx::Pack(eh_t.type, eh_t.data, eh_t.Rows(), eh_t.RowElements(), fit);
     in = q4nx::PackRows(
         {SegmentOf(t("attn_q.weight")), SegmentOf(t("attn_k.weight")),
          SegmentOf(t("attn_v.weight"))},
-        hidden);
+        hidden, fit);
     const auto& o_t = t("attn_output.weight");
-    out = q4nx::Pack(o_t.type, o_t.data, o_t.Rows(), o_t.RowElements());
+    out = q4nx::Pack(o_t.type, o_t.data, o_t.Rows(), o_t.RowElements(), fit);
     ffn_in = q4nx::PackRows(
         {SegmentOf(t("ffn_gate.weight")), SegmentOf(t("ffn_up.weight"))},
-        hidden);
+        hidden, fit);
     const auto& d_t = t("ffn_down.weight");
-    down = q4nx::Pack(d_t.type, d_t.data, d_t.Rows(), d_t.RowElements());
-    lm_head = q4nx::Pack(embed->type, embed->data, embed->Rows(), hidden);
+    down = q4nx::Pack(d_t.type, d_t.data, d_t.Rows(), d_t.RowElements(), fit);
+    lm_head = q4nx::Pack(embed->type, embed->data, embed->Rows(), hidden, fit);
 
     eh.resize(2 * hidden);
     x.resize(hidden);

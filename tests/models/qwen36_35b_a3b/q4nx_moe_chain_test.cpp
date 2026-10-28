@@ -65,7 +65,7 @@ int main(int argc, char** argv) {
     for (auto& v : w) {
       v = weight(rng);
     }
-    return q4nx::PackFloat(w.data(), rows, dim);
+    return q4nx::PackFloat(w.data(), rows, dim, q4nx::Fit::kSearch);
   };
   const std::size_t hidden = npu::kGemvHidden;
   // DeltaNet input (qkv + z) and output projections of Qwen3.6-35B-A3B.
@@ -86,11 +86,11 @@ int main(int argc, char** argv) {
     for (std::size_t i = 0; i < w.size(); ++i) {
       bits[i] = quant::FloatToBf16(w[i]);
     }
-    const auto up =
-        q4nx::PackRows({{gufo_npu::gguf::GgmlType::kBF16,
-                         reinterpret_cast<const std::uint8_t*>(bits.data()),
-                         2 * npu::kExpertFfn}},
-                       hidden, q4nx::SwiGluOrder(npu::kExpertFfn));
+    const auto up = q4nx::PackRows(
+        {{gufo_npu::gguf::GgmlType::kBF16,
+          reinterpret_cast<const std::uint8_t*>(bits.data()),
+          2 * npu::kExpertFfn}},
+        hidden, q4nx::Fit::kSearch, q4nx::SwiGluOrder(npu::kExpertFfn));
     const auto down = matrix(hidden, npu::kExpertFfn);
     std::memcpy(arena_buf.as<std::uint8_t>() + arena.UpOffset(e),
                 up.bytes.data(), up.bytes.size());

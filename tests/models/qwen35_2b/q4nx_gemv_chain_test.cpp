@@ -52,7 +52,7 @@ int main(int argc, char** argv) {
       v = weight(rng);
     }
     if (!swiglu) {
-      return q4nx::PackFloat(w.data(), rows, dim);
+      return q4nx::PackFloat(w.data(), rows, dim, q4nx::Fit::kMinMax);
     }
     std::vector<std::uint16_t> bits(w.size());
     for (std::size_t i = 0; i < w.size(); ++i) {
@@ -61,7 +61,7 @@ int main(int argc, char** argv) {
     return q4nx::PackRows(
         {{gufo_npu::gguf::GgmlType::kBF16,
           reinterpret_cast<const std::uint8_t*>(bits.data()), rows}},
-        dim, q4nx::SwiGluOrder(rows / 2));
+        dim, q4nx::Fit::kMinMax, q4nx::SwiGluOrder(rows / 2));
   };
   npu::Q4nxGemv in(rt, matrix(8192, 2048, false), Prologue::kResNorm,
                    Epilogue::kStore);

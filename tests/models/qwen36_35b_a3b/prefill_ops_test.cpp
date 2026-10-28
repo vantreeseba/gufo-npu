@@ -86,7 +86,7 @@ int main(int argc, char** argv) {
     for (auto& v : w) {
       v = weight(rng);
     }
-    const auto packed = q4nx::PackFloat(w.data(), n, k);
+    const auto packed = q4nx::PackFloat(w.data(), n, k, q4nx::Fit::kSearch);
     const auto wq = q4nx::Unpack(packed);  // the weights decode multiplies
 
     npu::Buffer qw(dequant, packed.bytes.size());

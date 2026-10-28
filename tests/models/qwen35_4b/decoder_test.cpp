@@ -14,6 +14,7 @@
 #include "core/gguf.hpp"
 #include "models/qwen35/q4nx_projections.hpp"
 #include "models/qwen35/reference.hpp"
+#include "models/qwen35_4b/npu_decoder.hpp"
 
 // The fast decode step against the reference, token by token, with the
 // same projections (q4nx weights on the CPU), so only the non-matrix math is
@@ -56,7 +57,8 @@ int main() {
     return 77;
   }
   const auto file = gufo_npu::gguf::File::Open(model);
-  const qwen35::Q4nxProjections projections(*file);
+  const qwen35::Q4nxProjections projections(*file,
+                                            gufo_npu::qwen35_4b::kQ4nxFit);
   const qwen35::Reference reference(*file);
   qwen35::Decoder decoder(*file, projections);
   const auto vocab = static_cast<std::size_t>(decoder.config().vocab);

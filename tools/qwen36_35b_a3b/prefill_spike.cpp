@@ -159,7 +159,7 @@ void Dense(const std::filesystem::path& dir, npu::HwContext& dq,
       {2048, 12288}, {2048, 9216}, {4096, 2048}};
   for (const auto& [k, n] : shapes) {
     const auto w = RandomMatrix(rng, n * k, 0.02f);
-    const auto packed = q4nx::PackFloat(w.data(), n, k);
+    const auto packed = q4nx::PackFloat(w.data(), n, k, q4nx::Fit::kSearch);
     const auto wq = q4nx::Unpack(packed);
     xrt::bo qw = dq.Buffer(packed.bytes.size());
     Upload(qw, packed.bytes.data(), packed.bytes.size());
@@ -236,7 +236,7 @@ void Switches(const std::filesystem::path& dir, npu::HwContext& dq,
   std::printf("\n== hardware context switches ==\n");
   const std::size_t k = 512, n = 2048, m = 256;
   const auto w = RandomMatrix(rng, n * k, 0.02f);
-  const auto packed = q4nx::PackFloat(w.data(), n, k);
+  const auto packed = q4nx::PackFloat(w.data(), n, k, q4nx::Fit::kSearch);
   xrt::bo qw = dq.Buffer(packed.bytes.size());
   Upload(qw, packed.bytes.data(), packed.bytes.size());
   xrt::bo b = dq.Buffer(BfpBytes(k, n));
@@ -329,10 +329,10 @@ void Experts(const std::filesystem::path& dir, npu::HwContext& dq,
   std::vector<q4nx::Matrix> up_t, down_t;
   for (int t = 0; t < ExpertLayer::kTemplates; ++t) {
     const auto wu = RandomMatrix(rng, ExpertLayer::kUpRows * kHidden, 0.02f);
-    up_t.push_back(q4nx::PackFloat(wu.data(), ExpertLayer::kUpRows, kHidden));
+    up_t.push_back(q4nx::PackFloat(wu.data(), ExpertLayer::kUpRows, kHidden, q4nx::Fit::kSearch));
     L.up_w.push_back(q4nx::Unpack(up_t.back()));
     const auto wd = RandomMatrix(rng, kHidden * kFfn, 0.02f);
-    down_t.push_back(q4nx::PackFloat(wd.data(), kHidden, kFfn));
+    down_t.push_back(q4nx::PackFloat(wd.data(), kHidden, kFfn, q4nx::Fit::kSearch));
     L.down_w.push_back(q4nx::Unpack(down_t.back()));
   }
   L.up_q = up_t[0].bytes.size();
