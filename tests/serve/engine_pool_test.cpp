@@ -122,8 +122,7 @@ bool Throws(F f) {
 }
 
 void Construction() {
-  Check(Throws([] { EnginePool pool({}, Probe, Load); }),
-        "empty pool refused");
+  Check(Throws([] { EnginePool pool({}, Probe, Load); }), "empty pool refused");
   Check(Throws([] { EnginePool pool(Models({"a", "a"}), Probe, Load); }),
         "duplicate ids refused");
   Check(Throws([] {
@@ -165,9 +164,9 @@ void Switching() {
   Check(unloads == 6, "unloads " + std::to_string(unloads));
   Check(s.models[0].id == "a" && s.models[0].loads == 2, "a loaded twice");
   const std::string metrics = pool.RenderMetrics();
-  Check(metrics.find("gufo_npu_model_loaded{model=\"b\"} 1") !=
-            std::string::npos,
-        "metrics: b loaded");
+  Check(
+      metrics.find("gufo_npu_model_loaded{model=\"b\"} 1") != std::string::npos,
+      "metrics: b loaded");
   Check(metrics.find("gufo_npu_model_loads_total{model=\"a\"} 2") !=
             std::string::npos,
         "metrics: a loads");
@@ -246,8 +245,8 @@ Reply Chat(const Running& s, const json& model) {
   if (!model.is_null()) {
     body["model"] = model;
   }
-  auto res = s.Client().Post("/v1/chat/completions", body.dump(),
-                             "application/json");
+  auto res =
+      s.Client().Post("/v1/chat/completions", body.dump(), "application/json");
   if (!res) {
     return {};
   }
@@ -287,15 +286,13 @@ void Http() {
   Check(s.Client().Get("/v1/models/z")->status == 404, "/v1/models/z 404");
 
   auto r = Chat(s, "b");
-  Check(r.status == 200 && r.body["model"] == "b" &&
-            Content(r) == "from-b",
+  Check(r.status == 200 && r.body["model"] == "b" && Content(r) == "from-b",
         "chat with b: " + r.body.dump());
   Check(Get(s, "/health")["model"] == "b", "/health: b loaded");
   Check(Get(s, "/health")["loading"].is_null(), "/health: no load running");
 
   r = Chat(s, json());
-  Check(r.status == 200 && r.body["model"] == "b",
-        "no model: the loaded one");
+  Check(r.status == 200 && r.body["model"] == "b", "no model: the loaded one");
   r = Chat(s, "zzz");
   Check(r.status == 404 && r.body["error"]["code"] == "model_not_found" &&
             r.body["error"]["param"] == "model",
@@ -306,9 +303,9 @@ void Http() {
   r = Chat(s, "c");
   Check(r.status == 200 && Content(r) == "from-c", "chat with c");
   const std::string metrics = Get(s, "/metrics").get<std::string>();
-  Check(metrics.find("gufo_npu_model_loaded{model=\"c\"} 1") !=
-            std::string::npos,
-        "/metrics: c loaded");
+  Check(
+      metrics.find("gufo_npu_model_loaded{model=\"c\"} 1") != std::string::npos,
+      "/metrics: c loaded");
   Check(metrics.find("gufo_npu_model_loads_total{model=\"b\"} 1") !=
             std::string::npos,
         "/metrics: b loads");
@@ -332,8 +329,9 @@ void Fifo() {
   std::vector<std::thread> clients;
   std::vector<Reply> replies(4);
   for (int i = 0; i < 4; ++i) {
-    clients.emplace_back(
-        [&, i] { replies[static_cast<std::size_t>(i)] = Chat(s, sequence[i]); });
+    clients.emplace_back([&, i] {
+      replies[static_cast<std::size_t>(i)] = Chat(s, sequence[i]);
+    });
     std::this_thread::sleep_for(60ms);  // arrive in order
   }
   for (auto& t : clients) {
@@ -360,8 +358,7 @@ void SingleModelPool() {
   pool.Preload();
   Running s(pool, format);
   const auto r = Chat(s, "gpt-4o");
-  Check(r.status == 200 && r.body["model"] == "a",
-        "one model: any name is it");
+  Check(r.status == 200 && r.body["model"] == "a", "one model: any name is it");
 }
 
 }  // namespace

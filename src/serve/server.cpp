@@ -148,16 +148,15 @@ struct Server::Impl {
           }
           res.set_content(Dump(health), "application/json");
         });
-    http.Get("/v1/models",
-             [this](const httplib::Request&, httplib::Response& res) {
-               json data = json::array();
-               for (Engine* engine : Engines()) {
-                 data.push_back(Model(*engine));
-               }
-               res.set_content(
-                   Dump({{"object", "list"}, {"data", std::move(data)}}),
-                   "application/json");
-             });
+    http.Get(
+        "/v1/models", [this](const httplib::Request&, httplib::Response& res) {
+          json data = json::array();
+          for (Engine* engine : Engines()) {
+            data.push_back(Model(*engine));
+          }
+          res.set_content(Dump({{"object", "list"}, {"data", std::move(data)}}),
+                          "application/json");
+        });
     http.Get(R"(/v1/models/(.+))", [this](const httplib::Request& req,
                                           httplib::Response& res) {
       Engine* engine = FindModel(req.matches[1]);
@@ -168,15 +167,15 @@ struct Server::Impl {
       }
       res.set_content(Dump(Model(*engine)), "application/json");
     });
-    http.Get("/metrics", [this](const httplib::Request&,
-                                httplib::Response& res) {
-      std::string text =
-          metrics.Render(scheduler.waiting(), scheduler.running());
-      if (pool) {
-        text += pool->RenderMetrics();
-      }
-      res.set_content(text, "text/plain; version=0.0.4");
-    });
+    http.Get("/metrics",
+             [this](const httplib::Request&, httplib::Response& res) {
+               std::string text =
+                   metrics.Render(scheduler.waiting(), scheduler.running());
+               if (pool) {
+                 text += pool->RenderMetrics();
+               }
+               res.set_content(text, "text/plain; version=0.0.4");
+             });
     http.Post("/v1/chat/completions",
               [this](const httplib::Request& req, httplib::Response& res) {
                 Chat(req, res);
@@ -502,8 +501,8 @@ struct Server::Impl {
     res.set_content(Dump(body), "application/json");
   }
 
-  Engine* single;     // one model, or
-  EnginePool* pool;   // several
+  Engine* single;    // one model, or
+  EnginePool* pool;  // several
   const ChatFormat& format;
   ServerOptions options;
   httplib::Server http;
@@ -518,8 +517,8 @@ Server::Server(Engine& engine, const ChatFormat& format, ServerOptions options)
 
 Server::Server(EnginePool& pool, const ChatFormat& format,
                ServerOptions options)
-    : impl_(std::make_unique<Impl>(nullptr, &pool, format,
-                                   std::move(options))) {}
+    : impl_(
+          std::make_unique<Impl>(nullptr, &pool, format, std::move(options))) {}
 
 Server::~Server() = default;
 

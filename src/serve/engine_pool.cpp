@@ -200,12 +200,11 @@ void EnginePool::UnloadLocked() {
 }
 
 void EnginePool::IdleLoop() {
-  const auto idle =
-      std::chrono::duration_cast<Clock::duration>(
-          std::chrono::duration<double>(options_.unload_after_seconds));
+  const auto idle = std::chrono::duration_cast<Clock::duration>(
+      std::chrono::duration<double>(options_.unload_after_seconds));
   // Check often enough that an idle model goes within ~10% of the limit.
-  const auto poll = std::max<Clock::duration>(
-      idle / 10, std::chrono::milliseconds(10));
+  const auto poll =
+      std::max<Clock::duration>(idle / 10, std::chrono::milliseconds(10));
   std::unique_lock wait_lock(idle_mutex_);
   while (!stopping_) {
     idle_wake_.wait_for(wait_lock, poll);

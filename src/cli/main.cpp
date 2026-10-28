@@ -1099,8 +1099,7 @@ int Serve(const std::vector<std::string_view>& args) {
     } else {
       engine_options.model_path = model_paths.front();
       engine = serve::LoadEngine(engine_options);
-      std::fprintf(stderr, "[loaded %s in %.1f s]\n",
-                   engine->info().id.c_str(),
+      std::fprintf(stderr, "[loaded %s in %.1f s]\n", engine->info().id.c_str(),
                    std::chrono::duration<double>(
                        std::chrono::steady_clock::now() - load_start)
                        .count());
