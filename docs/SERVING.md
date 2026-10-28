@@ -62,14 +62,14 @@ Request fields:
 |---|---|
 | `messages` | `system`, `user`, `assistant` and `tool` messages, rendered with the model's chat template. A final `assistant` message is continued (prefill). |
 | `model` | Accepted and ignored: the server runs one model, and replies carry its id. |
-| `tools`, `tool_choice` | Function tools. `tool_choice` may be `"auto"` (default) or `"none"`; `"required"` and named functions are refused. |
+| `tools`, `tool_choice` | Function tools. `tool_choice` may be `"auto"` (default), `"none"`, `"required"` (the reply is one or more tool calls) or `{"type": "function", "function": {"name": ...}}` (calls to that function). Forced calls are constrained token by token; see [Structured outputs](#structured-outputs). |
 | `max_completion_tokens`, `max_tokens` | Most generated tokens (the first wins). Default and ceiling: the rest of the context. |
 | `temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `seed` | Sampling. `temperature` 0 (the default) is greedy decoding. |
 | `stop` | Up to 16 strings. Matched in the generated text, also across tokens; the stop string itself is never sent. |
 | `stream`, `stream_options.include_usage` | Streaming, and a final usage chunk. |
 | `chat_template_kwargs.enable_thinking`, `reasoning_effort` | Thinking (a think block before the answer, returned as `reasoning_content`). Off by default. `reasoning_effort` `none` or `minimal` turns it off, `low`, `medium` or `high` on; `enable_thinking` wins when both are set. |
 | `n` | Only 1. |
-| `response_format` | Only `{"type": "text"}`. |
+| `response_format` | `{"type": "text"}` (default), `{"type": "json_object"}` (any JSON object) or `{"type": "json_schema", "json_schema": {"name", "schema", "strict"}}` (JSON matching the schema). See [Structured outputs](#structured-outputs). |
 | `logprobs`, `top_logprobs` | Not supported (400). |
 
 Other fields (`user`, `metadata`, `parallel_tool_calls`, ...) are ignored.
@@ -92,6 +92,45 @@ Streaming sends `chat.completion.chunk` events: first `{"role":
 delta with its `index`), then an empty delta with `finish_reason`, the usage
 chunk if asked for, and `data: [DONE]`. Text is sent in whole UTF-8
 characters.
+
+### Structured outputs
+
+`response_format` json_object / json_schema and a forced `tool_choice`
+constrain sampling: before each token, the tokens that cannot continue a
+valid reply are masked out (their logits count as -inf, before penalties,
+temperature and the filters), so the reply always parses unless it is cut
+off by `max_tokens` (`finish_reason: "length"`).
+
+- **JSON schema keywords enforced:** `type` (one or a list), `properties`,
+  `required`, `additionalProperties` (boolean or a schema), `items`,
+  `minItems`, `maxItems`, `minLength`, `maxLength` (characters), `enum`,
+  `const`, `anyOf`, `oneOf` (as anyOf), `allOf` with one schema, and `$ref`
+  to `#`, `#/$defs/...` or `#/definitions/...` (recursion included). Not
+  enforced: `pattern`, `format`, `minimum`/`maximum`, `multipleOf`,
+  `uniqueItems` and other keywords; they are accepted and ignored. With
+  `strict: true`, an object without `additionalProperties` allows no other
+  keys (OpenAI's strict mode); without it, other keys are allowed, as JSON
+  Schema says. A schema the server cannot compile (an unresolved `$ref`, an
+  empty `enum`, an unknown type, more than 128 properties or enum values)
+  is a 400 with `param: "response_format"`.
+- **Forced tool calls** follow the model's tool-call markup
+  (`<tool_call>\n<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>\n
+  ...</function>\n</tool_call>`): only the allowed function names, only
+  declared parameters (any, when a function declares none), every required
+  parameter before `</function>`. A string parameter is free text (it may
+  not contain `</parameter>` or `</tool_call>`), a string enum one of its
+  values, other types JSON matching their schema. More calls may follow,
+  separated by a newline.
+- **Thinking:** with thinking on, the think block is free text; the
+  constraint applies after `</think>`.
+- **MTP drafts** stay exact: a draft is kept only when the masked sample
+  equals it, so a draft the grammar refuses is never kept.
+- **Cost:** the mask is found by walking a trie of the vocabulary's bytes
+  from the grammar's state; inside strings and free text only the tokens
+  that could end them are walked. `serve_structured_test` prints the cost
+  per token on a 248k-token vocabulary. JSON whitespace is limited to 48
+  bytes in a row, numbers to 24 digits and nesting to 32 levels, so a
+  constrained reply cannot run on in whitespace or digits.
 
 ### `GET /v1/models`, `GET /v1/models/{id}`
 
@@ -223,8 +262,7 @@ client (`pip install openai httpx`). Each takes `--base-url` (default
 ## Not supported yet
 
 - More than one model per process, or switching models per request.
-- `n > 1`, log probabilities, JSON mode and structured outputs, forced tool
-  calls (`tool_choice: "required"` or a named function).
+- `n > 1`, log probabilities.
 - Images and audio.
 - The legacy `/v1/completions` and the `/v1/responses` APIs; embeddings.
 - TLS (put a reverse proxy in front for that) and CORS headers.
