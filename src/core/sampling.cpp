@@ -289,8 +289,8 @@ int Sampler::Sample(const float* logits, int vocab) {
     // Greedy: the best token when the constraint allows it (one check),
     // otherwise the best allowed one.
     if (params_.greedy() && (!HasPenalties() || counts_.empty())) {
-      const int best = static_cast<int>(
-          std::max_element(logits, logits + vocab) - logits);
+      const int best =
+          static_cast<int>(std::max_element(logits, logits + vocab) - logits);
       if (params_.constraint->IsAllowed(best)) {
         return best;
       }

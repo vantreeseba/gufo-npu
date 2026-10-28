@@ -77,15 +77,59 @@ struct Toy {
     for (int c = 0x20; c < 0x7f; ++c) {
       Add(std::string(1, static_cast<char>(c)));
     }
-    for (const char* t :
-         {"\n", "\t", "  ", "\n  ", "\n    ", "{\"", "\":", "\": ", "\": \"",
-          "\",", "\", \"", "\"}", "\"]", "},", "}]", "true", "false", "null",
-          "name", "age", "tags", "city", "unit", "celsius", "fahrenheit",
-          "Paris", "123", "0.5", "-1", "e+", "1e3", "\\\"", "\\n", "\\u00e9",
-          "\xc3\xa9", "\xc3", "\xa9", "<function=", "<parameter=",
-          "</parameter>", "</function>", "\n</parameter>\n", "\n</parameter>",
-          "get_weather", "get_time", "zone", "days", ">\n", "\n<", "hello",
-          " world", "ok\"", "\"\n"}) {
+    for (const char* t : {"\n",
+                          "\t",
+                          "  ",
+                          "\n  ",
+                          "\n    ",
+                          "{\"",
+                          "\":",
+                          "\": ",
+                          "\": \"",
+                          "\",",
+                          "\", \"",
+                          "\"}",
+                          "\"]",
+                          "},",
+                          "}]",
+                          "true",
+                          "false",
+                          "null",
+                          "name",
+                          "age",
+                          "tags",
+                          "city",
+                          "unit",
+                          "celsius",
+                          "fahrenheit",
+                          "Paris",
+                          "123",
+                          "0.5",
+                          "-1",
+                          "e+",
+                          "1e3",
+                          "\\\"",
+                          "\\n",
+                          "\\u00e9",
+                          "\xc3\xa9",
+                          "\xc3",
+                          "\xa9",
+                          "<function=",
+                          "<parameter=",
+                          "</parameter>",
+                          "</function>",
+                          "\n</parameter>\n",
+                          "\n</parameter>",
+                          "get_weather",
+                          "get_time",
+                          "zone",
+                          "days",
+                          ">\n",
+                          "\n<",
+                          "hello",
+                          " world",
+                          "ok\"",
+                          "\"\n"}) {
       Add(t);
     }
     Add("");  // padding: never allowed
@@ -121,8 +165,8 @@ bool MaskMatches(TokenConstraint& c, int vocab, std::string* why) {
     if ((mask[static_cast<std::size_t>(id)] != 0) != one) {
       *why = "token " + std::to_string(id) + " \"" +
              toy().bytes[static_cast<std::size_t>(id)] + "\": mask " +
-             std::to_string(mask[static_cast<std::size_t>(id)]) +
-             ", single " + std::to_string(one);
+             std::to_string(mask[static_cast<std::size_t>(id)]) + ", single " +
+             std::to_string(one);
       return false;
     }
   }
@@ -198,8 +242,8 @@ const json& Resolve(const json& s, const json& root) {
       return root;
     }
     const auto slash = ref.rfind('/');
-    const std::string defs = ref.starts_with("#/$defs/") ? "$defs"
-                                                         : "definitions";
+    const std::string defs =
+        ref.starts_with("#/$defs/") ? "$defs" : "definitions";
     return Resolve(root[defs][ref.substr(slash + 1)], root);
   }
   return s;
@@ -353,39 +397,40 @@ void Schemas() {
                {"required", {"name", "age"}},
                {"additionalProperties", false}},
               true);
-  SchemaWalks("non-strict object takes other keys",
-              {{"type", "object"},
-               {"properties", {{"city", {{"type", "string"}}}}}},
-              false, 20);
-  SchemaWalks("additionalProperties schema",
-              {{"type", "object"},
-               {"additionalProperties", {{"type", "boolean"}}}},
-              false, 20);
-  SchemaWalks("nested objects and arrays",
-              {{"type", "object"},
-               {"properties",
-                {{"unit",
-                  {{"type", "object"},
-                   {"properties", {{"days", {{"type", "number"}}}}},
-                   {"required", {"days"}},
-                   {"additionalProperties", false}}},
-                 {"tags",
-                  {{"type", "array"},
-                   {"minItems", 1},
-                   {"maxItems", 2},
-                   {"items",
-                    {{"type", "array"}, {"items", {{"type", "null"}}}}}}}}},
-               {"required", {"unit", "tags"}},
-               {"additionalProperties", false}},
-              true);
-  SchemaWalks("enum and const",
-              {{"type", "object"},
-               {"properties",
-                {{"unit", {{"enum", {"celsius", "fahrenheit", 1, 10, nullptr}}}},
-                 {"city", {{"const", "Paris"}}}}},
-               {"required", {"unit", "city"}},
-               {"additionalProperties", false}},
-              true);
+  SchemaWalks(
+      "non-strict object takes other keys",
+      {{"type", "object"}, {"properties", {{"city", {{"type", "string"}}}}}},
+      false, 20);
+  SchemaWalks(
+      "additionalProperties schema",
+      {{"type", "object"}, {"additionalProperties", {{"type", "boolean"}}}},
+      false, 20);
+  SchemaWalks(
+      "nested objects and arrays",
+      {{"type", "object"},
+       {"properties",
+        {{"unit",
+          {{"type", "object"},
+           {"properties", {{"days", {{"type", "number"}}}}},
+           {"required", {"days"}},
+           {"additionalProperties", false}}},
+         {"tags",
+          {{"type", "array"},
+           {"minItems", 1},
+           {"maxItems", 2},
+           {"items", {{"type", "array"}, {"items", {{"type", "null"}}}}}}}}},
+       {"required", {"unit", "tags"}},
+       {"additionalProperties", false}},
+      true);
+  SchemaWalks(
+      "enum and const",
+      {{"type", "object"},
+       {"properties",
+        {{"unit", {{"enum", {"celsius", "fahrenheit", 1, 10, nullptr}}}},
+         {"city", {{"const", "Paris"}}}}},
+       {"required", {"unit", "city"}},
+       {"additionalProperties", false}},
+      true);
   SchemaWalks("anyOf with the same first byte",
               {{"anyOf",
                 {{{"type", "object"},
@@ -397,14 +442,15 @@ void Schemas() {
                   {"required", {"age"}},
                   {"additionalProperties", false}}}}},
               true);
-  SchemaWalks("oneOf and type arrays",
-              {{"type", "object"},
-               {"properties",
-                {{"name", {{"type", {"string", "null"}}}},
-                 {"age", {{"oneOf", {{{"type", "integer"}}, {{"type", "boolean"}}}}}}}},
-               {"required", {"name", "age"}},
-               {"additionalProperties", false}},
-              true);
+  SchemaWalks(
+      "oneOf and type arrays",
+      {{"type", "object"},
+       {"properties",
+        {{"name", {{"type", {"string", "null"}}}},
+         {"age", {{"oneOf", {{{"type", "integer"}}, {{"type", "boolean"}}}}}}}},
+       {"required", {"name", "age"}},
+       {"additionalProperties", false}},
+      true);
   SchemaWalks("$ref and $defs, recursive",
               {{"$defs",
                 {{"node",
@@ -419,15 +465,16 @@ void Schemas() {
                    {"additionalProperties", false}}}}},
                {"$ref", "#/$defs/node"}},
               true);
-  SchemaWalks("string lengths and numbers",
-              {{"type", "object"},
-               {"properties",
-                {{"name", {{"type", "string"}, {"minLength", 2}, {"maxLength", 4}}},
-                 {"age", {{"type", "number"}}},
-                 {"days", {{"type", "integer"}}}}},
-               {"required", {"name", "age", "days"}},
-               {"additionalProperties", false}},
-              true);
+  SchemaWalks(
+      "string lengths and numbers",
+      {{"type", "object"},
+       {"properties",
+        {{"name", {{"type", "string"}, {"minLength", 2}, {"maxLength", 4}}},
+         {"age", {{"type", "number"}}},
+         {"days", {{"type", "integer"}}}}},
+       {"required", {"name", "age", "days"}},
+       {"additionalProperties", false}},
+      true);
   SchemaWalks("any value", json::object(), false, 30);
   SchemaWalks("top-level array",
               {{"type", "array"}, {"items", {{"type", "integer"}}}}, true);
@@ -436,8 +483,8 @@ void Schemas() {
 
   // json_object: any object.
   {
-    auto c = NewGrammarConstraint(JsonObjectGrammar(), ToyIndex(),
-                                  {toy().end}, false);
+    auto c = NewGrammarConstraint(JsonObjectGrammar(), ToyIndex(), {toy().end},
+                                  false);
     std::mt19937 rng(3);
     bool ok = true;
     for (int i = 0; i < 40 && ok; ++i) {
@@ -504,8 +551,8 @@ void Specifics() {
         "padding tokens are never allowed");
 
   // Thinking: free until </think>, then the grammar.
-  auto think = NewGrammarConstraint(JsonObjectGrammar(), ToyIndex(), {t.end},
-                                    true);
+  auto think =
+      NewGrammarConstraint(JsonObjectGrammar(), ToyIndex(), {t.end}, true);
   think->Reset();
   Check(allowed(*think, "x") && allowed(*think, "hello") &&
             !think->IsAllowed(t.end),
@@ -605,19 +652,18 @@ void Errors() {
         }),
         "error: unresolved $ref");
   Check(refused([] {
-          JsonSchemaGrammar(ordered_json{{"enum", ordered_json::array()}}, true);
+          JsonSchemaGrammar(ordered_json{{"enum", ordered_json::array()}},
+                            true);
         }),
         "error: empty enum");
+  Check(
+      refused([] { JsonSchemaGrammar(ordered_json{{"type", "date"}}, true); }),
+      "error: unknown type");
   Check(refused([] {
-          JsonSchemaGrammar(ordered_json{{"type", "date"}}, true);
-        }),
-        "error: unknown type");
-  Check(refused([] {
-          JsonSchemaGrammar(
-              ordered_json{{"type", "object"},
-                           {"properties", ordered_json::object()},
-                           {"required", {"x"}}},
-              true);
+          JsonSchemaGrammar(ordered_json{{"type", "object"},
+                                         {"properties", ordered_json::object()},
+                                         {"required", {"x"}}},
+                            true);
         }),
         "error: required names an undefined property");
   Check(refused([] {
@@ -628,9 +674,9 @@ void Errors() {
         }),
         "error: forced function not in tools");
   // A schema that refers to itself only cannot loop.
-  auto self = NewGrammarConstraint(
-      JsonSchemaGrammar(ordered_json{{"$ref", "#"}}, true), ToyIndex(),
-      {toy().end}, false);
+  auto self =
+      NewGrammarConstraint(JsonSchemaGrammar(ordered_json{{"$ref", "#"}}, true),
+                           ToyIndex(), {toy().end}, false);
   std::vector<std::uint8_t> mask;
   self->Allowed(static_cast<int>(toy().bytes.size()), mask);
   Check(true, "self-referencing schema: a mask without looping");
@@ -641,11 +687,10 @@ void Errors() {
 void SamplerAndDrafts() {
   const Toy& t = toy();
   const int vocab = static_cast<int>(t.bytes.size());
-  const ordered_json schema = {
-      {"type", "object"},
-      {"properties", {{"age", {{"type", "integer"}}}}},
-      {"required", {"age"}},
-      {"additionalProperties", false}};
+  const ordered_json schema = {{"type", "object"},
+                               {"properties", {{"age", {{"type", "integer"}}}}},
+                               {"required", {"age"}},
+                               {"additionalProperties", false}};
   SamplingParams p;
   p.constraint = NewGrammarConstraint(JsonSchemaGrammar(schema, true),
                                       ToyIndex(), {t.end}, false);
@@ -788,8 +833,7 @@ void ServerEndToEnd() {
   client.set_read_timeout(60, 0);
   const ordered_json messages = {{{"role", "user"}, {"content", "hi"}}};
   auto post = [&](const ordered_json& body) {
-    return client.Post("/v1/chat/completions", body.dump(),
-                       "application/json");
+    return client.Post("/v1/chat/completions", body.dump(), "application/json");
   };
 
   const json schema = {{"type", "object"},
@@ -842,10 +886,10 @@ void ServerEndToEnd() {
               {"max_tokens", 400},
               {"response_format", {{"type", "json_object"}}}});
   const json m2 = message(res);
-  const json object = m2.is_object() && m2["content"].is_string()
-                          ? json::parse(m2["content"].get<std::string>(),
-                                        nullptr, false)
-                          : json();
+  const json object =
+      m2.is_object() && m2["content"].is_string()
+          ? json::parse(m2["content"].get<std::string>(), nullptr, false)
+          : json();
   Check(res && res->status == 200 && object.is_object(),
         "server: json_object reply is an object");
 
@@ -855,11 +899,12 @@ void ServerEndToEnd() {
         "city": {"type": "string"}, "days": {"type": "integer"}},
        "required": ["city", "days"]}}},
     {"type": "function", "function": {"name": "get_time"}}])");
-  res = post({{"messages", messages},
-              {"max_tokens", 400},
-              {"tools", tools},
-              {"tool_choice",
-               {{"type", "function"}, {"function", {{"name", "get_weather"}}}}}});
+  res =
+      post({{"messages", messages},
+            {"max_tokens", 400},
+            {"tools", tools},
+            {"tool_choice",
+             {{"type", "function"}, {"function", {{"name", "get_weather"}}}}}});
   const json msg = message(res);
   const bool has_call = msg.is_object() && msg.contains("tool_calls") &&
                         msg["tool_calls"].is_array() &&
@@ -933,8 +978,8 @@ void Benchmark() {
   const double build =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
           .count();
-  std::printf("bench: vocabulary index for %d tokens built in %.0f ms\n",
-              vocab, build * 1e3);
+  std::printf("bench: vocabulary index for %d tokens built in %.0f ms\n", vocab,
+              build * 1e3);
 
   const ordered_json schema = {
       {"type", "object"},
@@ -989,23 +1034,23 @@ void Benchmark() {
     for (int i = 0; i < kIters; ++i) {
       k.c->Allowed(vocab, mask);
     }
-    const double ms = std::chrono::duration<double>(
-                          std::chrono::steady_clock::now() - start)
-                          .count() *
-                      1e3 / kIters;
+    const double ms =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+            .count() *
+        1e3 / kIters;
     const auto allowed = std::count(mask.begin(), mask.end(), 1);
-    std::printf("bench: mask %-20s %7.2f ms per token (%ld allowed)\n",
-                k.label, ms, static_cast<long>(allowed));
+    std::printf("bench: mask %-20s %7.2f ms per token (%ld allowed)\n", k.label,
+                ms, static_cast<long>(allowed));
     Check(ms < 250.0, std::string("bench: ") + k.label + " under 250 ms");
     int single = 0;
     const auto s0 = std::chrono::steady_clock::now();
     for (int id = 0; id < 2000; ++id) {
       single += k.c->IsAllowed(id) ? 1 : 0;
     }
-    const double us = std::chrono::duration<double>(
-                          std::chrono::steady_clock::now() - s0)
-                          .count() *
-                      1e6 / 2000;
+    const double us =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - s0)
+            .count() *
+        1e6 / 2000;
     std::printf("bench: one-token check %-20s %6.2f us\n", k.label, us);
   }
 }

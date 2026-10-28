@@ -255,8 +255,8 @@ struct Server::Impl {
         return nullptr;
       }
     } catch (const GrammarError& e) {
-      throw InvalidRequest(e.what(),
-                           chat.tool_required ? "tool_choice" : "response_format");
+      throw InvalidRequest(
+          e.what(), chat.tool_required ? "tool_choice" : "response_format");
     }
     return NewGrammarConstraint(std::move(grammar), Vocab(), stop_ids,
                                 chat.prompt.thinking);

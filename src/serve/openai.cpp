@@ -168,9 +168,9 @@ ChatRequest ParseChatRequest(const json& body) {
                         return tool["function"]["name"] == req.tool_name;
                       });
       if (!known) {
-        throw InvalidRequest(
-            "tool_choice names \"" + req.tool_name + "\", which is not in tools",
-            "tool_choice");
+        throw InvalidRequest("tool_choice names \"" + req.tool_name +
+                                 "\", which is not in tools",
+                             "tool_choice");
       }
       req.tool_required = true;
     } else if (*choice != "auto") {
@@ -196,8 +196,9 @@ ChatRequest ParseChatRequest(const json& body) {
       req.format = ChatRequest::Format::kJsonObject;
     } else if (type == "json_schema") {
       const json* spec = Field(*format, "json_schema");
-      const json* schema =
-          spec != nullptr && spec->is_object() ? Field(*spec, "schema") : nullptr;
+      const json* schema = spec != nullptr && spec->is_object()
+                               ? Field(*spec, "schema")
+                               : nullptr;
       if (schema == nullptr || !(schema->is_object() || schema->is_boolean())) {
         throw InvalidRequest(
             "response_format json_schema needs {\"json_schema\": "

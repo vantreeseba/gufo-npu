@@ -219,14 +219,13 @@ void Requests() {
                 .format == ChatRequest::Format::kJsonObject,
         "parse: json_object");
   {
-    const auto r = ParseChatRequest(
-        {{"messages", messages},
-         {"response_format",
-          {{"type", "json_schema"},
-           {"json_schema",
-            {{"name", "x"},
-             {"strict", true},
-             {"schema", {{"type", "object"}}}}}}}});
+    const auto r = ParseChatRequest({{"messages", messages},
+                                     {"response_format",
+                                      {{"type", "json_schema"},
+                                       {"json_schema",
+                                        {{"name", "x"},
+                                         {"strict", true},
+                                         {"schema", {{"type", "object"}}}}}}}});
     Check(r.format == ChatRequest::Format::kJsonSchema && r.json_strict &&
               r.json_schema == json{{"type", "object"}},
           "parse: json_schema");
@@ -235,10 +234,10 @@ void Requests() {
                  {"response_format", {{"type", "json_schema"}}}},
                 "response_format"),
         "reject: json_schema without a schema");
-  Check(Rejects({{"messages", messages},
-                 {"response_format", {{"type", "xml"}}}},
-                "response_format"),
-        "reject: response_format xml");
+  Check(
+      Rejects({{"messages", messages}, {"response_format", {{"type", "xml"}}}},
+              "response_format"),
+      "reject: response_format xml");
   Check(Rejects({{"messages", messages}, {"reasoning_effort", "max"}},
                 "reasoning_effort"),
         "reject: reasoning_effort max");

@@ -129,8 +129,10 @@ off by `max_tokens` (`finish_reason: "length"`).
   from the grammar's state; inside strings and free text only the tokens
   that could end them are walked. `serve_structured_test` prints the cost
   per token on a 248k-token vocabulary. JSON whitespace is limited to 48
-  bytes in a row, numbers to 24 digits and nesting to 32 levels, so a
-  constrained reply cannot run on in whitespace or digits.
+  bytes in a row, integers to 18 digits (they fit in 64 bits), other
+  numbers to 24 digits and a two-digit exponent, and nesting to 32 levels,
+  so a constrained reply cannot run on in whitespace or digits. Strings,
+  keys and raw parameter text are valid UTF-8.
 
 ### `GET /v1/models`, `GET /v1/models/{id}`
 

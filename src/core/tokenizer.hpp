@@ -44,8 +44,8 @@ private:
 
   struct Regex;
   std::unique_ptr<Regex> regex_;
-  std::vector<std::string> tokens_;  // byte-level encoded token strings
-  std::vector<std::string> bytes_;   // decoded UTF-8 bytes per token
+  std::vector<std::string> tokens_;    // byte-level encoded token strings
+  std::vector<std::string> bytes_;     // decoded UTF-8 bytes per token
   std::vector<std::uint8_t> special_;  // 1 for added tokens
   std::unordered_map<std::string, int> vocab_;
   std::unordered_map<std::string, int> merge_rank_;  // "left right" -> rank

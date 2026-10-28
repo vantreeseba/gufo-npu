@@ -32,8 +32,7 @@ public:
   // `bytes[id]`: the token's bytes (empty: never allowed); `special[id]`:
   // an added token such as "<tool_call>", allowed only where the grammar
   // spells out markup, never inside strings or free text.
-  VocabIndex(std::vector<std::string> bytes,
-             std::vector<std::uint8_t> special);
+  VocabIndex(std::vector<std::string> bytes, std::vector<std::uint8_t> special);
   ~VocabIndex();
   VocabIndex(const VocabIndex&) = delete;
   VocabIndex& operator=(const VocabIndex&) = delete;

@@ -13,13 +13,15 @@ namespace {
 using Json = nlohmann::ordered_json;
 
 constexpr int kNoMax = INT_MAX;
-constexpr int kMaxDepth = 32;    // nesting, root included
-constexpr int kMaxStacks = 16;   // parallel parses (anyOf)
-constexpr int kMaxWs = 48;       // structural whitespace bytes in a row
-constexpr int kMaxDigits = 24;   // digits in a number
-constexpr int kMaxKey = 256;     // bytes in an object key
-constexpr int kMaxMembers = 128; // properties, enum values, functions
-constexpr int kEnd = 256;        // end of output, not a byte
+constexpr int kMaxDepth = 32;      // nesting, root included
+constexpr int kMaxStacks = 16;     // parallel parses (anyOf)
+constexpr int kMaxWs = 48;         // structural whitespace bytes in a row
+constexpr int kMaxDigits = 24;     // digits before the exponent
+constexpr int kMaxIntDigits = 18;  // integers: always fit int64
+constexpr int kMaxExpDigits = 2;   // exponent digits: within a double
+constexpr int kMaxKey = 256;       // bytes in an object key
+constexpr int kMaxMembers = 128;   // properties, enum values, functions
+constexpr int kEnd = 256;          // end of output, not a byte
 
 // A set of up to 128 indices (properties, literals, functions).
 struct Mask {
@@ -46,14 +48,76 @@ struct Mask {
   }
 };
 
-bool IsWs(int c) { return c == ' ' || c == '\n' || c == '\t' || c == '\r'; }
-bool IsDigit(int c) { return c >= '0' && c <= '9'; }
+bool IsWs(int c) {
+  return c == ' ' || c == '\n' || c == '\t' || c == '\r';
+}
+bool IsDigit(int c) {
+  return c >= '0' && c <= '9';
+}
 bool IsHex(int c) {
   return IsDigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
 }
 // A byte that may follow '\\' in a JSON string.
 bool IsEscape(int c) {
   return c > 0 && c < 128 && std::strchr("\"\\/bfnrtu", c) != nullptr;
+}
+
+// UTF-8 validation one byte at a time (RFC 3629: no overlong forms, no
+// surrogates, nothing past U+10FFFF). `st` packs the continuation bytes
+// still due (bits 0-7) and the next byte's range (bits 8-15 and 16-23);
+// 0 between characters. False for a byte that cannot come next.
+bool Utf8Step(std::int32_t& st, int c) {
+  auto expect = [&](int count, int lo, int hi) {
+    st = count | (lo << 8) | (hi << 16);
+    return true;
+  };
+  const int due = st & 0xFF;
+  if (due > 0) {
+    if (c < ((st >> 8) & 0xFF) || c > ((st >> 16) & 0xFF)) {
+      return false;
+    }
+    if (due == 1) {
+      st = 0;
+      return true;
+    }
+    return expect(due - 1, 0x80, 0xBF);
+  }
+  if (c < 0x80) {
+    return true;
+  }
+  if (c >= 0xC2 && c <= 0xDF) {
+    return expect(1, 0x80, 0xBF);
+  }
+  if (c == 0xE0) {
+    return expect(2, 0xA0, 0xBF);
+  }
+  if (c == 0xED) {
+    return expect(2, 0x80, 0x9F);
+  }
+  if (c >= 0xE1 && c <= 0xEF) {
+    return expect(2, 0x80, 0xBF);
+  }
+  if (c == 0xF0) {
+    return expect(3, 0x90, 0xBF);
+  }
+  if (c >= 0xF1 && c <= 0xF3) {
+    return expect(3, 0x80, 0xBF);
+  }
+  if (c == 0xF4) {
+    return expect(3, 0x80, 0x8F);
+  }
+  return false;
+}
+
+// Whether `bytes` is whole, valid UTF-8.
+bool WholeUtf8(const std::string& bytes) {
+  std::int32_t st = 0;
+  for (const char ch : bytes) {
+    if (!Utf8Step(st, static_cast<unsigned char>(ch))) {
+      return false;
+    }
+  }
+  return st == 0;
 }
 
 }  // namespace
@@ -466,21 +530,19 @@ std::shared_ptr<const Grammar> ToolCallGrammar(const Json& tools,
     }
     Grammar::Function fn;
     fn.name = f["name"].get<std::string>();
-    if (fn.name.empty() ||
-        fn.name.find_first_of("<>\n") != std::string::npos) {
+    if (fn.name.empty() || fn.name.find_first_of("<>\n") != std::string::npos) {
       throw GrammarError("tool name \"" + fn.name +
                          "\" cannot be forced (empty, or holds <, > or a "
                          "newline)");
     }
     const Json params =
         f.contains("parameters") ? f["parameters"] : Json::object();
-    const auto props = params.is_object() ? params.find("properties")
-                                          : params.end();
+    const auto props =
+        params.is_object() ? params.find("properties") : params.end();
     if (params.is_object() && props != params.end() && props->is_object() &&
         !props->empty()) {
       if (props->size() > static_cast<std::size_t>(kMaxMembers)) {
-        throw GrammarError("tool " + fn.name +
-                           ": at most 128 parameters");
+        throw GrammarError("tool " + fn.name + ": at most 128 parameters");
       }
       for (const auto& [key, sub] : props->items()) {
         if (key.empty() || key.find_first_of("<>\n") != std::string::npos) {
@@ -496,8 +558,8 @@ std::shared_ptr<const Grammar> ToolCallGrammar(const Json& tools,
           if (!r.is_string()) {
             continue;
           }
-          const auto it =
-              std::find(fn.params.begin(), fn.params.end(), r.get<std::string>());
+          const auto it = std::find(fn.params.begin(), fn.params.end(),
+                                    r.get<std::string>());
           if (it != fn.params.end()) {
             fn.required.Set(static_cast<int>(it - fn.params.begin()));
           }
@@ -575,10 +637,14 @@ struct VocabIndex::Data {
   std::vector<std::uint8_t> special;
   std::vector<int> next_same;  // next token with the same bytes
   Trie all;                    // every ordinary token
-  Trie string_unsafe;          // tokens with '"', '\\' or a control byte
-  Trie with_newline;           // tokens with '\n'
-  std::vector<int> string_safe;   // the other ordinary tokens
-  std::vector<int> no_newline;    // the other ordinary tokens
+  // Inside a free string, tokens of whole UTF-8 without '"', '\\' or a
+  // control byte always fit (string_safe); the rest are walked.
+  Trie string_unsafe;
+  std::vector<int> string_safe;
+  // Inside raw text, tokens of whole UTF-8 without '\n' or '<' always fit
+  // (raw_safe): neither the end nor a forbidden tag can start in them.
+  Trie raw_unsafe;
+  std::vector<int> raw_safe;
   std::vector<int> specials;
 };
 
@@ -601,28 +667,34 @@ VocabIndex::VocabIndex(std::vector<std::string> bytes,
       continue;
     }
     d.all.Insert(b, id, d.next_same);
-    const bool safe = std::all_of(b.begin(), b.end(), [](char ch) {
-      const auto c = static_cast<unsigned char>(ch);
-      return c >= 0x20 && c != '"' && c != '\\';
-    });
-    if (safe) {
+    const bool whole = WholeUtf8(b);
+    const bool string_safe =
+        whole && std::all_of(b.begin(), b.end(), [](char ch) {
+          const auto c = static_cast<unsigned char>(ch);
+          return c >= 0x20 && c != '"' && c != '\\';
+        });
+    if (string_safe) {
       d.string_safe.push_back(id);
     } else {
       d.string_unsafe.Insert(b, id, d.next_same);
     }
-    if (b.find('\n') == std::string::npos) {
-      d.no_newline.push_back(id);
+    if (whole && b.find_first_of("\n<") == std::string::npos) {
+      d.raw_safe.push_back(id);
     } else {
-      d.with_newline.Insert(b, id, d.next_same);
+      d.raw_unsafe.Insert(b, id, d.next_same);
     }
   }
 }
 
 VocabIndex::~VocabIndex() = default;
 
-int VocabIndex::size() const { return static_cast<int>(data_->bytes.size()); }
+int VocabIndex::size() const {
+  return static_cast<int>(data_->bytes.size());
+}
 
-const VocabIndex::Data& VocabIndex::data() const { return *data_; }
+const VocabIndex::Data& VocabIndex::data() const {
+  return *data_;
+}
 
 // ---------------------------------------------------------------------------
 // The matcher.
@@ -689,12 +761,12 @@ struct Frame {
   std::uint8_t esc = 0;    // strings: 0, 1 after '\\', 2..5 in \uXXXX
   std::uint8_t flags = 0;  // kValue: whitespace first; kNumber: integer
   std::int32_t node = -1;
-  std::int32_t a = 0;  // counter: position, length, items, digits
-  std::int32_t b = 0;  // kObject: the key's property; kTool: function
-  std::int32_t c = 0;  // kTool: parameter
-  std::int32_t pad = 0;  // no padding bytes: frames compare with memcmp
-  Mask m1;             // kObject / kTool: seen; kLiteral: candidates
-  Mask m2;             // kObject / kTool: key / name / item candidates
+  std::int32_t a = 0;     // counter: position, length, items, digits
+  std::int32_t b = 0;     // kObject: the key's property; kTool: function
+  std::int32_t c = 0;     // kTool: parameter
+  std::int32_t utf8 = 0;  // strings, keys, raw text: Utf8Step's state
+  Mask m1;                // kObject / kTool: seen; kLiteral: candidates
+  Mask m2;                // kObject / kTool: key / name / item candidates
 };
 
 struct Stack {
@@ -958,6 +1030,7 @@ private:
     f.phase = kObjKey;
     f.a = 0;
     f.esc = 0;
+    f.utf8 = 0;
     return R::kAccept;
   }
 
@@ -971,8 +1044,8 @@ private:
     for (std::size_t i = 0; i < n.names.size(); ++i) {
       const int idx = static_cast<int>(i);
       if (f.m2.Test(idx) && n.names[i].size() > static_cast<std::size_t>(f.a) &&
-          static_cast<unsigned char>(n.names[i][static_cast<std::size_t>(
-              f.a)]) == c) {
+          static_cast<unsigned char>(
+              n.names[i][static_cast<std::size_t>(f.a)]) == c) {
         next.Set(idx);
       }
     }
@@ -1009,7 +1082,7 @@ private:
         }
         return c == '"' ? BeginKey(s, f) : R::kReject;
       case kObjKey:
-        if (special || c < 0x20) {
+        if (special || c < 0x20 || !Utf8Step(f.utf8, c)) {
           return R::kReject;
         }
         if (f.esc == 1) {
@@ -1064,11 +1137,10 @@ private:
           return Ws(s);
         }
         if (c == ',') {
-          const bool more =
-              n.additional >= 0 ||
-              !Mask::First(static_cast<int>(n.names.size()))
-                   .Minus(f.m1)
-                   .Empty();
+          const bool more = n.additional >= 0 ||
+                            !Mask::First(static_cast<int>(n.names.size()))
+                                 .Minus(f.m1)
+                                 .Empty();
           if (!more) {
             return R::kReject;
           }
@@ -1150,6 +1222,9 @@ private:
       f.esc = f.esc == 5 ? 0 : static_cast<std::uint8_t>(f.esc + 1);
       return R::kAccept;
     }
+    if (f.utf8 != 0) {  // inside a character: continuation bytes only
+      return Utf8Step(f.utf8, c) ? R::kAccept : R::kReject;
+    }
     if (c == '"') {
       if (f.a < n.min_len) {
         return R::kReject;
@@ -1157,15 +1232,10 @@ private:
       --s.depth;
       return R::kAccept;
     }
-    if (c < 0x20) {
+    if (c < 0x20 || !Utf8Step(f.utf8, c) || f.a >= n.max_len) {
       return R::kReject;
     }
-    if (c == '\\' || (c & 0xC0) != 0x80) {
-      if (f.a >= n.max_len) {
-        return R::kReject;
-      }
-      ++f.a;
-    }
+    ++f.a;  // a character starts (or an escape)
     if (c == '\\') {
       f.esc = 1;
     }
@@ -1176,11 +1246,19 @@ private:
     const bool integer = f.flags != 0;
     const bool can_end = f.phase == kNumZero || f.phase == kNumInt ||
                          f.phase == kNumFrac || f.phase == kNumExp;
+    // a: digits before the exponent, b: exponent digits.
     auto digit = [&](std::uint8_t phase) {
-      if (f.a >= kMaxDigits) {
-        return R::kReject;
+      if (phase == kNumExp) {
+        if (f.b >= kMaxExpDigits) {
+          return R::kReject;
+        }
+        ++f.b;
+      } else {
+        if (f.a >= (integer ? kMaxIntDigits : kMaxDigits)) {
+          return R::kReject;
+        }
+        ++f.a;
       }
-      ++f.a;
       f.phase = phase;
       return R::kAccept;
     };
@@ -1340,8 +1418,8 @@ private:
           const auto& name = g_.functions[i].name;
           if (f.m2.Test(static_cast<int>(i)) &&
               name.size() > static_cast<std::size_t>(f.a) &&
-              static_cast<unsigned char>(
-                  name[static_cast<std::size_t>(f.a)]) == c) {
+              static_cast<unsigned char>(name[static_cast<std::size_t>(f.a)]) ==
+                  c) {
             next.Set(static_cast<int>(i));
           }
         }
@@ -1382,6 +1460,7 @@ private:
         if (next.Test(0) && f.a == static_cast<int>(kParamOpen.size())) {
           f.phase = kToolKey;
           f.a = 0;
+          f.utf8 = 0;
           const auto& fn = Fn(f);
           f.m2 = Mask::First(static_cast<int>(fn.params.size())).Minus(f.m1);
         } else if (next.Test(1) && f.a == static_cast<int>(kCallClose.size())) {
@@ -1391,7 +1470,8 @@ private:
         return R::kAccept;
       }
       case kToolKey: {
-        if (c == kEnd || special || c == '\n' || c == '<') {
+        if (c == kEnd || special || c == '\n' || c == '<' ||
+            !Utf8Step(f.utf8, c)) {
           return R::kReject;
         }
         const auto& fn = Fn(f);
@@ -1454,9 +1534,8 @@ private:
         return Push(s, value) ? R::kAccept : R::kReject;
       }
       case kToolValueEnd:
-        if (c == kEnd ||
-            c != static_cast<unsigned char>(
-                     kValueEnd[static_cast<std::size_t>(f.a)])) {
+        if (c == kEnd || c != static_cast<unsigned char>(
+                                  kValueEnd[static_cast<std::size_t>(f.a)])) {
           return R::kReject;
         }
         if (++f.a == static_cast<int>(kValueEnd.size())) {
@@ -1501,7 +1580,7 @@ private:
   // a: progress through "\n</parameter>" (the end), b: "</parameter>",
   // c: "</tool_call>".
   R ApplyRaw(Stack& s, Frame& f, int c, bool special) {
-    if (c == kEnd || special) {
+    if (c == kEnd || special || !Utf8Step(f.utf8, c)) {
       return R::kReject;
     }
     f.a = Track(kRawEnd, f.a, c);
@@ -1566,10 +1645,10 @@ public:
       }
       Walk(v_.string_unsafe, mask, vocab);
     } else if (AllTops(kRaw, /*raw=*/true)) {
-      for (const int id : v_.no_newline) {
+      for (const int id : v_.raw_safe) {
         Set(mask, vocab, id);
       }
-      Walk(v_.with_newline, mask, vocab);
+      Walk(v_.raw_unsafe, mask, vocab);
     } else {
       Walk(v_.all, mask, vocab);
     }
@@ -1653,8 +1732,9 @@ private:
     }
   }
 
-  // Whether every parse is inside a free string (no length cap, not in an
-  // escape) or, with `raw`, inside raw text with no terminator under way.
+  // Whether every parse is between characters inside a free string (no
+  // length cap, not in an escape) or, with `raw`, inside raw text with no
+  // end or forbidden tag under way.
   bool AllTops(std::uint8_t kind, bool raw) const {
     if (state_.count == 0) {
       return false;
@@ -1665,8 +1745,12 @@ private:
       if (top.kind != kind) {
         return false;
       }
+      if (top.utf8 != 0) {
+        return false;
+      }
       if (raw) {
-        if (top.a != 0) {
+        // No end or forbidden tag under way.
+        if (top.a != 0 || top.b != 0 || top.c != 0) {
           return false;
         }
       } else if (top.esc != 0 ||
