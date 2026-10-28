@@ -9,27 +9,24 @@
 #include "models/qwen35/decoder.hpp"
 #include "models/qwen35/npu_decoder.hpp"
 
-// Qwen3.6-35B-A3B prompt processing (prefill) on the NPU, v1
-// (docs/research/NPU-MOE-PREFILL.md). The prompt goes through the model
-// layer by layer, all of it (up to kMaxPromptChunk tokens per pass) through
-// each layer before the next, so each expert's weights are converted once per
-// pass. Nothing is kept beside the decoder's own weights: the NPU converts
-// them from the decoder's device buffers (q4nx) to bfp16 per pass
-// (qwen36_35b_a3b_dequant), and bfp16 GEMMs (qwen36_35b_a3b_prefill)
+// Qwen3.6-35B-A3B prompt processing (prefill) on the NPU and the CPU
+// (docs/research/NPU-MOE-PREFILL.md, docs/research/TTFT.md). The prompt goes
+// through the model layer by layer, all of it (up to kMaxPromptChunk tokens
+// per pass) through each layer before the next, so each expert's weights are
+// read once per pass. The NPU converts the decoder's device weights (q4nx)
+// to bfp16 (qwen36_35b_a3b_dequant), and bfp16 GEMMs (qwen36_35b_a3b_prefill)
 // multiply them. Per layer:
-//   1. GEMM context: the input projection, the mixer on the CPU (the
+//   1. GEMM program: the input projection, the mixer on the CPU (the
 //      family's PrefillMixer: chunked DeltaNet or causal attention), the
 //      output projection, in blocks of up to 1,024 tokens.
 //   2. CPU: post-attention norm, router logits in fp32, top 8 (moe.hpp, as
 //      decode routes), and the tokens grouped by expert.
-//   3. Dequant context: the experts with tokens and the shared expert, and
-//      the next layer's dense matrices.
-//   4. GEMM context: each expert's gate + up over its tokens (rows padded to
-//      256, 512 or 1,024), SwiGLU times the router weight on the CPU, its
-//      down, and the sum into the residual on the CPU. The shared expert is
-//      one more expert, over every token, weighed by its sigmoid gate.
-// So two context switches per layer (~5 ms each). It fills the same
-// DecodeState NpuDecoder decodes from, and the MTP layer's cache.
+//   3. The expert step (ExpertBackend below): the routed experts and the
+//      shared one (one more expert over every token, weighed by its sigmoid
+//      gate), each expert's SwiGLU times its router weight, summed into the
+//      residual.
+// It fills the same DecodeState NpuDecoder decodes from, and the MTP layer's
+// cache.
 namespace gufo_npu::qwen36_35b_a3b {
 
 // Tokens per pass: the prompt is processed in passes of at most this many.

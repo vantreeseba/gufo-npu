@@ -8,8 +8,8 @@ xdna-driver 2.26, NPU runtime power control `auto`.
 | | FastFlowLM (measured below) | gufo-npu NPU (below) | MVP target | Ceiling |
 |---|---|---|---|---|
 | Decode, 1k context | 16.9 tok/s | **26.3 tok/s** with MTP (19.2 without) | ≥ 22 tok/s | ~33 tok/s without MTP (56 GB/s NPU read ÷ 1.69 GB per token with every matrix in q4nx) |
-| Prefill, ~1k | ~120 tok/s (8.75 s) | **190 tok/s** (5.56 s at 1,055; NPU prefill v1, below) | ≥ 400 tok/s | |
-| TTFT, 35-token prompt | 3.48 s | 0.9 s (24 tokens) | < 1 s | |
+| Prefill, ~1k | ~120 tok/s (8.75 s) | **845 tok/s** (1.25 s at 1,055; prefill with the experts on the CPU, below) | ≥ 400 tok/s | |
+| TTFT, 35-token prompt | 3.48 s | **0.25 s** | < 1 s | |
 
 ## NPU decode
 
@@ -121,12 +121,76 @@ memory ~0.6 GB, and up to
 ~20 GB of the memory-mapped GGUF in page cache while loading. Loading
 (packing every matrix to q4nx, Q4_K experts code for code) takes 19.8–24 s.
 
-## NPU prefill (v1)
+## Prefill with the experts on the CPU (the default)
 
-`qwen36_35b_a3b::NpuPrefill` through `PrefillPrompt` (the hook
-`generate --device npu` and `bench prefill` use): prompts of at least
-`kMinPrefillPrompt` (108) tokens run layer by layer over the whole prompt on
-the NPU, shorter ones through the decoder's two-token passes. Per layer: the
+`qwen36_35b_a3b::NpuPrefill` with `ExpertBackend::kCpu`, through
+`PrefillPrompt` (the hook `generate --device npu` and `bench prefill` use):
+prompts of at least `kMinPrefillPromptCpu` (6) tokens run layer by layer
+over the whole prompt, shorter ones through the decoder's two-token passes.
+The NPU runs only the dense matrices (input and output projections, bfp16
+GEMMs), on bfp16 copies converted once when the prefill is built (one visit
+to the dequant program in all, no program switches per prompt). The routed
+and shared experts run on the CPU (`cpu_experts.hpp`): the decoder's q4nx
+arenas are read in place, a 32-row tile at a time unpacked to bf16 and
+multiplied with the bf16 activations by AVX-512 BF16 dot products (fp32
+sums). Routing runs per token on the CPU pool (it ran serially before: 1.3 s
+at 8.5k).
+
+`gufo-npu bench prefill` (the first N tokens of one long chat prompt, MTP
+cache and first token included), warm, a warm-up then 3 runs back to back,
+two rounds interleaved with main's build (the experts on the NPU,
+`ExpertBackend::kNpu`), 2026-10-28:
+
+| Prompt tokens | Experts on the CPU (min–max, both rounds) | Main: experts on the NPU | FLM | Faster than FLM |
+|---|---|---|---|---|
+| 35 | **0.245 s** (0.235–0.249) | 1.02 s (decode path) | 3.49 s | 14× |
+| 125 | **0.344 s** (0.337–0.350) | 3.34 s | 5.17 s | 15× |
+| 1,055 | **1.250 s** (1.237–1.263) | 5.56 s | 8.75 s | 7.0× |
+| 2,119 | **2.352 s** (2.331–2.390) | 7.00 s | 11.91 s | 5.1× |
+| 4,246 | **4.766 s** (4.727–4.831) | 9.79 s | 19.47 s | 4.1× |
+| 8,499 | **10.692 s** (10.626–10.739) | 16.09 s | 34.17 s | 3.2× |
+
+Where the time goes (seconds per run, mean of both rounds; the GEMM column is
+the NPU's dense matrices):
+
+| Tokens | GEMMs | Syncs | Building calls | DeltaNet | Attention | Routing | Experts (CPU) | Other |
+|---|---|---|---|---|---|---|---|---|
+| 35 | 0.070 | 0.001 | 0.008 | 0.008 | 0.002 | 0.005 | 0.091 | 0.003 |
+| 125 | 0.071 | 0.003 | 0.009 | 0.023 | 0.003 | 0.010 | 0.160 | 0.007 |
+| 1,055 | 0.247 | 0.020 | 0.026 | 0.192 | 0.068 | 0.063 | 0.516 | 0.055 |
+| 2,119 | 0.412 | 0.041 | 0.042 | 0.382 | 0.215 | 0.126 | 0.950 | 0.111 |
+| 4,246 | 0.746 | 0.083 | 0.075 | 0.757 | 0.737 | 0.238 | 1.817 | 0.223 |
+| 8,499 | 1.506 | 0.164 | 0.141 | 1.515 | 2.752 | 0.426 | 3.624 | 0.447 |
+
+- **Experts:** 13 ms per layer at 1,055 tokens (~4.6 TFLOPS counting the 9
+  experts' 3 × 512 × 2,048 multiply-adds per token), 91 ms at 8,499
+  (~5.3 TFLOPS). `qwen36_cpu_experts_bench` (one layer, random experts,
+  routing skewed like real prompts) gives 7.3 ms at 125 tokens, 15.8 at
+  1,024, 49.1 at 4,096 and 85.6 at 8,192. Short prompts are bound by
+  unpacking (~225 experts with tokens per layer at 125 tokens).
+- **Fixed cost:** the 80 GEMM calls of a pass at their 256-row minimum
+  (~70 ms) and the decode step for the last token.
+- **Long prompts:** CPU attention (2.75 s) and DeltaNet (1.5 s) at 8.5k, as
+  with the experts on the NPU; the NPU's GEMMs (1.5 s) run while the CPU
+  waits, so overlapping them with the mixers of the previous block is the
+  next lever.
+- **Crossover** (same bench, `--decode-path`): 4 tokens 0.133 s on the
+  decode path against 0.157 s through the prefill, 6 tokens 0.190 against
+  0.167, 8 tokens 0.245 against 0.173: `kMinPrefillPromptCpu` is 6.
+
+**Memory.** On top of the decoder's 19.4 GiB of device buffers the prefill
+pins ~1.5 GB: every layer's dense matrices as bfp16 (1.44 GB) and the MTP
+head's (31 MB), and the dense GEMM operands (34 MB); nothing for the experts
+(they are read from the decoder's arenas). ~22.3 GB in all, against ~21.6 GB
+with the experts on the NPU. Host scratch: the SwiGLU rows (151 MB at 16,384
+tokens) and 128 KB of unpacked weights per thread, besides the core's
+~0.45 GB.
+
+## Prefill with the experts on the NPU (v1)
+
+`ExpertBackend::kNpu` (`bench prefill --experts npu`): prompts of at least
+`kMinPrefillPromptNpu` (108) tokens run layer by layer over the whole prompt
+on the NPU, shorter ones through the decoder's two-token passes. Per layer: the
 input projection, the CPU mixer and the output projection in blocks of 1,024
 tokens (GEMM program), routing on the CPU, one visit to the dequant program
 (the experts with tokens, from the decoder's arena, and the next layer's
@@ -176,7 +240,7 @@ their program switches):
 - **Crossover** (same bench, `--decode-path`): 64 tokens 2.78 s against
   1.86 s on the decode path, 96 tokens 3.11 against 2.84, 128 tokens 3.36
   against 3.80. The prefill costs ~2.78 s at 64 plus ~9 ms per token, the
-  decode path ~30 ms per token: even at ~108, `kMinPrefillPrompt`.
+  decode path ~30 ms per token: even at ~108, `kMinPrefillPromptNpu`.
 - **Call setup, measured alternatives** (EXPERIMENTS.md): reusing runs,
   keeping the buffer windows, and the instruction-buffer flow were each
   slower than a fresh run and window per call.
