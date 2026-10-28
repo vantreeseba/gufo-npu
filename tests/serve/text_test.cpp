@@ -170,7 +170,7 @@ void Requests() {
   Check(Rejects(json::object(), "messages"), "reject: no messages");
   Check(Rejects({{"messages", json::array()}}, "messages"),
         "reject: empty messages");
-  Check(Rejects({{"messages", messages}, {"n", 2}}, "n"), "reject: n=2");
+  Check(Rejects({{"messages", messages}, {"n", 9}}, "n"), "reject: n=9");
   Check(Rejects({{"messages", messages}, {"temperature", 3}}, "temperature"),
         "reject: temperature 3");
   Check(Rejects({{"messages", messages}, {"top_p", 0}}, "top_p"),
@@ -188,8 +188,8 @@ void Requests() {
         "reject: tool_choice required");
   Check(Rejects({{"messages", messages}, {"tools", json::array({1})}}, "tools"),
         "reject: bad tool");
-  Check(Rejects({{"messages", messages}, {"logprobs", true}}, "logprobs"),
-        "reject: logprobs");
+  Check(Rejects({{"messages", messages}, {"top_logprobs", 3}}, "top_logprobs"),
+        "reject: top_logprobs without logprobs");
   Check(Rejects({{"messages", messages},
                  {"response_format", {{"type", "json_object"}}}},
                 "response_format"),

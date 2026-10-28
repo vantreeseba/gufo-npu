@@ -316,9 +316,10 @@ TokenLogprobs ComputeLogprobs(const float* logits, int vocab, int id, int top) {
     throw std::invalid_argument("logprobs: token id out of range");
   }
   const float best = *std::max_element(logits, logits + vocab);
-  // log sum exp, summed in 16 lanes of float then in double.
+  // log sum exp, summed in 16 lanes of double (float lanes lose ~1e-4 of
+  // the sum over a 248k vocabulary).
   constexpr int kLanes = 16;
-  float lanes[kLanes] = {};
+  double lanes[kLanes] = {};
   int i = 0;
   for (; i + kLanes <= vocab; i += kLanes) {
     for (int j = 0; j < kLanes; ++j) {
@@ -329,7 +330,7 @@ TokenLogprobs ComputeLogprobs(const float* logits, int vocab, int id, int top) {
     lanes[0] += FastExp(std::max(logits[i] - best, -87.0f));
   }
   double sum = 0;
-  for (const float lane : lanes) {
+  for (const double lane : lanes) {
     sum += lane;
   }
   const double log_z = best + std::log(sum);
