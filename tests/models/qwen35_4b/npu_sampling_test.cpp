@@ -34,7 +34,7 @@ int main(int argc, char** argv) {
   const auto prompt = tokenizer.Encode(qwen35::RenderChat(
       {{"user", "Write a short poem about the sea."}}, false));
   gufo_npu::qwen35_4b::NpuDecoder npu(*file, argv[1]);
-  const int runs = argc == 3 ? std::atoi(argv[2]) : 600;
+  const int runs = argc == 3 ? std::atoi(argv[2]) : 300;
   const auto sample = [&](bool draft, int tokens,
                           const gufo_npu::SamplingParams& sampling,
                           qwen35::SpeculativeStats* stats) {
