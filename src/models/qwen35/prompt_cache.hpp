@@ -62,8 +62,10 @@ struct PromptCacheModel {
                      int position, DecodeState& mtp)>
       fill_mtp;
   // A fresh decode state (the checkpoints' DeltaNet buffers take its
-  // sizes).
+  // sizes): the decoder's AcquireState, so checkpoints reuse its buffers.
   std::function<DecodeState()> new_state;
+  // Optional: takes back an evicted checkpoint's state (ReleaseState).
+  std::function<void(DecodeState&&)> recycle;
 };
 
 class PromptCache {
@@ -110,11 +112,17 @@ private:
                                   bool need_mtp);
   int Boundary(const std::vector<int>& prompt, int end) const;
   void Insert(Entry entry);
+  // Removes an entry, handing its state to model_.recycle.
+  void Drop(std::list<Entry>::iterator it);
   static std::size_t Bytes(const Entry& entry);
 
   PromptCacheModel model_;
   PromptCacheOptions options_;
   std::list<Entry> entries_;  // least recently used first
+  // Evicted checkpoints' MTP caches, reused for new ones (their buffers
+  // keep their capacity, so checkpoints of varying length do not churn the
+  // heap).
+  std::vector<DecodeState::Layer> spare_mtp_;
   std::size_t bytes_ = 0;
   int last_reused_ = 0;
   Stats stats_;

@@ -613,7 +613,10 @@ PromptCacheModel MakePromptCacheModel(NpuDecoder& decoder,
     StepMtp(decoder, decoder.config().hidden, hidden, tokens, count, position,
             mtp);
   };
-  m.new_state = [&decoder] { return decoder.NewState(); };
+  m.new_state = [&decoder] { return decoder.AcquireState(); };
+  m.recycle = [&decoder](DecodeState&& state) {
+    decoder.ReleaseState(std::move(state));
+  };
   return m;
 }
 

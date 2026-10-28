@@ -93,14 +93,12 @@ void PromptCache::Insert(Entry entry) {
   while (static_cast<int>(entries_.size()) > options_.max_checkpoints ||
          (options_.max_bytes > 0 && bytes_ > options_.max_bytes &&
           entries_.size() > 1)) {
-    bytes_ -= entries_.front().bytes;
-    entries_.pop_front();
+    Drop(entries_.begin());
     ++stats_.evictions;
   }
   if (options_.max_bytes > 0 && bytes_ > options_.max_bytes) {
     // Even alone it is over the budget.
-    bytes_ = 0;
-    entries_.clear();
+    Clear();
     ++stats_.evictions;
   }
 }
@@ -184,6 +182,13 @@ int PromptCache::Run(const std::vector<int>& prompt, DecodeState& state,
       }
     }
     if (mtp != nullptr) {
+      // An evicted checkpoint's buffers, emptied, take the rows.
+      if (!spare_mtp_.empty()) {
+        e.mtp = std::move(spare_mtp_.back());
+        spare_mtp_.pop_back();
+        e.mtp.keys.clear();
+        e.mtp.values.clear();
+      }
       // Rows for positions 1 .. hi; keep 1 .. b - 1.
       const auto& from = mtp->layers[static_cast<std::size_t>(model_.layers)];
       if (hi >= 1 && !from.keys.empty()) {
@@ -197,8 +202,7 @@ int PromptCache::Run(const std::vector<int>& prompt, DecodeState& state,
     // A checkpoint of the same tokens is replaced.
     for (auto it = entries_.begin(); it != entries_.end(); ++it) {
       if (it->tokens == e.tokens) {
-        bytes_ -= it->bytes;
-        entries_.erase(it);
+        Drop(it);
         break;
       }
     }
@@ -215,8 +219,22 @@ std::vector<int> PromptCache::checkpoint_lengths() const {
   return out;
 }
 
+void PromptCache::Drop(std::list<Entry>::iterator it) {
+  bytes_ -= it->bytes;
+  if (model_.recycle) {
+    model_.recycle(std::move(it->state));
+  }
+  if (it->has_mtp &&
+      spare_mtp_.size() < static_cast<std::size_t>(options_.max_checkpoints)) {
+    spare_mtp_.push_back(std::move(it->mtp));
+  }
+  entries_.erase(it);
+}
+
 void PromptCache::Clear() {
-  entries_.clear();
+  while (!entries_.empty()) {
+    Drop(entries_.begin());
+  }
   bytes_ = 0;
 }
 
