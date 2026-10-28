@@ -256,8 +256,10 @@ GGUF as stored, with the weight sets above:
     the sub-scale and sub-minimum within one grid step of its fit with the
     lowest error. *Equal weights* drops the |w| term; *refit* then solves d
     and dmin by least squares with the integers fixed.
-  - *library*: `q4nx::PackRows` as it is now, the search fit vectorized;
-    the NPU decoder loads these weights.
+  - *library*: `q4nx::PackRows` with `Fit::kSearch` (the search fit,
+    vectorized), which `qwen35::Q4nxFit` names for this model: the NPU
+    decoder, its MTP block and draft head load these weights, and the NPU
+    prefill converts the decoder's buffers.
   - *imatrix*: search with each weight's error weighted by its input's mean
     x² from the calibration pass (llama.cpp's `qw * sqrt(sigma2 + w²)`);
     *mean x² alone* drops the sqrt term; *Unsloth's imatrix* takes the mean
@@ -281,7 +283,7 @@ GGUF as stored, with the weight sets above:
 | search, equal weights | | | 0.0338 | 93.07% | | | 277 / 274 | |
 | search | | | 0.0261 | 93.66% | | | 280 / 279 | |
 | search + refit | | | 0.0267 | 93.80% | | | 278 / 277 | |
-| **library (new default)** | **0.0230** | **94.65%** | **0.0268** | **93.80%** | **0.0301** | **93.07%** | 278 / 277 | 1.4 ns per weight |
+| **library (this model's fit)** | **0.0230** | **94.65%** | **0.0268** | **93.80%** | **0.0301** | **93.07%** | 278 / 277 | 1.4 ns per weight |
 | imatrix | 0.0111 | 95.84% | 0.0149 | 94.65% | | | 281 / 281 | |
 | imatrix, mean x² alone | | | 0.0157 | 95.51% | | | 282 / 280 | |
 | Unsloth's imatrix | 0.0107 | 96.70% | 0.0147 | 95.64% | 0.0175 | 94.85% | 280 / 279 | |
@@ -293,13 +295,18 @@ For scale: llama.cpp against (a) has KL 0.006 on the oracle prompts.
 Reading:
 
 - The search fit cuts KL by about a quarter on every set at no cost in
-  format, kernel or decode speed, so it is now the packer's fit
-  (`q4nx::PackRows`). Its weighting of larger weights does most of that:
+  format, kernel or decode speed, so it is this model's fit
+  (`qwen35::Q4nxFit`). Each model names its own: Qwen3.5-4B takes it too,
+  Qwen3.5-2B keeps min/max (its EXPERIMENTS.md). Its weighting of larger weights does most of that:
   with equal weights it gains only 6%. Refitting d and dmin adds nothing.
 - Weighting by activation statistics halves KL again (0.0149 against 0.0261
   at (b)) and moves the oracle's top-1 against llama.cpp from 269 (min/max)
-  and 279 (search) to 281. The NPU path does not use it yet: it needs the
-  statistics at load time.
+  and 279 (search) to 281. Unsloth's published imatrix does as well as our
+  own calibration pass. Next step, not built: the NPU path needs the
+  statistics at load time (an importance argument to `q4nx::PackRows`, the
+  imatrix GGUF read by tensor name, per expert for the expert tensors, and
+  a calibration-pass fallback for the LM head, which llama.cpp's imatrix
+  leaves out).
 - AWQ helps the data-free fit (0.0194) but adds nothing on top of the
   importance weighting (0.0153 against 0.0149), and it needs calibration
   data too.

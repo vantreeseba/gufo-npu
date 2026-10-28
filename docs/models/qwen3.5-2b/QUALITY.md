@@ -63,14 +63,13 @@ error < 1e-2, and the resnorm residual (H + D) within 1e-6 of its scale.
   unchanged and gave 1.1e-2.
 - `q4nx_test` (hosted CI) checks the packing: Q4_K codes, sub-scales and
   sub-minima carry over unchanged (only d and dmin round to bf16),
-  requantized weights stay within one step of a min/max fit (the group's
-  range / 15, widened by the int8 minimum's grid and rounded up onto d's;
-  the packer's error-minimizing fit may clip a group's extremes), fused
-  stacks equal their parts, row orders (SwiGLU) apply, and the CPU q4nx GEMV
-  matches the reference. Requantizing N(0, 0.02) weights: relative RMS error
-  0.0702 (pass < 0.074); the min/max fit before 2026-10-27 gave 0.0787
-  (0.0783 with 5120-byte blocks). How the fit was chosen:
-  [Qwen3.6-35B-A3B quality](../qwen3.6-35b-a3b/QUALITY.md#choosing-the-4-bit-values).
+  requantized weights stay within half their step with `Fit::kMinMax`, this
+  model's fit (the group's range / 15, widened by the int8 minimum's grid
+  and rounded up onto d's) and within a whole step with `Fit::kSearch`
+  (which may clip a group's extremes), fused stacks equal their parts, row
+  orders (SwiGLU) apply, and the CPU q4nx GEMV matches the reference.
+  Requantizing N(0, 0.02) weights: relative RMS error 0.0787 with min/max
+  (0.0783 with 5120-byte blocks), 0.0702 with the search fit.
 
 ## NPU decode, teacher-forced
 
@@ -106,8 +105,15 @@ With the compact 4736-byte blocks (same day, same test):
   do better: requantizing the 5–8-bit tensors costs 2 of 73. A longer quality
   run decides whether an 8-bit kernel variant is needed.
 
-With the error-minimizing fit for requantized tensors (2026-10-27, compact
-blocks; [how it was chosen](../qwen3.6-35b-a3b/QUALITY.md#choosing-the-4-bit-values)):
+### The search fit, measured and not adopted
+
+Each model names its q4nx fit (`q4nx::Fit`; this package's rule is
+`qwen35::Q4nxFit`). Qwen3.6-35B-A3B and Qwen3.5-4B pack with the search
+fit (llama.cpp's weighted least-squares Q4_K fit,
+[measured on the 35B](../qwen3.6-35b-a3b/QUALITY.md#choosing-the-4-bit-values));
+this model keeps min/max, because on its decode weights the search fit
+lowers KL but not top-1. With the search fit (2026-10-27, compact
+blocks):
 
 | Prompt | Tokens | NPU vs q4nx CPU: argmax | Logits rel err | NPU argmax vs HF |
 |---|---|---|---|---|
@@ -123,7 +129,9 @@ blocks; [how it was chosen](../qwen3.6-35b-a3b/QUALITY.md#choosing-the-4-bit-val
   goes from 91.29% to 90.89% (6 positions); without the LM head (the tied
   Q6_K embedding) KL falls from 0.0336 to 0.0258 and top-1 rises from
   93.14% to 93.47%.
-- The NPU decoder packs and uploads in 2.6 s instead of 1.3 s.
+- The NPU decoder would pack and upload in 2.6 s instead of 1.3 s.
+- With min/max kept, the 2B's outputs are main's: the same hashes and
+  speed (see EXPERIMENTS.md).
 
 ## Speculative decoding
 
