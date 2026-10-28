@@ -149,12 +149,15 @@ differ. On the ten prompts:
 | Check | Measured |
 |---|---|
 | First token the same as the decode path's | 10/10 |
-| Largest change of any logit, prefill row vs decode step | 0.80 (2,049 tokens) |
-| Smallest decode-path top-2 gap among the prompts | 0.16 (prose; still the same token) |
-| States after the whole prompt (worst) | hidden 1.3e-1, conv 2.8e-1, DeltaNet 1.2e-1, K/V 1.8e-1 (under the same limits) |
+| Largest change of any logit, prefill row vs decode step | 0.60 (256 tokens; 0.80 with the min/max fit) |
+| Smallest decode-path top-2 gap among the prompts | 0.06 (prose; still the same token) |
+| States after the whole prompt (worst) | hidden 1.4e-1, conv 1.8e-1, DeltaNet 1.2e-1, K/V 2.0e-1 (under the same limits) |
 | Argmax over the first token and 16 teacher-forced steps | 170/170 |
 | Speculative decoding after prefill vs plain greedy (chat, 48 tokens) | identical; greedy with and without prefill agree on 48/48 |
 
-The 2-logit limit is about twice the largest logit change measured (0.80;
-the 2B 0.89): below it two logits can trade places. The sky and Fibonacci
-outputs keep their hashes (`2eb62ce4`, `e5fd099a`).
+Measured with the 4B's q4nx search fit (#15). The 2-logit limit is about
+twice the largest logit change measured (0.60; 0.80 with the min/max fit,
+the 2B 0.89): below it two logits can trade places. Outputs: the sky
+prompt keeps main's hash (`f99190db`, with and without MTP); the
+Fibonacci prompt changes from main's `64f4400a` to `a965fad4`, and its MTP
+output equals plain greedy from the new state (`a965fad4` both).

@@ -105,7 +105,9 @@ second, lo-part pass the 2B's prefill notes (about twice the GEMM time).
   step for the last prompt token): retained, TTFT −47 ms at every length
   (35 tokens 0.236 → 0.188 s). First token the same on all 10 test prompts;
   the test allows a different one only at a decode-path top-2 gap under 2
-  logits (QUALITY.md). Hashes unchanged.
+  logits (QUALITY.md). With the min/max fit both hashes were unchanged;
+  with the search fit (#15) the Fibonacci reply differs from main's
+  (`64f4400a` → `a965fad4`) and still equals plain greedy.
 - **AVX-512 delta rule** in this model's copy of the prefill mixers:
   retained, bit-identical, ~1% of TTFT. Open: this model still carries its
   own copy of the mixer code from before the family `PrefillMixer`

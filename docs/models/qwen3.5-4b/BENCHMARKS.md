@@ -122,9 +122,13 @@ found 0.25-0.35 ms best, and 0.5 ms and above slower at 2k and longer:
 From 800 tokens up both pick the same passes; the differences there are
 run-to-run noise (the final build: 1,024 0.660 s, 4,096 2.844 s).
 
-Outputs: the sky prompt without drafting (`2eb62ce4`) and the Fibonacci
-prompt with MTP (`e5fd099a`) keep their hashes after all three changes;
-decode speed unchanged (18.8 and 30.8 tok/s).
+Outputs: with the min/max fit the table above was measured on, the sky
+prompt without drafting (`2eb62ce4`) and the Fibonacci prompt with MTP
+(`e5fd099a`) kept their hashes after all three changes; decode speed
+unchanged (18.8 and 30.8 tok/s). After merging main's search fit for the
+4B (#15): sky `f99190db` (main's), Fibonacci `a965fad4` (main: `64f4400a`),
+MTP equal to plain greedy for both, and TTFT the same (35 tokens 0.188 s,
+1,024 tokens 0.667 s).
 
 ## Against the 2B
 

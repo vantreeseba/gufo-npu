@@ -60,7 +60,7 @@ constexpr double kMaxLogitError = 5e-2;
 constexpr double kMinArgmaxAgreement = 0.95;
 // The first token's logits from prefill's last row move by at most 0.89
 // against the decode path's (measured on these prompts, 2026-10-28; 4B
-// 0.80), so two logits can trade places only when they are within ~1.8 of
+// 0.60), so two logits can trade places only when they are within ~1.8 of
 // each other. Every first token was the same; at a gap under 2 logits it may
 // differ.
 constexpr double kFirstTokenTie = 2.0;

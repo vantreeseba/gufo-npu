@@ -255,7 +255,7 @@ prompts above:
 
 The near-tie limit is 2 logits. A token changes only if its logit and the
 runner-up's move across each other, which takes a gap smaller than about
-twice the largest logit change (0.89 here, 0.80 on the 4B), so 1.8. A
+twice the largest logit change (0.89 here, 0.60 on the 4B), so 1.8. A
 first token may differ only below 2 logits; none did.
 
 The outputs on the decode benchmarks change only where a near tie falls
