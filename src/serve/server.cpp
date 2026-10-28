@@ -10,16 +10,19 @@
 #include <memory>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "serve/logprobs.hpp"
 #include "serve/metrics.hpp"
 #include "serve/openai.hpp"
 #include "serve/reply.hpp"
 #include "serve/scheduler.hpp"
+#include "serve/text.hpp"
 
 namespace gufo_npu::serve {
 namespace {
@@ -61,10 +64,22 @@ json ToolCall(const OutputPart& part) {
       {"function", {{"name", part.tool_name}, {"arguments", part.arguments}}}};
 }
 
-// A chat completion between its admission and its reply.
+json Bytes(const std::string& text) {
+  json out = json::array();
+  for (const unsigned char c : text) {
+    out.push_back(static_cast<int>(c));
+  }
+  return out;
+}
+
+// A request between its admission and its reply: a chat completion or a
+// legacy completion.
 struct Job {
   ChatRequest chat;
-  GenerateRequest gen;
+  CompletionRequest completion;
+  // One per prompt (a chat has one; a completion may have several).
+  std::vector<GenerateRequest> gens;
+  std::vector<std::string> echo;  // completion echo text per prompt
   std::unique_ptr<Scheduler::Ticket> ticket;
   std::string id;
   std::string model;
@@ -77,6 +92,16 @@ struct Outcome {
   std::string finish;  // "stop", "length" or "tool_calls"
   bool client_gone = false;
   std::string error;  // engine failure
+};
+
+// What one generation reports besides its text parts.
+struct Hooks {
+  std::function<bool()> gone;
+  ReplyStream::Emit emit;
+  // Each generated token's logprobs (not the stop token's), before its text
+  // reaches `emit`; unset: no logprobs.
+  std::function<void(TokenLogprobs&&)> logprob;
+  int top_logprobs = 0;
 };
 
 }  // namespace
@@ -166,6 +191,10 @@ struct Server::Impl {
               [this](const httplib::Request& req, httplib::Response& res) {
                 Chat(req, res);
               });
+    http.Post("/v1/completions",
+              [this](const httplib::Request& req, httplib::Response& res) {
+                Completions(req, res);
+              });
   }
 
   json Model() const {
@@ -175,53 +204,82 @@ struct Server::Impl {
             {"owned_by", "gufo-npu"}};
   }
 
+  static nlohmann::ordered_json ParseBody(const httplib::Request& req) {
+    try {
+      return nlohmann::ordered_json::parse(req.body);
+    } catch (const nlohmann::ordered_json::exception&) {
+      throw InvalidRequest("the request body is not valid JSON");
+    }
+  }
+
+  void CheckBias(const SamplingParams& s) const {
+    for (const auto& [id, bias] : s.logit_bias) {
+      if (id >= engine.info().vocab) {
+        throw InvalidRequest("logit_bias token id " + std::to_string(id) +
+                                 " is outside the vocabulary",
+                             "logit_bias");
+      }
+    }
+  }
+
+  // A generation request for `prompt`, checked against the context.
+  GenerateRequest Gen(std::vector<int> prompt, std::optional<int> max_tokens,
+                      const SamplingParams& sampling, const char* param) const {
+    GenerateRequest gen;
+    gen.prompt = std::move(prompt);
+    const int context = engine.info().context_length;
+    const int size = static_cast<int>(gen.prompt.size());
+    if (context > 0 && size >= context) {
+      throw ApiError(400, "invalid_request_error", "context_length_exceeded",
+                     "the prompt has " + std::to_string(size) +
+                         " tokens; this model's context is " +
+                         std::to_string(context) + " tokens",
+                     param);
+    }
+    const int room = context > 0 ? context - size : INT_MAX;
+    gen.max_tokens = std::min(max_tokens.value_or(room), room);
+    gen.sampling = sampling;
+    gen.stop_ids = stop_ids;
+    return gen;
+  }
+
+  // Admits `job` to the queue; false after sending 429.
+  bool Admit(Job& job, httplib::Response& res, const char* id_prefix) {
+    job.ticket = scheduler.Enter();
+    if (!job.ticket) {
+      metrics.Request(429);
+      SendError(res, ApiError(429, "rate_limit_error", "queue_full",
+                              "the server is busy; retry later"));
+      return false;
+    }
+    job.id = NewId(id_prefix);
+    job.model = engine.info().id;
+    job.created = static_cast<std::int64_t>(std::time(nullptr));
+    return true;
+  }
+
   void Chat(const httplib::Request& req, httplib::Response& res) {
     auto job = std::make_shared<Job>();
     job->arrived = Clock::now();
     try {
-      nlohmann::ordered_json body;
-      try {
-        body = nlohmann::ordered_json::parse(req.body);
-      } catch (const nlohmann::ordered_json::exception&) {
-        throw InvalidRequest("the request body is not valid JSON");
-      }
-      job->chat = ParseChatRequest(body);
+      job->chat = ParseChatRequest(ParseBody(req));
+      CheckBias(job->chat.sampling);
       std::string text;
       try {
         text = format.Render(job->chat.prompt);
       } catch (const std::invalid_argument& e) {
         throw InvalidRequest(e.what(), "messages");
       }
-      job->gen.prompt = engine.Encode(text);
-      const int context = engine.info().context_length;
-      const int prompt = static_cast<int>(job->gen.prompt.size());
-      if (context > 0 && prompt >= context) {
-        throw ApiError(400, "invalid_request_error", "context_length_exceeded",
-                       "the prompt has " + std::to_string(prompt) +
-                           " tokens; this model's context is " +
-                           std::to_string(context) + " tokens",
-                       "messages");
-      }
-      const int room = context > 0 ? context - prompt : INT_MAX;
-      job->gen.max_tokens = std::min(job->chat.max_tokens.value_or(room), room);
-      job->gen.sampling = job->chat.sampling;
-      job->gen.stop_ids = stop_ids;
+      job->gens.push_back(Gen(engine.Encode(text), job->chat.max_tokens,
+                              job->chat.sampling, "messages"));
     } catch (const ApiError& e) {
       metrics.Request(e.status);
       SendError(res, e);
       return;
     }
-    job->ticket = scheduler.Enter();
-    if (!job->ticket) {
-      metrics.Request(429);
-      SendError(res, ApiError(429, "rate_limit_error", "queue_full",
-                              "the server is busy; retry later"));
+    if (!Admit(*job, res, "chatcmpl-")) {
       return;
     }
-    job->id = NewId("chatcmpl-");
-    job->model = engine.info().id;
-    job->created = static_cast<std::int64_t>(std::time(nullptr));
-
     if (job->chat.stream) {
       res.set_header("Cache-Control", "no-cache");
       res.set_header("X-Accel-Buffering", "no");
@@ -237,38 +295,63 @@ struct Server::Impl {
     }
   }
 
-  // Waits for the engine, generates, and hands parts to `emit`.
-  Outcome Run(Job& job, const std::function<bool()>& gone,
-              ReplyStream::Emit emit) {
-    Outcome out;
+  // Waits for the engine. False when the client left first.
+  bool Acquire(Job& job, const std::function<bool()>& gone) {
     if (!job.ticket->Wait(gone)) {
       job.ticket.reset();
-      out.client_gone = true;
-      return out;
+      return false;
+    }
+    return true;
+  }
+
+  // One generation of `base` as choice `choice` (the engine is ours).
+  Outcome Run(Job& job, const GenerateRequest& base, int choice,
+              std::unique_ptr<OutputParser> parser,
+              const std::vector<std::string>& stop, int max_tool_calls,
+              const Hooks& hooks) {
+    Outcome out;
+    GenerateRequest gen = base;
+    // Choices differ: each draws from its own seed (seed + choice).
+    if (gen.sampling.seed && choice > 0) {
+      gen.sampling.seed = *gen.sampling.seed + static_cast<unsigned>(choice);
+    }
+    std::optional<LogprobRecorder> recorder;
+    if (hooks.logprob) {
+      recorder.emplace(hooks.top_logprobs);
+      gen.sampling.observer = &*recorder;
     }
     std::atomic<bool> cancel{false};
-    job.gen.cancel = &cancel;
-    ReplyStream reply(engine, job.gen.stop_ids, job.chat.stop,
-                      format.NewParser(job.chat.prompt), std::move(emit));
-    bool first = true;
+    gen.cancel = &cancel;
+    ReplyStream reply(engine, gen.stop_ids, stop, std::move(parser),
+                      hooks.emit);
+    reply.set_max_tool_calls(max_tool_calls);
+    const auto is_stop = [&](int id) {
+      return std::find(gen.stop_ids.begin(), gen.stop_ids.end(), id) !=
+             gen.stop_ids.end();
+    };
+    // Time to first token: the request's first generation only.
+    bool first = choice == 0 && &base == &job.gens.front();
     try {
-      out.result = engine.Generate(job.gen, [&](int id) {
+      out.result = engine.Generate(gen, [&](int id) {
         if (first) {
           first = false;
           metrics.TimeToFirstToken(Since(job.arrived));
         }
-        if (gone()) {
+        if (hooks.gone()) {
           cancel = true;
           return false;
+        }
+        if (recorder && !is_stop(id)) {
+          if (auto lp = recorder->Take(id)) {
+            hooks.logprob(std::move(*lp));
+          }
         }
         return reply.OnToken(id);
       });
     } catch (const std::exception& e) {
-      job.ticket.reset();
       out.error = e.what();
       return out;
     }
-    job.ticket.reset();  // the engine is free; the tail is only text
     out.client_gone = cancel || reply.delivery_failed();
     if (!out.client_gone) {
       reply.Finish();
@@ -278,7 +361,8 @@ struct Server::Impl {
     metrics.Generation(r.prompt_tokens, r.cached_prompt_tokens,
                        static_cast<int>(r.tokens.size()), r.prefill_seconds,
                        r.decode_seconds, r.steps, r.accepted);
-    out.finish = !reply.stop_string_hit() && r.finish == FinishReason::kLength
+    out.finish = !reply.stop_string_hit() && !reply.tool_limit_hit() &&
+                         r.finish == FinishReason::kLength
                      ? "length"
                      : "stop";
     if (out.finish == "stop" && reply.tool_calls() > 0) {
@@ -287,32 +371,63 @@ struct Server::Impl {
     return out;
   }
 
-  json Usage(const Job& job, const GenerateResult& r) const {
-    const int prompt = r.prompt_tokens > 0
-                           ? r.prompt_tokens
-                           : static_cast<int>(job.gen.prompt.size());
-    const int completion = static_cast<int>(r.tokens.size());
-    return {
-        {"prompt_tokens", prompt},
-        {"completion_tokens", completion},
-        {"total_tokens", prompt + completion},
-        {"prompt_tokens_details", {{"cached_tokens", r.cached_prompt_tokens}}}};
+  // Usage over all choices: each prompt counted once, completions summed.
+  static json Usage(const Job& job, const std::vector<Outcome>& outs,
+                    int per_prompt) {
+    int prompt = 0;
+    int completion = 0;
+    int cached = 0;
+    for (std::size_t i = 0; i < outs.size(); ++i) {
+      const auto& r = outs[i].result;
+      completion += static_cast<int>(r.tokens.size());
+      if (i % static_cast<std::size_t>(per_prompt) == 0) {
+        const std::size_t p = i / static_cast<std::size_t>(per_prompt);
+        prompt += p < job.gens.size()
+                      ? static_cast<int>(job.gens[p].prompt.size())
+                      : r.prompt_tokens;
+        cached += r.cached_prompt_tokens;
+      }
+    }
+    return {{"prompt_tokens", prompt},
+            {"completion_tokens", completion},
+            {"total_tokens", prompt + completion},
+            {"prompt_tokens_details", {{"cached_tokens", cached}}}};
   }
 
-  json Chunk(const Job& job, json delta, json finish) const {
+  json LogprobEntry(int id, float logprob) const {
+    const std::string text = engine.TokenBytes(id);
+    return {{"token", text}, {"logprob", logprob}, {"bytes", Bytes(text)}};
+  }
+
+  json ChatLogprob(const TokenLogprobs& lp) const {
+    json entry = LogprobEntry(lp.id, lp.logprob);
+    json top = json::array();
+    for (const auto& [id, logprob] : lp.top) {
+      top.push_back(LogprobEntry(id, logprob));
+    }
+    entry["top_logprobs"] = std::move(top);
+    return entry;
+  }
+
+  json Chunk(const Job& job, int index, json delta, json finish,
+             json logprobs = nullptr) const {
     json chunk = {
         {"id", job.id},
         {"object", "chat.completion.chunk"},
         {"created", job.created},
         {"model", job.model},
-        {"choices", json::array({{{"index", 0},
+        {"choices", json::array({{{"index", index},
                                   {"delta", std::move(delta)},
-                                  {"logprobs", nullptr},
+                                  {"logprobs", std::move(logprobs)},
                                   {"finish_reason", std::move(finish)}}})}};
     if (job.chat.include_usage) {
       chunk["usage"] = nullptr;
     }
     return chunk;
+  }
+
+  int MaxToolCalls(const Job& job) const {
+    return job.chat.parallel_tool_calls ? 0 : 1;
   }
 
   void Stream(Job& job, const httplib::Request& req, httplib::DataSink& sink) {
@@ -321,53 +436,97 @@ struct Server::Impl {
       return sink.write(event.data(), event.size());
     };
     const auto gone = [&req] { return req.is_connection_closed(); };
-    int tool_index = 0;
-    const auto emit = [&](std::vector<OutputPart>&& parts) {
-      for (auto& part : parts) {
-        json delta;
-        switch (part.kind) {
-          case OutputPart::Kind::kContent:
-            delta = {{"content", std::move(part.text)}};
-            break;
-          case OutputPart::Kind::kReasoning:
-            delta = {{"reasoning_content", std::move(part.text)}};
-            break;
-          case OutputPart::Kind::kToolCall: {
-            json call = ToolCall(part);
-            call["index"] = tool_index++;
-            delta = {{"tool_calls", json::array({std::move(call)})}};
-            break;
+    std::vector<Outcome> outs;
+    std::string error;
+    bool client_gone = !Acquire(job, gone);
+    for (int c = 0; c < job.chat.n && !client_gone && error.empty(); ++c) {
+      int tool_index = 0;
+      json pending = json::array();  // logprobs not yet sent
+      const auto logprobs = [&]() -> json {
+        if (!job.chat.logprobs || pending.empty()) {
+          return nullptr;
+        }
+        json out = {{"content", std::move(pending)}};
+        pending = json::array();
+        return out;
+      };
+      const auto emit = [&](std::vector<OutputPart>&& parts) {
+        for (auto& part : parts) {
+          std::vector<json> deltas;
+          switch (part.kind) {
+            case OutputPart::Kind::kContent:
+              deltas.push_back({{"content", std::move(part.text)}});
+              break;
+            case OutputPart::Kind::kReasoning:
+              deltas.push_back({{"reasoning_content", std::move(part.text)}});
+              break;
+            case OutputPart::Kind::kToolCall: {
+              // OpenAI's fragment shape: the call's id and name with empty
+              // arguments, then the arguments.
+              const json call = ToolCall(part);
+              json head = call;
+              head["index"] = tool_index;
+              head["function"]["arguments"] = "";
+              deltas.push_back({{"tool_calls", json::array({head})}});
+              deltas.push_back(
+                  {{"tool_calls",
+                    json::array({{{"index", tool_index},
+                                  {"function",
+                                   {{"arguments",
+                                     call["function"]["arguments"]}}}}})}});
+              ++tool_index;
+              break;
+            }
+          }
+          for (auto& delta : deltas) {
+            if (!write(Dump(
+                    Chunk(job, c, std::move(delta), nullptr, logprobs())))) {
+              return false;
+            }
           }
         }
-        if (!write(Dump(Chunk(job, std::move(delta), nullptr)))) {
-          return false;
-        }
+        return true;
+      };
+      Hooks hooks;
+      hooks.gone = gone;
+      hooks.emit = emit;
+      if (job.chat.logprobs) {
+        hooks.top_logprobs = job.chat.top_logprobs;
+        hooks.logprob = [&](TokenLogprobs&& lp) {
+          pending.push_back(ChatLogprob(lp));
+        };
       }
-      return true;
-    };
-
-    Outcome out;
-    if (!write(Dump(
-            Chunk(job, {{"role", "assistant"}, {"content", ""}}, nullptr)))) {
-      out.client_gone = true;
-      job.ticket.reset();
-    } else {
-      out = Run(job, gone, emit);
+      if (!write(Dump(Chunk(job, c, {{"role", "assistant"}, {"content", ""}},
+                            nullptr)))) {
+        client_gone = true;
+        break;
+      }
+      Outcome out = Run(job, job.gens[0], c, format.NewParser(job.chat.prompt),
+                        job.chat.stop, MaxToolCalls(job), hooks);
+      if (!out.error.empty()) {
+        error = out.error;
+      } else if (out.client_gone) {
+        client_gone = true;
+      } else if (!write(Dump(
+                     Chunk(job, c, json::object(), out.finish, logprobs())))) {
+        client_gone = true;
+      }
+      outs.push_back(std::move(out));
     }
-    if (!out.error.empty()) {
+    job.ticket.reset();
+    if (!error.empty()) {
       metrics.Request(500);
-      write(Dump(ErrorJson(ApiError(500, "server_error", "", out.error))));
-    } else if (out.client_gone) {
+      write(Dump(ErrorJson(ApiError(500, "server_error", "", error))));
+    } else if (client_gone) {
       metrics.Request(kClientClosed);
     } else {
-      write(Dump(Chunk(job, json::object(), out.finish)));
       if (job.chat.include_usage) {
         write(Dump({{"id", job.id},
                     {"object", "chat.completion.chunk"},
                     {"created", job.created},
                     {"model", job.model},
                     {"choices", json::array()},
-                    {"usage", Usage(job, out.result)}}));
+                    {"usage", Usage(job, outs, job.chat.n)}}));
       }
       write("[DONE]");
       metrics.Request(200);
@@ -376,60 +535,310 @@ struct Server::Impl {
   }
 
   void Complete(Job& job, const httplib::Request& req, httplib::Response& res) {
-    std::string content;
-    std::string reasoning;
-    json tool_calls = json::array();
-    const auto emit = [&](std::vector<OutputPart>&& parts) {
-      for (auto& part : parts) {
-        switch (part.kind) {
-          case OutputPart::Kind::kContent:
-            content += part.text;
-            break;
-          case OutputPart::Kind::kReasoning:
-            reasoning += part.text;
-            break;
-          case OutputPart::Kind::kToolCall:
-            tool_calls.push_back(ToolCall(part));
-            break;
+    const auto gone = [&req] { return req.is_connection_closed(); };
+    std::vector<Outcome> outs;
+    json choices = json::array();
+    std::string error;
+    bool client_gone = !Acquire(job, gone);
+    for (int c = 0; c < job.chat.n && !client_gone && error.empty(); ++c) {
+      std::string content;
+      std::string reasoning;
+      json tool_calls = json::array();
+      json logprobs = json::array();
+      Hooks hooks;
+      hooks.gone = gone;
+      hooks.emit = [&](std::vector<OutputPart>&& parts) {
+        for (auto& part : parts) {
+          switch (part.kind) {
+            case OutputPart::Kind::kContent:
+              content += part.text;
+              break;
+            case OutputPart::Kind::kReasoning:
+              reasoning += part.text;
+              break;
+            case OutputPart::Kind::kToolCall:
+              tool_calls.push_back(ToolCall(part));
+              break;
+          }
         }
+        return true;
+      };
+      if (job.chat.logprobs) {
+        hooks.top_logprobs = job.chat.top_logprobs;
+        hooks.logprob = [&](TokenLogprobs&& lp) {
+          logprobs.push_back(ChatLogprob(lp));
+        };
       }
-      return true;
-    };
-    const Outcome out =
-        Run(job, [&req] { return req.is_connection_closed(); }, emit);
+      Outcome out = Run(job, job.gens[0], c, format.NewParser(job.chat.prompt),
+                        job.chat.stop, MaxToolCalls(job), hooks);
+      if (!out.error.empty()) {
+        error = out.error;
+      } else if (out.client_gone) {
+        client_gone = true;
+      }
+      json message = {
+          {"role", "assistant"},
+          {"content", content.empty() && !tool_calls.empty() ? json(nullptr)
+                                                             : json(content)}};
+      if (!reasoning.empty()) {
+        message["reasoning_content"] = reasoning;
+      }
+      if (!tool_calls.empty()) {
+        message["tool_calls"] = std::move(tool_calls);
+      }
+      choices.push_back(
+          {{"index", c},
+           {"message", std::move(message)},
+           {"logprobs", job.chat.logprobs
+                            ? json({{"content", std::move(logprobs)}})
+                            : json(nullptr)},
+           {"finish_reason", out.finish}});
+      outs.push_back(std::move(out));
+    }
+    job.ticket.reset();
     metrics.RequestDuration(Since(job.arrived));
-    if (!out.error.empty()) {
+    if (!error.empty()) {
       metrics.Request(500);
-      SendError(res, ApiError(500, "server_error", "", out.error));
+      SendError(res, ApiError(500, "server_error", "", error));
       return;
     }
-    if (out.client_gone) {
+    if (client_gone) {
       metrics.Request(kClientClosed);
       res.status = kClientClosed;
       return;
     }
-    json message = {
-        {"role", "assistant"},
-        {"content", content.empty() && !tool_calls.empty() ? json(nullptr)
-                                                           : json(content)}};
-    if (!reasoning.empty()) {
-      message["reasoning_content"] = reasoning;
-    }
-    if (!tool_calls.empty()) {
-      message["tool_calls"] = std::move(tool_calls);
-    }
-    const json body = {
-        {"id", job.id},
-        {"object", "chat.completion"},
-        {"created", job.created},
-        {"model", job.model},
-        {"choices", json::array({{{"index", 0},
-                                  {"message", std::move(message)},
-                                  {"logprobs", nullptr},
-                                  {"finish_reason", out.finish}}})},
-        {"usage", Usage(job, out.result)}};
+    const json body = {{"id", job.id},
+                       {"object", "chat.completion"},
+                       {"created", job.created},
+                       {"model", job.model},
+                       {"choices", std::move(choices)},
+                       {"usage", Usage(job, outs, job.chat.n)}};
     metrics.Request(200);
     res.set_content(Dump(body), "application/json");
+  }
+
+  // ---- /v1/completions (legacy) ----
+
+  // The prompt's text for echo: its tokens' bytes as whole characters.
+  std::string Text(const std::vector<int>& ids) const {
+    Utf8Assembler utf8;
+    std::string text;
+    for (const int id : ids) {
+      text += utf8.Feed(engine.TokenBytes(id));
+    }
+    return text + utf8.Finish();
+  }
+
+  void Completions(const httplib::Request& req, httplib::Response& res) {
+    auto job = std::make_shared<Job>();
+    job->arrived = Clock::now();
+    try {
+      job->completion = ParseCompletionRequest(ParseBody(req));
+      auto& c = job->completion;
+      CheckBias(c.sampling);
+      for (std::size_t p = 0; p < c.prompts(); ++p) {
+        std::vector<int> ids;
+        if (c.texts.empty()) {
+          ids = c.ids[p];
+          for (const int id : ids) {
+            if (id >= engine.info().vocab) {
+              throw InvalidRequest("prompt token id " + std::to_string(id) +
+                                       " is outside the vocabulary",
+                                   "prompt");
+            }
+          }
+        } else {
+          ids = engine.Encode(c.texts[p]);
+          if (ids.empty()) {
+            throw InvalidRequest("prompt has no tokens", "prompt");
+          }
+        }
+        if (c.echo) {
+          job->echo.push_back(c.texts.empty() ? Text(ids) : c.texts[p]);
+        }
+        job->gens.push_back(
+            Gen(std::move(ids), c.max_tokens, c.sampling, "prompt"));
+      }
+    } catch (const ApiError& e) {
+      metrics.Request(e.status);
+      SendError(res, e);
+      return;
+    }
+    if (!Admit(*job, res, "cmpl-")) {
+      return;
+    }
+    if (job->completion.stream) {
+      res.set_header("Cache-Control", "no-cache");
+      res.set_header("X-Accel-Buffering", "no");
+      res.set_chunked_content_provider(
+          "text/event-stream",
+          [this, job, &req](std::size_t, httplib::DataSink& sink) {
+            Generate(*job, req, &sink, nullptr);
+            sink.done();
+            return true;
+          });
+    } else {
+      Generate(*job, req, nullptr, &res);
+    }
+  }
+
+  // Legacy logprobs for some tokens: {tokens, token_logprobs, top_logprobs,
+  // text_offset}, offsets counted from `offset`.
+  struct Legacy {
+    json tokens = json::array();
+    json token_logprobs = json::array();
+    json top = json::array();
+    json offsets = json::array();
+    std::size_t offset = 0;
+
+    bool empty() const { return tokens.empty(); }
+    json Take() {
+      json out = {{"tokens", std::move(tokens)},
+                  {"token_logprobs", std::move(token_logprobs)},
+                  {"top_logprobs", std::move(top)},
+                  {"text_offset", std::move(offsets)}};
+      tokens = token_logprobs = top = offsets = json::array();
+      return out;
+    }
+  };
+
+  void AddLegacy(Legacy& legacy, const TokenLogprobs& lp) const {
+    const std::string text = engine.TokenBytes(lp.id);
+    legacy.tokens.push_back(text);
+    legacy.token_logprobs.push_back(lp.logprob);
+    json top = json::object();
+    for (const auto& [id, logprob] : lp.top) {
+      top[engine.TokenBytes(id)] = logprob;
+    }
+    legacy.top.push_back(std::move(top));
+    legacy.offsets.push_back(legacy.offset);
+    legacy.offset += text.size();
+  }
+
+  // Runs every prompt's n choices; streams to `sink` or answers in `res`.
+  void Generate(Job& job, const httplib::Request& req, httplib::DataSink* sink,
+                httplib::Response* res) {
+    const auto& c = job.completion;
+    const auto gone = [&req] { return req.is_connection_closed(); };
+    const auto write = [&](const std::string& data) {
+      const std::string event = "data: " + data + "\n\n";
+      return sink->write(event.data(), event.size());
+    };
+    const auto chunk = [&](int index, std::string text, json logprobs,
+                           json finish) {
+      json out = {
+          {"id", job.id},
+          {"object", "text_completion"},
+          {"created", job.created},
+          {"model", job.model},
+          {"choices", json::array({{{"text", std::move(text)},
+                                    {"index", index},
+                                    {"logprobs", std::move(logprobs)},
+                                    {"finish_reason", std::move(finish)}}})}};
+      if (c.include_usage) {
+        out["usage"] = nullptr;
+      }
+      return Dump(out);
+    };
+    std::vector<Outcome> outs;
+    json choices = json::array();
+    std::string error;
+    bool client_gone = !Acquire(job, gone);
+    for (std::size_t p = 0;
+         p < job.gens.size() && !client_gone && error.empty(); ++p) {
+      for (int i = 0; i < c.n && !client_gone && error.empty(); ++i) {
+        const int index = static_cast<int>(p) * c.n + i;
+        std::string text = c.echo ? job.echo[p] : std::string();
+        Legacy legacy;
+        legacy.offset = text.size();
+        if (sink != nullptr && !text.empty() &&
+            !write(chunk(index, text, nullptr, nullptr))) {
+          client_gone = true;
+          break;
+        }
+        Hooks hooks;
+        hooks.gone = gone;
+        hooks.emit = [&](std::vector<OutputPart>&& parts) {
+          for (auto& part : parts) {
+            if (sink == nullptr) {
+              text += part.text;
+              continue;
+            }
+            json lp =
+                c.logprobs && !legacy.empty() ? legacy.Take() : json(nullptr);
+            if (!write(chunk(index, std::move(part.text), std::move(lp),
+                             nullptr))) {
+              return false;
+            }
+          }
+          return true;
+        };
+        if (c.logprobs) {
+          hooks.top_logprobs = *c.logprobs;
+          hooks.logprob = [&](TokenLogprobs&& lp) { AddLegacy(legacy, lp); };
+        }
+        Outcome out =
+            Run(job, job.gens[p], i, std::make_unique<PlainTextParser>(),
+                c.stop, 0, hooks);
+        if (!out.error.empty()) {
+          error = out.error;
+        } else if (out.client_gone) {
+          client_gone = true;
+        } else if (sink != nullptr) {
+          json lp =
+              c.logprobs && !legacy.empty() ? legacy.Take() : json(nullptr);
+          if (!write(chunk(index, "", std::move(lp), out.finish))) {
+            client_gone = true;
+          }
+        } else {
+          choices.push_back(
+              {{"text", std::move(text)},
+               {"index", index},
+               {"logprobs", c.logprobs ? legacy.Take() : json(nullptr)},
+               {"finish_reason", out.finish}});
+        }
+        outs.push_back(std::move(out));
+      }
+    }
+    job.ticket.reset();
+    metrics.RequestDuration(Since(job.arrived));
+    if (!error.empty()) {
+      metrics.Request(500);
+      if (sink != nullptr) {
+        write(Dump(ErrorJson(ApiError(500, "server_error", "", error))));
+      } else {
+        SendError(*res, ApiError(500, "server_error", "", error));
+      }
+      return;
+    }
+    if (client_gone) {
+      metrics.Request(kClientClosed);
+      if (res != nullptr) {
+        res->status = kClientClosed;
+      }
+      return;
+    }
+    metrics.Request(200);
+    const json usage = Usage(job, outs, c.n);
+    if (sink != nullptr) {
+      if (c.include_usage) {
+        write(Dump({{"id", job.id},
+                    {"object", "text_completion"},
+                    {"created", job.created},
+                    {"model", job.model},
+                    {"choices", json::array()},
+                    {"usage", usage}}));
+      }
+      write("[DONE]");
+      return;
+    }
+    res->set_content(Dump({{"id", job.id},
+                           {"object", "text_completion"},
+                           {"created", job.created},
+                           {"model", job.model},
+                           {"choices", std::move(choices)},
+                           {"usage", usage}}),
+                     "application/json");
   }
 
   Engine& engine;

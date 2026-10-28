@@ -96,6 +96,91 @@ bool Thinking(const json& body) {
   return false;
 }
 
+void ParseSampling(const json& body, SamplingParams& s) {
+  constexpr std::int64_t kMaxInt = std::numeric_limits<int>::max();
+  s.temperature = static_cast<float>(
+      Number(body, "temperature", 0, 2).value_or(s.temperature));
+  if (const auto top_p = Number(body, "top_p", 0, 1)) {
+    if (*top_p <= 0) {
+      throw InvalidRequest("top_p must be above 0", "top_p");
+    }
+    s.top_p = static_cast<float>(*top_p);
+  }
+  s.top_k = static_cast<int>(Integer(body, "top_k", 0, kMaxInt).value_or(0));
+  s.min_p = static_cast<float>(Number(body, "min_p", 0, 1).value_or(0));
+  s.presence_penalty =
+      static_cast<float>(Number(body, "presence_penalty", -2, 2).value_or(0));
+  s.frequency_penalty =
+      static_cast<float>(Number(body, "frequency_penalty", -2, 2).value_or(0));
+  if (const auto rep = Number(body, "repetition_penalty", 0, 10)) {
+    if (*rep <= 0) {
+      throw InvalidRequest("repetition_penalty must be above 0",
+                           "repetition_penalty");
+    }
+    s.repetition_penalty = static_cast<float>(*rep);
+  }
+  if (const auto seed =
+          Integer(body, "seed", std::numeric_limits<std::int64_t>::min(),
+                  std::numeric_limits<std::int64_t>::max())) {
+    s.seed = static_cast<std::uint64_t>(*seed);
+  }
+
+  if (const json* bias = Field(body, "logit_bias")) {
+    if (!bias->is_object()) {
+      throw InvalidRequest("logit_bias must be an object", "logit_bias");
+    }
+    for (const auto& [key, value] : bias->items()) {
+      std::size_t used = 0;
+      long long id = -1;
+      try {
+        id = std::stoll(key, &used);
+      } catch (const std::exception&) {
+      }
+      if (used != key.size() || id < 0 || id > kMaxInt) {
+        throw InvalidRequest("logit_bias keys must be token ids", "logit_bias");
+      }
+      if (!value.is_number() || !std::isfinite(value.get<double>()) ||
+          value.get<double>() < -100 || value.get<double>() > 100) {
+        throw InvalidRequest("logit_bias values must be in [-100, 100]",
+                             "logit_bias");
+      }
+      s.logit_bias.emplace_back(static_cast<int>(id),
+                                static_cast<float>(value.get<double>()));
+    }
+  }
+}
+
+std::vector<std::string> Stop(const json& body) {
+  std::vector<std::string> out;
+  if (const json* stop = Field(body, "stop")) {
+    if (stop->is_string()) {
+      out.push_back(stop->get<std::string>());
+    } else if (stop->is_array() && stop->size() <= 16) {
+      for (const auto& item : *stop) {
+        if (!item.is_string()) {
+          throw InvalidRequest("stop must be a string or strings", "stop");
+        }
+        out.push_back(item.get<std::string>());
+      }
+    } else {
+      throw InvalidRequest("stop must be a string or up to 16 strings", "stop");
+    }
+  }
+
+  return out;
+}
+
+void ParseStream(const json& body, bool& stream, bool& include_usage) {
+  stream = Bool(body, "stream").value_or(false);
+  if (const json* options = Field(body, "stream_options")) {
+    if (!options->is_object()) {
+      throw InvalidRequest("stream_options must be an object",
+                           "stream_options");
+    }
+    include_usage = Bool(*options, "include_usage").value_or(false);
+  }
+}
+
 }  // namespace
 
 nlohmann::json ErrorJson(const ApiError& error) {
@@ -151,13 +236,15 @@ ChatRequest ParseChatRequest(const json& body) {
   }
   req.prompt.thinking = Thinking(body);
 
-  if (const auto n = Integer(body, "n", 1, 1 << 20); n && *n != 1) {
-    throw Unsupported("n must be 1", "n");
+  req.n = static_cast<int>(Integer(body, "n", 1, kMaxChoices).value_or(1));
+  req.logprobs = Bool(body, "logprobs").value_or(false);
+  if (const auto top = Integer(body, "top_logprobs", 0, kMaxTopLogprobs)) {
+    if (!req.logprobs) {
+      throw InvalidRequest("top_logprobs needs logprobs: true", "top_logprobs");
+    }
+    req.top_logprobs = static_cast<int>(*top);
   }
-  if (Bool(body, "logprobs").value_or(false) ||
-      Field(body, "top_logprobs") != nullptr) {
-    throw Unsupported("logprobs are not supported", "logprobs");
-  }
+  req.parallel_tool_calls = Bool(body, "parallel_tool_calls").value_or(true);
   if (const json* format = Field(body, "response_format")) {
     if (!format->is_object() || format->value("type", "") != "text") {
       throw Unsupported("response_format supports only {\"type\": \"text\"}",
@@ -174,57 +261,107 @@ ChatRequest ParseChatRequest(const json& body) {
     req.max_tokens = static_cast<int>(*max_tokens);
   }
 
-  auto& s = req.sampling;
-  s.temperature = static_cast<float>(
-      Number(body, "temperature", 0, 2).value_or(s.temperature));
-  if (const auto top_p = Number(body, "top_p", 0, 1)) {
-    if (*top_p <= 0) {
-      throw InvalidRequest("top_p must be above 0", "top_p");
-    }
-    s.top_p = static_cast<float>(*top_p);
-  }
-  s.top_k = static_cast<int>(Integer(body, "top_k", 0, kMaxInt).value_or(0));
-  s.min_p = static_cast<float>(Number(body, "min_p", 0, 1).value_or(0));
-  s.presence_penalty =
-      static_cast<float>(Number(body, "presence_penalty", -2, 2).value_or(0));
-  s.frequency_penalty =
-      static_cast<float>(Number(body, "frequency_penalty", -2, 2).value_or(0));
-  if (const auto rep = Number(body, "repetition_penalty", 0, 10)) {
-    if (*rep <= 0) {
-      throw InvalidRequest("repetition_penalty must be above 0",
-                           "repetition_penalty");
-    }
-    s.repetition_penalty = static_cast<float>(*rep);
-  }
-  if (const auto seed =
-          Integer(body, "seed", std::numeric_limits<std::int64_t>::min(),
-                  std::numeric_limits<std::int64_t>::max())) {
-    s.seed = static_cast<std::uint64_t>(*seed);
-  }
+  ParseSampling(body, req.sampling);
+  req.stop = Stop(body);
+  ParseStream(body, req.stream, req.include_usage);
+  return req;
+}
 
-  if (const json* stop = Field(body, "stop")) {
-    if (stop->is_string()) {
-      req.stop.push_back(stop->get<std::string>());
-    } else if (stop->is_array() && stop->size() <= 16) {
-      for (const auto& item : *stop) {
-        if (!item.is_string()) {
-          throw InvalidRequest("stop must be a string or strings", "stop");
+CompletionRequest ParseCompletionRequest(const json& body) {
+  if (!body.is_object()) {
+    throw InvalidRequest("the request body must be a JSON object");
+  }
+  CompletionRequest req;
+  const json* prompt = Field(body, "prompt");
+  const auto bad_prompt = [] {
+    return InvalidRequest(
+        "prompt must be a string, an array of strings, an array of token ids "
+        "or an array of such arrays",
+        "prompt");
+  };
+  const auto token_ids = [&](const json& arr) {
+    std::vector<int> ids;
+    for (const auto& t : arr) {
+      if (!t.is_number_integer() || t.get<std::int64_t>() < 0 ||
+          t.get<std::int64_t>() > std::numeric_limits<int>::max()) {
+        throw bad_prompt();
+      }
+      ids.push_back(t.get<int>());
+    }
+    if (ids.empty()) {
+      throw bad_prompt();
+    }
+    return ids;
+  };
+  if (prompt == nullptr) {
+    throw InvalidRequest("prompt is required", "prompt");
+  } else if (prompt->is_string()) {
+    req.texts.push_back(prompt->get<std::string>());
+  } else if (prompt->is_array() && !prompt->empty()) {
+    const json& first = prompt->front();
+    if (first.is_string()) {
+      for (const auto& p : *prompt) {
+        if (!p.is_string()) {
+          throw bad_prompt();
         }
-        req.stop.push_back(item.get<std::string>());
+        req.texts.push_back(p.get<std::string>());
+      }
+    } else if (first.is_number_integer()) {
+      req.ids.push_back(token_ids(*prompt));
+    } else if (first.is_array()) {
+      for (const auto& p : *prompt) {
+        if (!p.is_array()) {
+          throw bad_prompt();
+        }
+        req.ids.push_back(token_ids(p));
       }
     } else {
-      throw InvalidRequest("stop must be a string or up to 16 strings", "stop");
+      throw bad_prompt();
+    }
+  } else {
+    throw bad_prompt();
+  }
+  for (const auto& text : req.texts) {
+    if (text.empty()) {
+      throw InvalidRequest("prompt must not be empty", "prompt");
     }
   }
-
-  req.stream = Bool(body, "stream").value_or(false);
-  if (const json* options = Field(body, "stream_options")) {
-    if (!options->is_object()) {
-      throw InvalidRequest("stream_options must be an object",
-                           "stream_options");
-    }
-    req.include_usage = Bool(*options, "include_usage").value_or(false);
+  if (req.prompts() > kMaxChoices) {
+    throw InvalidRequest(
+        "at most " + std::to_string(kMaxChoices) + " prompts per request",
+        "prompt");
   }
+  if (const json* suffix = Field(body, "suffix")) {
+    if (!suffix->is_string() || !suffix->get<std::string>().empty()) {
+      throw Unsupported("suffix is not supported", "suffix");
+    }
+  }
+  req.n = static_cast<int>(Integer(body, "n", 1, kMaxChoices).value_or(1));
+  if (req.n * static_cast<int>(req.prompts()) > kMaxChoices) {
+    throw InvalidRequest(
+        "prompts times n must be at most " + std::to_string(kMaxChoices), "n");
+  }
+  if (const auto best_of = Integer(body, "best_of", 1, kMaxChoices);
+      best_of && *best_of != req.n) {
+    throw Unsupported("best_of must equal n", "best_of");
+  }
+  if (const auto max_tokens =
+          Integer(body, "max_tokens", 1, std::numeric_limits<int>::max())) {
+    req.max_tokens = static_cast<int>(*max_tokens);
+  }
+  if (const auto lp = Integer(body, "logprobs", 0, 5)) {
+    req.logprobs = static_cast<int>(*lp);
+  }
+  req.echo = Bool(body, "echo").value_or(false);
+  if (req.echo && req.logprobs) {
+    throw Unsupported(
+        "echo with logprobs is not supported (prompt tokens have no "
+        "logprobs here)",
+        "echo");
+  }
+  ParseSampling(body, req.sampling);
+  req.stop = Stop(body);
+  ParseStream(body, req.stream, req.include_usage);
   return req;
 }
 

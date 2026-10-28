@@ -7,7 +7,8 @@
 #include "serve/engine.hpp"
 
 // The OpenAI-compatible HTTP server (docs/SERVING.md): /v1/chat/completions
-// (streaming and not), /v1/models, /health and /metrics over one engine.
+// (streaming and not), the legacy /v1/completions, /v1/models, /health
+// and /metrics over one engine.
 namespace gufo_npu::serve {
 
 struct ServerOptions {
