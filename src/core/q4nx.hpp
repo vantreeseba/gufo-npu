@@ -77,6 +77,16 @@ struct Segment {
 // `order`, when given, picks the stacked row for each packed row.
 Matrix PackRows(const std::vector<Segment>& segments, std::size_t dim, Fit fit,
                 const std::vector<std::size_t>& order = {});
+// One PackRows call's arguments.
+struct PackJob {
+  std::vector<Segment> segments;
+  std::size_t dim = 0;
+  std::vector<std::size_t> order;
+};
+// PackRows for each job, in one parallel region over every job's row tiles:
+// the same bytes as packing them one by one, faster when they are many and
+// small (an MoE layer's experts).
+std::vector<Matrix> PackEach(const std::vector<PackJob>& jobs, Fit fit);
 
 // The packed-row order for a [gate (ffn rows) | up (ffn rows)] stack that the
 // GEMV's SwiGLU output stage expects: each kMTile tile holds 16 gate rows,

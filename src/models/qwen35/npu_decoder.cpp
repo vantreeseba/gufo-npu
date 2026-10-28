@@ -259,17 +259,24 @@ struct NpuDecoder::Impl {
     const auto& gate = t("ffn_gate_exps.weight");
     const auto& up = t("ffn_up_exps.weight");
     const auto& down = t("ffn_down_exps.weight");
+    // Every expert's [gate | up] and down, then the shared expert's, packed
+    // in one parallel region (514 small matrices; one at a time, each
+    // call's thread start-up dominated).
+    std::vector<q4nx::PackJob> jobs;
     for (std::size_t e = 0; e < static_cast<std::size_t>(c.experts); ++e) {
-      put(e,
-          q4nx::PackRows({RowsOf(gate, e * ef, ef), RowsOf(up, e * ef, ef)},
-                         hidden, fit, order),
-          q4nx::PackRows({RowsOf(down, e * hidden, hidden)}, ef, fit));
+      jobs.push_back(
+          {{RowsOf(gate, e * ef, ef), RowsOf(up, e * ef, ef)}, hidden, order});
+      jobs.push_back({{RowsOf(down, e * hidden, hidden)}, ef, {}});
     }
-    put(static_cast<std::size_t>(c.experts),
-        q4nx::PackRows({SegmentOf(t("ffn_gate_shexp.weight")),
-                        SegmentOf(t("ffn_up_shexp.weight"))},
-                       hidden, fit, order),
-        PackOne(t("ffn_down_shexp.weight"), fit));
+    jobs.push_back({{SegmentOf(t("ffn_gate_shexp.weight")),
+                     SegmentOf(t("ffn_up_shexp.weight"))},
+                    hidden,
+                    order});
+    jobs.push_back({{SegmentOf(t("ffn_down_shexp.weight"))}, ef, {}});
+    const auto packed = q4nx::PackEach(jobs, fit);
+    for (std::size_t e = 0; e <= static_cast<std::size_t>(c.experts); ++e) {
+      put(e, packed[2 * e], packed[2 * e + 1]);
+    }
     b.arena->ToDevice();
     b.post_norm = ToFloats(t("post_attention_norm.weight"));
     b.router = ToFloats(t("ffn_gate_inp.weight"));
