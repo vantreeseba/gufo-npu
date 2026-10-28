@@ -39,7 +39,7 @@ struct SamplingParams {
 // Greedy without penalties is std::max_element over the logits (the first
 // maximum), exactly as the models' greedy paths pick.
 class Sampler {
- public:
+public:
   static constexpr float kTailNats = 25.0f;
 
   // A seed in `params` makes the draws reproducible; without one the
@@ -63,7 +63,7 @@ class Sampler {
   // A uniform draw in [0, 1) from the sampler's generator.
   double Uniform();
 
- private:
+private:
   bool HasPenalties() const;
   // The logit after penalties.
   float Penalized(int id, float logit) const;

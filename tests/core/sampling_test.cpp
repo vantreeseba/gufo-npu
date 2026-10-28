@@ -2,6 +2,8 @@
 // each filter and penalty gives the documented distribution, draws follow it
 // (chi-square), and the speculative loop's acceptance rule (draw from the
 // target, keep the draft when they agree) samples the target exactly.
+#include "core/sampling.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -10,8 +12,6 @@
 #include <map>
 #include <random>
 #include <vector>
-
-#include "core/sampling.hpp"
 
 namespace {
 
@@ -78,8 +78,7 @@ std::vector<double> Softmax(const std::vector<float>& logits, float t) {
 }
 
 void CheckDraws(Sampler& sampler, const std::vector<float>& logits,
-                const std::vector<double>& expected, long n,
-                const char* what) {
+                const std::vector<double>& expected, long n, const char* what) {
   std::vector<long> counts(logits.size(), 0);
   for (long i = 0; i < n; ++i) {
     ++counts[static_cast<std::size_t>(
@@ -397,7 +396,8 @@ void SpeculativeRule() {
       while (going) {
         const int y2 = draft[static_cast<std::size_t>(y1)];
         ++steps;
-        const int z1 = s.Sample(target[static_cast<std::size_t>(y1)].data(), kV);
+        const int z1 =
+            s.Sample(target[static_cast<std::size_t>(y1)].data(), kV);
         if (z1 == y2) {
           ++accepted;
           going = emit(y2);
