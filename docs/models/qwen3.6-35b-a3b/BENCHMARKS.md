@@ -141,14 +141,14 @@ cache and first token included), warm, a warm-up then 3 runs back to back,
 two rounds interleaved with main's build (the experts on the NPU,
 `ExpertBackend::kNpu`), 2026-10-28:
 
-| Prompt tokens | Experts on the CPU (min–max, both rounds) | Main: experts on the NPU | FLM | Faster than FLM |
-|---|---|---|---|---|
-| 35 | **0.245 s** (0.235–0.249) | 1.02 s (decode path) | 3.49 s | 14× |
-| 125 | **0.344 s** (0.337–0.350) | 3.34 s | 5.17 s | 15× |
-| 1,055 | **1.250 s** (1.237–1.263) | 5.56 s | 8.75 s | 7.0× |
-| 2,119 | **2.352 s** (2.331–2.390) | 7.00 s | 11.91 s | 5.1× |
-| 4,246 | **4.766 s** (4.727–4.831) | 9.79 s | 19.47 s | 4.1× |
-| 8,499 | **10.692 s** (10.626–10.739) | 16.09 s | 34.17 s | 3.2× |
+| Prompt tokens | Experts on the CPU (min–max, both rounds) | Prompt tok/s | Main: experts on the NPU | FLM | FLM tok/s | Faster than FLM |
+|---|---|---|---|---|---|---|
+| 35 | **0.245 s** (0.235–0.249) | 143 | 1.02 s (decode path) | 3.49 s | 10.1 | 14× |
+| 125 | **0.344 s** (0.337–0.350) | 363 | 3.34 s | 5.17 s | 24.2 | 15× |
+| 1,055 | **1.250 s** (1.237–1.263) | 844 | 5.56 s | 8.75 s | 120.6 | 7.0× |
+| 2,119 | **2.352 s** (2.331–2.390) | 901 | 7.00 s | 11.91 s | 177.9 | 5.1× |
+| 4,246 | **4.766 s** (4.727–4.831) | 891 | 9.79 s | 19.47 s | 218.0 | 4.1× |
+| 8,499 | **10.692 s** (10.626–10.739) | 795 | 16.09 s | 34.17 s | 248.8 | 3.2× |
 
 These are the min/max-fit weights before #15. With the search fit (#15) the
 spot check at 1,055 tokens gives 1.260 s (1.259–1.262, 2 runs, warm): the

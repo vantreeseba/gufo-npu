@@ -526,11 +526,11 @@ Two changes from the TTFT research (`docs/research/TTFT.md` on
 warm up, then three runs, back to back so the NPU never idles into its
 5 s autosuspend), two interleaved rounds of three builds, alone on the NPU:
 
-| Prompt tokens | main | + AVX-512 DeltaNet | + first token from prefill |
-|---|---|---|---|
-| 35 | 0.107, 0.106 s | 0.107, 0.106 | **0.086, 0.086** (−21 ms against main) |
-| 1,024 | 0.317, 0.315 | 0.312, 0.311 | **0.291, 0.290** (−26 ms) |
-| 4,096 | 1.235, 1.229 | 1.226, 1.223 | **1.195, 1.199** (−35 ms) |
+| Prompt tokens | main | + AVX-512 DeltaNet | + first token from prefill | Prompt tok/s (final) |
+|---|---|---|---|---|
+| 35 | 0.107, 0.106 s | 0.107, 0.106 | **0.086, 0.086** (−21 ms against main) | 407 |
+| 1,024 | 0.317, 0.315 | 0.312, 0.311 | **0.291, 0.290** (−26 ms) | 3,525 |
+| 4,096 | 1.235, 1.229 | 1.226, 1.223 | **1.195, 1.199** (−35 ms) | 3,422 |
 
 - **First token from the prefill.** PrefillPrompt now prefills the whole
   prompt; the first token comes from the LM head alone on its last row

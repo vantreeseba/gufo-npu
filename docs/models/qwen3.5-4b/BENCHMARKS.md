@@ -69,12 +69,12 @@ autosuspend. TTFT is SpeculativeGenerate's prompt phase (prefill, MTP cache,
 first token, first draft). Two interleaved rounds of three builds, then the
 final build, alone on the NPU:
 
-| Prompt tokens | main | + AVX-512 DeltaNet | + first token from prefill | + chunk planner (final) |
-|---|---|---|---|---|
-| 35 | 0.237, 0.236 s | 0.235, 0.236 | 0.188, 0.189 | **0.188** (−48 ms against main) |
-| 1,024 | 0.719, 0.727 | 0.709, 0.710 | 0.661, 0.662 | **0.660** (−63 ms) |
-| 4,096 | 2.930, 2.929 | 2.886, 2.915 | 2.854, 2.837 | **2.844** (−86 ms) |
-| 9,000 | 7.930, 7.880 | 7.799, 7.841 | 7.772, 7.717 | **7.787** (−118 ms) |
+| Prompt tokens | main | + AVX-512 DeltaNet | + first token from prefill | + chunk planner (final) | Prompt tok/s (final) |
+|---|---|---|---|---|---|
+| 35 | 0.237, 0.236 s | 0.235, 0.236 | 0.188, 0.189 | **0.188** (−48 ms against main) | 186 |
+| 1,024 | 0.719, 0.727 | 0.709, 0.710 | 0.661, 0.662 | **0.660** (−63 ms) | 1,552 |
+| 4,096 | 2.930, 2.929 | 2.886, 2.915 | 2.854, 2.837 | **2.844** (−86 ms) | 1,440 |
+| 9,000 | 7.930, 7.880 | 7.799, 7.841 | 7.772, 7.717 | **7.787** (−118 ms) | 1,156 |
 
 - **First token from the prefill.** PrefillPrompt prefills the whole
   prompt; the first token comes from the LM head alone on its last row
