@@ -422,8 +422,11 @@ contribution to each token's residual.
 
 | Path | Worst token rel. L2 | Repeat | Limit |
 |---|---|---|---|
-| Portable (any x86-64-v3 CPU; hosted CI) | 3.80e-3 | bit-identical | < 1e-2 |
-| AVX-512 BF16 (the box) | 3.80e-3 | bit-identical | < 1e-2 |
+| Portable (any x86-64-v3 CPU; hosted CI) | 3.67e-3 | bit-identical | < 1e-2 |
+| AVX-512 BF16 (the box) | 3.67e-3 | bit-identical | < 1e-2 |
+
+(The experts are packed with the search fit, as the 35B packs its weights;
+3.80e-3 with the min/max fit.)
 
 The step rounds each q4nx weight once to bf16 (dmin·mn + d·sc·code built
 exactly in fp32) and the SwiGLU output to bf16 before the down projection;
@@ -478,9 +481,9 @@ argument, `qwen36_npu_prefill_npu_experts_test`); 2026-10-28 it gives the
 same results.
 
 With the experts on the CPU (the default, `qwen36_npu_prefill_test`),
-2026-10-28: the same checks, the errors equal or a little smaller (the
-experts' weights are rounded to bf16 per value rather than to bfp16 per 8,
-and their activations stay bf16):
+2026-10-28, on the min/max-fit weights before #15: the same checks, the
+errors equal or a little smaller (the experts' weights are rounded to bf16
+per value rather than to bfp16 per 8, and their activations stay bf16):
 
 | Prompt | Hidden | Conv | DeltaNet state | K/V | MTP K/V | Logits | Argmax | Routings unlike the prefill's own (largest gap) | Hidden per token: max / over 0.1 |
 |---|---|---|---|---|---|---|---|---|---|
@@ -499,6 +502,17 @@ within the 95% limit); the first token is the decode path's on 9 of 10
 prompts (the 230-token passage again a 0.01-logit tie); every repeat is
 bit-identical; speculation after the prefill equals plain greedy (48 tokens,
 57% of drafts kept). The same limits hold.
+
+With the search fit (#15), 2026-10-28, both backends pass the same limits:
+
+| Experts | Argmax | First token (own routing) | 1,024: hidden / logits | 2,049: hidden / K/V / logits | 4,000: hidden / K/V / logits | Speculation after prefill |
+|---|---|---|---|---|---|---|
+| CPU (default) | 169/170 | same on 10 of 10 | 4.5e-2 / 0.17 | 7.2e-2 / 9.9e-2 / 0.11 | 8.2e-2 / 0.11 / 0.17 | equals greedy (48 tokens, 66% kept) |
+| NPU | 167/170 | same on 10 of 10 | 4.1e-2 / 0.16 | 7.5e-2 / 0.10 / 0.12 | 8.5e-2 / 0.11 / 0.16 | equals greedy (48 tokens, 66% kept) |
+
+The NPU backend's 167/170 is #15's own measurement again (near ties in the
+decode path's top two after routing diverges on the long prompts); every
+repeat is bit-identical on both.
 
 **With the search fit** (this model's fit since 2026-10-28, `qwen35::Q4nxFit`)
 argmax agrees 167/170 (pass ≥ 95%); the states after prefill are as close to

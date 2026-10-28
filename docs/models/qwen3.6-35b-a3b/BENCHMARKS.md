@@ -150,6 +150,10 @@ two rounds interleaved with main's build (the experts on the NPU,
 | 4,246 | **4.766 s** (4.727–4.831) | 9.79 s | 19.47 s | 4.1× |
 | 8,499 | **10.692 s** (10.626–10.739) | 16.09 s | 34.17 s | 3.2× |
 
+These are the min/max-fit weights before #15. With the search fit (#15) the
+spot check at 1,055 tokens gives 1.260 s (1.259–1.262, 2 runs, warm): the
+fit changes the weights, not the work.
+
 Where the time goes (seconds per run, mean of both rounds; the GEMM column is
 the NPU's dense matrices):
 
