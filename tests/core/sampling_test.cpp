@@ -147,7 +147,10 @@ void Seeds() {
   Check(same, "same seed, same draws");
   p.seed = 43;
   Sampler c(p);
-  Sampler d(SamplingParams{1.0f, 1.0f, 0, 0.0f, 0, 0, 1.0f, 42});
+  SamplingParams same_seed;
+  same_seed.temperature = 1.0f;
+  same_seed.seed = 42;
+  Sampler d(same_seed);
   int differ = 0;
   for (int i = 0; i < 2000; ++i) {
     differ += c.Sample(l.data(), 6) != d.Sample(l.data(), 6);
