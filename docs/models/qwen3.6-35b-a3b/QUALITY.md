@@ -572,3 +572,69 @@ DeltaNet heads, 256/8 experts of width 512, shared expert 512, untied head),
 and every tensor dequantizes to finite values (753 tensors, 35.5 B values,
 ~2.5 s). `tests/models/qwen35/config_test.cpp` (hosted CI) covers the same
 fields on synthetic `qwen35` / `qwen35moe` headers, plus inconsistent ones.
+
+## Prompt cache (2026-10-28)
+
+`qwen36_prompt_cache_test` (labels `qwen36_35b_a3b;npu;model`; how the cache works is in
+[BENCHMARKS.md](BENCHMARKS.md), "Prompt cache across requests"). A chat
+over ~1k tokens of notes, turns 2 and 3, each state against the whole
+prompt through the model's own `PrefillPrompt`: the decode state (every
+layer's conv window, DeltaNet state and K/V cache), the MTP layer's K/V
+cache and the last prompt row's final residual.
+
+| Check | Turn 2 / turn 3 |
+|---|---|
+| The previous turn's checkpoint restored, the rest (~40 tokens) through the prefill | **bit-identical** (every error 0) |
+| An exact repeat: the checkpoint restored, the generation prompt through the prefill | **bit-identical** |
+| A 5-token remainder through the decoder (below the prefill threshold) | hidden 4.4e-2 / 6.3e-2, states 6.2e-2 / 7.2e-2 |
+| The same prompt entirely through the decode path, for scale | hidden 6.9e-2 / 6.9e-2, states 0.23 / 0.22 (its routing drifts from the prefill's over 1k tokens, as "NPU prefill" above shows) |
+| The checkpoint the decoder took mid-remainder, continued through the prefill | hidden 5.4e-2 / 9.7e-2, states 6.1e-2 / 8.6e-2 |
+| Greedy MTP output, 3 turns at ~1k and ~4k tokens of history, two rounds: with the cache (hits) and on a miss, against `PrefillPrompt` | **identical** every turn |
+
+- **Bit-identical restore:** the prefill's arithmetic for a token does not
+  depend on where a pass starts. Its GEMM rows are independent, the
+  DeltaNet runs token by token, and attention reads the same cache, so a
+  checkpoint plus the rest equals one prefill exactly.
+- **The decoder's remainders** differ from the prefill as the decode path
+  always does (bfp16 GEMMs against q4nx GEMVs), and no more: within the
+  limits of the model's prefill test (hidden 0.15, states 0.2).
+- **Untouched without a cache:** the capture is off unless a checkpoint
+  is asked for, and outputs keep their hashes: the 960-token prompt with MTP `1de5ad9f` (as #15 recorded); the sky prompt with MTP `2c9f87d3`.
+- **Cache logic** (`qwen35_prompt_cache_logic_test`, CPU, label
+  `qwen35_family`): on a toy model with an order-dependent recurrent
+  layer, a restored run leaves exactly the uncached state over four
+  turns, with and without the MTP cache and with the last token left to
+  the decoder; short prompts go to the decoder untouched; a repeat runs
+  only the generation prompt; least-recently-used and byte-budget
+  eviction; and a draft request skips checkpoints without the MTP cache.
+
+## Sampling with MTP drafts (2026-10-28)
+
+`qwen36_npu_sampling_test` (`tests/models/qwen35/sampling_check.hpp`):
+400 continuations of 5 tokens of one chat prompt ("Write a short poem about
+the sea.") at temperature 1, top-k 20, with and without the MTP draft, each run
+on its own seed. A two-sample chi-square test (p = 1e-6) per position and for
+tokens 1 and 2 jointly finds no difference (47% of drafts accepted):
+
+| Compared | Chi-square | df | Limit |
+|---|---|---|---|
+| token 0 | 3.0 | 5 | 37.5 |
+| token 1 | 8.5 | 12 | 51.8 |
+| token 2 | 11.6 | 14 | 55.5 |
+| token 3 | 14.6 | 10 | 48.0 |
+| token 4 | 10.8 | 12 | 51.8 |
+| tokens 1 and 2 | 8.4 | 13 | 53.7 |
+
+- The rule needs no draft probabilities: the draft is a point proposal, so
+  drawing the first token from the main model and keeping the draft when they
+  agree is speculative sampling's acceptance (probability p(draft)), and a
+  miss is distributed as p without the draft.
+- `sampling_test` (CPU) checks the same loop against exact enumeration on a
+  toy model, with and without a frequency penalty, and each filter's
+  distribution.
+- Greedy (temperature 0) output is unchanged: the hashes and the
+  speculative-equals-greedy checks of the decode tests are as before.
+- The sky prompt's greedy hash is now `2c9f87d3`, both on this branch and on
+  #13's own build (the Fibonacci prompt's `9430fd17` is unchanged). It was
+  `c4d7f8e2` while 24-token prompts still took the decode path; #13 sends
+  prompts of 6 tokens or more through the prefill with CPU experts.

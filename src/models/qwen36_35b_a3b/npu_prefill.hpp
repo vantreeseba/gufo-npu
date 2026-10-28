@@ -8,6 +8,8 @@
 #include "models/qwen35/config.hpp"
 #include "models/qwen35/decoder.hpp"
 #include "models/qwen35/npu_decoder.hpp"
+#include "models/qwen35/prompt_cache.hpp"
+#include "models/qwen35/state_capture.hpp"
 
 // Qwen3.6-35B-A3B prompt processing (prefill) on the NPU and the CPU
 // (docs/research/NPU-MOE-PREFILL.md, docs/research/TTFT.md). The prompt goes
@@ -58,9 +60,10 @@ public:
 
   // Runs `count` tokens from state.position and advances the state. With
   // `hidden`, writes each token's final residual (before output_norm), count
-  // rows of hidden values: the MTP head's input.
+  // rows of hidden values: the MTP head's input. With `capture`, copies the
+  // DeltaNet layers' state at capture->position on the way.
   void Run(const int* tokens, int count, qwen35::DecodeState& state,
-           float* hidden);
+           float* hidden, const qwen35::StateCapture* capture = nullptr);
 
   // The MTP layer's cache: for i < count, the pair (hidden row i, tokens[i])
   // at position + i, where hidden row i is the main model's final residual
@@ -122,5 +125,12 @@ constexpr int MinPrefillPrompt(ExpertBackend experts) {
                                         : kMinPrefillPromptNpu;
 }
 qwen35::PromptPrefill PrefillPrompt(NpuPrefill& prefill);
+
+// How this model runs prompt tokens for a PromptCache (prompt_cache.hpp):
+// `prefill` from MinPrefillPrompt tokens, `decoder` (the one `prefill`
+// reads) below that; the prompt's last token stays with the decoder, as in
+// PrefillPrompt.
+qwen35::PromptCacheModel MakePromptCacheModel(qwen35::NpuDecoder& decoder,
+                                              NpuPrefill& prefill);
 
 }  // namespace gufo_npu::qwen36_35b_a3b

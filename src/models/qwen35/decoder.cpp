@@ -5,6 +5,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include "core/cpus.hpp"
 #include "core/quant.hpp"
@@ -97,6 +98,44 @@ Mixer::Mixer(const gguf::File& file)
 }
 
 Mixer::~Mixer() = default;
+
+StatePool::StatePool(std::function<DecodeState()> fresh, std::size_t keep)
+    : fresh_(std::move(fresh)), keep_(keep) {}
+
+DecodeState StatePool::Acquire() {
+  const std::lock_guard lock(mutex_);
+  if (free_.empty()) {
+    return fresh_();
+  }
+  if (!proto_) {
+    proto_ = fresh_();
+  }
+  DecodeState state = std::move(free_.back());
+  free_.pop_back();
+  if (state.layers.size() != proto_->layers.size()) {
+    return fresh_();
+  }
+  // Every buffer takes the fresh state's contents; assign keeps capacity.
+  state.position = proto_->position;
+  for (std::size_t il = 0; il < state.layers.size(); ++il) {
+    const auto& from = proto_->layers[il];
+    auto& to = state.layers[il];
+    to.conv.assign(from.conv.begin(), from.conv.end());
+    to.ssm.assign(from.ssm.begin(), from.ssm.end());
+    to.keys.assign(from.keys.begin(), from.keys.end());
+    to.values.assign(from.values.begin(), from.values.end());
+    to.ssm_spec.assign(from.ssm_spec.begin(), from.ssm_spec.end());
+    to.conv_saved.assign(from.conv_saved.begin(), from.conv_saved.end());
+  }
+  return state;
+}
+
+void StatePool::Release(DecodeState&& state) {
+  const std::lock_guard lock(mutex_);
+  if (free_.size() < keep_) {
+    free_.push_back(std::move(state));
+  }
+}
 
 DecodeState Mixer::NewState() const {
   const Config& c = config_;

@@ -39,6 +39,11 @@ find_package(ICU REQUIRED COMPONENTS uc i18n)
 add_library(nlohmann_json INTERFACE)
 target_include_directories(nlohmann_json SYSTEM INTERFACE
   "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
+add_library(cpp_httplib INTERFACE)
+target_include_directories(cpp_httplib SYSTEM INTERFACE
+  "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
+find_package(Threads REQUIRED)
+target_link_libraries(cpp_httplib INTERFACE Threads::Threads)
 
 # CPU-only core: no XRT, safe for hosted CI and unit tests.
 add_library(gufo_npu_core STATIC
@@ -47,12 +52,18 @@ add_library(gufo_npu_core STATIC
   src/core/gguf.cpp
   src/core/q4nx.cpp
   src/core/quant.cpp
+  src/core/sampling.cpp
   src/core/tokenizer.cpp
 )
 target_link_libraries(gufo_npu_core PUBLIC ICU::uc ICU::i18n)
 target_include_directories(gufo_npu_core PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
   "${CMAKE_CURRENT_BINARY_DIR}/generated")
+
+# The server's chat format: OpenAI messages to the Qwen3.5 / Qwen3.6 chat
+# template and the model's output back to content, reasoning and tool calls.
+add_library(gufo_npu_serve_chat STATIC src/serve/chat_format_qwen35.cpp)
+target_link_libraries(gufo_npu_serve_chat PUBLIC gufo_npu_core nlohmann_json)
 
 # Qwen3.5 / Qwen3.6 model code (CPU reference).
 add_library(gufo_npu_qwen35 STATIC
@@ -64,6 +75,7 @@ add_library(gufo_npu_qwen35 STATIC
   src/models/qwen35/gguf_projections.cpp
   src/models/qwen35/moe.cpp
   src/models/qwen35/mtp.cpp
+  src/models/qwen35/prompt_cache.cpp
   src/models/qwen35/reference.cpp
 )
 target_link_libraries(gufo_npu_qwen35 PUBLIC gufo_npu_core)
@@ -75,6 +87,10 @@ set_source_files_properties(src/models/qwen35/decoder.cpp
   COMPILE_OPTIONS "-march=x86-64-v3;-O3")
 # The q4nx packer's fit vectorizes too; no fused multiply-adds, so Unpack and
 # Gemv round exactly as written (tests compare unpacked weights bit for bit).
+# Sampling weighs the whole vocabulary once per token; its exp loop
+# vectorizes once compares may not trap (nothing here reads FP exceptions).
+set_source_files_properties(src/core/sampling.cpp PROPERTIES
+  COMPILE_OPTIONS "-march=x86-64-v3;-O3;-fno-trapping-math")
 set_source_files_properties(src/core/q4nx.cpp PROPERTIES
   COMPILE_OPTIONS "-march=x86-64-v3;-O3;-ffp-contract=off")
 
@@ -114,10 +130,25 @@ endif()
 # Per-model packages: their own NPU programs and host wiring.
 add_subdirectory(src/models/qwen35_4b)
 add_subdirectory(src/models/qwen36_35b_a3b)
+# The OpenAI-compatible server's model side (src/serve).
+add_subdirectory(src/serve)
+
+# OpenAI-compatible server (docs/SERVING.md): HTTP, OpenAI JSON, queue and
+# metrics over the Engine and ChatFormat interfaces. CPU-only.
+add_library(gufo_npu_serve STATIC
+  src/serve/metrics.cpp
+  src/serve/openai.cpp
+  src/serve/reply.cpp
+  src/serve/server.cpp
+  src/serve/text.cpp
+)
+target_link_libraries(gufo_npu_serve PUBLIC gufo_npu_core nlohmann_json
+                      PRIVATE cpp_httplib)
 
 add_executable(gufo-npu src/cli/main.cpp)
 target_link_libraries(gufo-npu PRIVATE gufo_npu_qwen35_npu gufo_npu_qwen35_4b
-                      gufo_npu_qwen36_35b_a3b)
+                      gufo_npu_qwen36_35b_a3b gufo_npu_serve
+                      gufo_npu_serve_chat gufo_npu_serve_engine)
 install(TARGETS gufo-npu RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 if(BUILD_TESTING)

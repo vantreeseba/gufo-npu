@@ -16,6 +16,11 @@
 # Run on a Strix Halo host (the NPU is /dev/accel/accel0, char major 261):
 #   docker run --rm --device /dev/accel/accel0 --ulimit memlock=-1:-1 \
 #     [-v /opt/xilinx/xrt:/opt/xilinx/xrt:ro] gufo-npu diagnose
+# Serve a model (docs/SERVING.md) on port 8080:
+#   docker run -d --name gufo-npu-serve --device /dev/accel/accel0 \
+#     --ulimit memlock=-1:-1 -p 8080:8080 \
+#     -v /path/to/MODEL.gguf:/models/model.gguf:ro \
+#     gufo-npu serve --model /models/model.gguf --host 0.0.0.0
 # Mount the host XRT when the host runs an out-of-tree amdxdna driver whose
 # version differs from the bundled XRT.
 
@@ -62,8 +67,19 @@ RUN cmake --preset release \
  && cmake --install build/release --prefix /opt/gufo-npu
 
 FROM xrt AS runtime
+ARG DEBIAN_FRONTEND=noninteractive
+# curl: the health check.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl \
+ && rm -rf /var/lib/apt/lists/*
 COPY --from=build /opt/gufo-npu /opt/gufo-npu
 COPY .devops/entrypoint.sh /opt/gufo-npu/bin/entrypoint.sh
 ENV PATH="/opt/gufo-npu/bin:${PATH}"
+# `gufo-npu serve` listens here (--port); GUFO_NPU_PORT tells the health
+# check about another port. Loading a model takes up to ~25 s (35B).
+ENV GUFO_NPU_PORT=8080
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
+  CMD curl -fsS "http://127.0.0.1:${GUFO_NPU_PORT}/health" || exit 1
 ENTRYPOINT ["/opt/gufo-npu/bin/entrypoint.sh"]
 CMD ["diagnose"]

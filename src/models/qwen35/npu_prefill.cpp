@@ -163,6 +163,8 @@ struct NpuPrefill::Impl {
       std::max<std::size_t>(std::thread::hardware_concurrency() / 2, 1) - 1};
 
   Profile profile;
+  // The current Run's capture request, if any.
+  const StateCapture* capture = nullptr;
   // GEMM work per token of a prefill pass and of the MTP cache fill.
   double flops_per_token = 0;
   double mtp_flops_per_token = 0;
@@ -404,7 +406,8 @@ struct NpuPrefill::Impl {
           profile.attention_seconds += SecondsSince(mixer_start);
         } else {
           lane.mixer->DeltaNet(lane.in.data(), l.in->rows(), lane.normed.data(),
-                               l.mix, st, lane.mixed.data());
+                               l.mix, st, lane.mixed.data(),
+                               CaptureIn(capture, il, lane.position, lane.n));
           profile.deltanet_seconds += SecondsSince(mixer_start);
         }
         ToA(lane, lane.mixed.data(), static_cast<int>(l.out->dim()));
@@ -520,9 +523,11 @@ const Config& NpuPrefill::config() const {
 }
 
 void NpuPrefill::Run(const int* tokens, int count, DecodeState& state,
-                     float* hidden) {
+                     float* hidden, const StateCapture* capture) {
   const BurstPool::Burst burst(impl_->pool);
+  impl_->capture = capture;
   impl_->Run(tokens, count, state, hidden);
+  impl_->capture = nullptr;
 }
 
 void NpuPrefill::FillMtp(const float* hidden, const int* tokens, int count,
@@ -555,7 +560,6 @@ PromptPrefill PrefillPrompt(NpuPrefill& prefill) {
     // ~0.07 s however short the prompt (98 GEMM calls of at least 256 rows
     // each), the decode path ~28 ms per two tokens. Shorter prompts go
     // through the decoder alone (crossover measured in BENCHMARKS.md).
-    constexpr int kMinPrefillPrompt = 7;
     const int n = static_cast<int>(prompt.size());
     if (n < kMinPrefillPrompt) {
       return 0;
@@ -575,6 +579,45 @@ PromptPrefill PrefillPrompt(NpuPrefill& prefill) {
     }
     return n;
   };
+}
+
+PromptCacheModel MakePromptCacheModel(NpuDecoder& decoder,
+                                      NpuPrefill& prefill) {
+  const Config& c = prefill.config();
+  PromptCacheModel m;
+  m.hidden = c.hidden;
+  m.vocab = c.vocab;
+  m.layers = c.layers;
+  m.keep_last = 0;
+  m.min_prefill = kMinPrefillPrompt;
+  m.run = [&decoder, &prefill](const int* tokens, int count, DecodeState& state,
+                               float* hidden, const StateCapture* capture) {
+    if (count >= kMinPrefillPrompt) {
+      prefill.Run(tokens, count, state, hidden, capture);
+      return;
+    }
+    StepPrompt(
+        decoder,
+        [&decoder](const int* t, int n, DecodeState& s) {
+          decoder.Step(t, n, s, false);
+        },
+        decoder.config().hidden, tokens, count, state, hidden, capture);
+  };
+  m.fill_mtp = [&decoder, &prefill](const float* hidden, const int* tokens,
+                                    int count, int position, DecodeState& mtp) {
+    // As the prompt's own prefill fills it when the prompt took one.
+    if (count >= kMinPrefillPrompt - 1) {
+      prefill.FillMtp(hidden, tokens, count, position, mtp);
+      return;
+    }
+    StepMtp(decoder, decoder.config().hidden, hidden, tokens, count, position,
+            mtp);
+  };
+  m.new_state = [&decoder] { return decoder.AcquireState(); };
+  m.recycle = [&decoder](DecodeState&& state) {
+    decoder.ReleaseState(std::move(state));
+  };
+  return m;
 }
 
 }  // namespace gufo_npu::qwen35

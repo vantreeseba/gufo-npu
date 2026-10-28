@@ -7,6 +7,7 @@
 
 #include "core/gguf.hpp"
 #include "core/q4nx.hpp"
+#include "core/sampling.hpp"
 #include "models/qwen35/config.hpp"
 #include "models/qwen35/decoder.hpp"
 #include "models/qwen35/generate.hpp"
@@ -90,6 +91,16 @@ public:
                int position, DecodeState& state);
   DecodeState NewMtpState() const;
 
+  // States for a generation from the decoder's pool (StatePool): equal to
+  // NewState()'s, keeping a released state's buffers. The MTP state is made
+  // the same way. Release hands one back when the generation is over.
+  DecodeState AcquireState();
+  void ReleaseState(DecodeState&& state);
+  // A generation's per-prompt-token final residuals, `floats` values,
+  // zeroed; reused (grow-only) across generations, valid until the next
+  // call.
+  float* PromptHidden(std::size_t floats);
+
   // Wall time inside NPU submissions since construction, and their count;
   // CPU time in the mixers and draft input (including buffer syncs).
   double npu_seconds() const;
@@ -101,18 +112,21 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
-// Greedy decoding with MTP speculation: each step verifies one MTP draft in a
-// 2-token pass and keeps it when the main model agrees, so the output is the
-// main model's greedy output. The prompt runs through `prefill` when given,
-// the rest of it two tokens per pass. With `draft` false, every step decodes
-// one token (no MTP). `on_token` sees each generated id (including a stop
-// id) as it is produced.
-std::vector<int> SpeculativeGenerate(NpuDecoder& model,
-                                     const std::vector<int>& prompt,
-                                     int max_tokens,
-                                     const std::vector<int>& stop, bool draft,
-                                     const std::function<void(int)>& on_token,
-                                     SpeculativeStats* stats = nullptr,
-                                     const PromptPrefill& prefill = {});
+// Decoding with MTP speculation: each step verifies one MTP draft in a
+// 2-token pass. The draft is a point proposal (the MTP head's argmax), so the
+// step draws the first token from the main model's distribution and keeps
+// the draft when they agree: it is accepted with probability p(draft), and a
+// miss is distributed as p without the draft, which is speculative sampling's
+// rule. The output therefore follows the main model's distribution exactly;
+// greedy `sampling` (the default) gives its greedy output. The prompt runs
+// through `prefill` when given, the rest of it two tokens per pass. With
+// `draft` false, every step decodes one token (no MTP). `on_token` sees each
+// generated id (including a stop id) as it is produced; returning false ends
+// the generation after that id.
+std::vector<int> SpeculativeGenerate(
+    NpuDecoder& model, const std::vector<int>& prompt, int max_tokens,
+    const std::vector<int>& stop, bool draft,
+    const std::function<bool(int)>& on_token, SpeculativeStats* stats = nullptr,
+    const PromptPrefill& prefill = {}, const SamplingParams& sampling = {});
 
 }  // namespace gufo_npu::qwen35_4b

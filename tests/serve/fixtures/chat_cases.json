@@ -1,0 +1,1079 @@
+[
+ {
+  "name": "user_only",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hello!"
+   }
+  ]
+ },
+ {
+  "name": "user_only_thinking",
+  "thinking": true,
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hello!"
+   }
+  ]
+ },
+ {
+  "name": "system_user",
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are terse."
+   },
+   {
+    "role": "user",
+    "content": "Why is the sky blue?"
+   }
+  ]
+ },
+ {
+  "name": "developer_user",
+  "messages": [
+   {
+    "role": "developer",
+    "content": "Be brief."
+   },
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ]
+ },
+ {
+  "name": "two_systems_merged",
+  "messages": [
+   {
+    "role": "system",
+    "content": "  First.  "
+   },
+   {
+    "role": "developer",
+    "content": "Second."
+   },
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ]
+ },
+ {
+  "name": "later_system_dropped",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Top."
+   },
+   {
+    "role": "user",
+    "content": "Hi"
+   },
+   {
+    "role": "system",
+    "content": "Ignored later system."
+   },
+   {
+    "role": "user",
+    "content": "Again"
+   }
+  ]
+ },
+ {
+  "name": "multi_turn",
+  "messages": [
+   {
+    "role": "system",
+    "content": "sys"
+   },
+   {
+    "role": "user",
+    "content": "one"
+   },
+   {
+    "role": "assistant",
+    "content": "first answer"
+   },
+   {
+    "role": "user",
+    "content": "two"
+   }
+  ]
+ },
+ {
+  "name": "multi_turn_thinking",
+  "thinking": true,
+  "messages": [
+   {
+    "role": "user",
+    "content": "one"
+   },
+   {
+    "role": "assistant",
+    "content": "answer",
+    "reasoning_content": "old reasoning"
+   },
+   {
+    "role": "user",
+    "content": "two"
+   }
+  ]
+ },
+ {
+  "name": "inline_think_history",
+  "messages": [
+   {
+    "role": "user",
+    "content": "one"
+   },
+   {
+    "role": "assistant",
+    "content": "<think>\nhidden\n</think>\n\nvisible answer"
+   },
+   {
+    "role": "user",
+    "content": "two"
+   }
+  ]
+ },
+ {
+  "name": "trim_whitespace",
+  "messages": [
+   {
+    "role": "system",
+    "content": " \n sys \t"
+   },
+   {
+    "role": "user",
+    "content": " 　 padded \n\n"
+   },
+   {
+    "role": "assistant",
+    "content": "  spaced  "
+   },
+   {
+    "role": "user",
+    "content": "x "
+   }
+  ]
+ },
+ {
+  "name": "content_parts",
+  "messages": [
+   {
+    "role": "system",
+    "content": [
+     {
+      "type": "text",
+      "text": "Part A. "
+     },
+     {
+      "type": "text",
+      "text": "Part B."
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Hello "
+     },
+     {
+      "type": "text",
+      "text": "world"
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "name": "null_content_user",
+  "messages": [
+   {
+    "role": "user",
+    "content": null
+   }
+  ]
+ },
+ {
+  "name": "tools_no_system",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the weather for a city <with> \"quotes\" & ünïcödé 天气",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "filters": {
+        "type": "object"
+       },
+       "limit": {
+        "type": "number"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Paris?"
+   }
+  ]
+ },
+ {
+  "name": "tools_with_system",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the weather for a city <with> \"quotes\" & ünïcödé 天气",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "filters": {
+        "type": "object"
+       },
+       "limit": {
+        "type": "number"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   }
+  ],
+  "thinking": true,
+  "messages": [
+   {
+    "role": "system",
+    "content": "You help."
+   },
+   {
+    "role": "user",
+    "content": "Weather in Paris?"
+   }
+  ]
+ },
+ {
+  "name": "tool_call_string_args",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the weather for a city <with> \"quotes\" & ünïcödé 天气",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "filters": {
+        "type": "object"
+       },
+       "limit": {
+        "type": "number"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Paris for 3 days?"
+   },
+   {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"city\": \"Paris\", \"days\": 3, \"metric\": true}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "{\"temp\": 21}",
+    "tool_call_id": "call_1"
+   }
+  ]
+ },
+ {
+  "name": "tool_call_object_args",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the weather for a city <with> \"quotes\" & ünïcödé 天气",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "filters": {
+        "type": "object"
+       },
+       "limit": {
+        "type": "number"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "Search"
+   },
+   {
+    "role": "assistant",
+    "content": "Let me search.",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+       "name": "search",
+       "arguments": {
+        "query": "a\nb",
+        "filters": {
+         "lang": "en",
+         "n": [
+          1,
+          2.5,
+          null,
+          false
+         ]
+        },
+        "limit": 10.0,
+        "tags": [
+         "x",
+         "y"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "results"
+   }
+  ]
+ },
+ {
+  "name": "tool_call_value_types",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the weather for a city <with> \"quotes\" & ünïcödé 天气",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "filters": {
+        "type": "object"
+       },
+       "limit": {
+        "type": "number"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "types"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+       "name": "search",
+       "arguments": {
+        "i": 123456789012345,
+        "f1": 1e+20,
+        "f2": 1e-05,
+        "f3": 0.1,
+        "f4": 1000000000000000.0,
+        "f5": 1e+16,
+        "f6": -0.0,
+        "f7": 3.0,
+        "f8": 2.5e-07,
+        "f9": 123456789.123,
+        "f10": 0.0001,
+        "t": true,
+        "n": null,
+        "s": "tab\there \u0001 ünï <&>",
+        "o": {
+         "k": "\"q\" \\ \n",
+         "e": {},
+         "a": []
+        },
+        "neg": -42
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "ok"
+   }
+  ]
+ },
+ {
+  "name": "tool_call_invalid_json_args",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the weather for a city <with> \"quotes\" & ünïcödé 天气",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "filters": {
+        "type": "object"
+       },
+       "limit": {
+        "type": "number"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "x"
+   },
+   {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+       "name": "search",
+       "arguments": "{not json"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "err"
+   }
+  ]
+ },
+ {
+  "name": "tool_call_unwrapped",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the weather for a city <with> \"quotes\" & ünïcödé 天气",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "filters": {
+        "type": "object"
+       },
+       "limit": {
+        "type": "number"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "x"
+   },
+   {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+     {
+      "name": "search",
+      "arguments": {
+       "query": "direct"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "r"
+   }
+  ]
+ },
+ {
+  "name": "parallel_tool_calls",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the weather for a city <with> \"quotes\" & ünïcödé 天气",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "filters": {
+        "type": "object"
+       },
+       "limit": {
+        "type": "number"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   }
+  ],
+  "thinking": true,
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Paris and Rome"
+   },
+   {
+    "role": "assistant",
+    "content": "I'll check both.",
+    "reasoning_content": "Two cities.",
+    "tool_calls": [
+     {
+      "id": "a",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"city\": \"Paris\"}"
+      }
+     },
+     {
+      "id": "b",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"city\": \"Rome\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "sunny",
+    "tool_call_id": "a"
+   },
+   {
+    "role": "tool",
+    "content": "rainy",
+    "tool_call_id": "b"
+   }
+  ]
+ },
+ {
+  "name": "tool_round_then_answer_then_user",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the weather for a city <with> \"quotes\" & ünïcödé 天气",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "filters": {
+        "type": "object"
+       },
+       "limit": {
+        "type": "number"
+       },
+       "tags": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   }
+  ],
+  "thinking": true,
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Paris"
+   },
+   {
+    "role": "assistant",
+    "content": null,
+    "reasoning_content": "Need the tool.",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"city\": \"Paris\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "sunny"
+   },
+   {
+    "role": "assistant",
+    "content": "It is sunny.",
+    "reasoning_content": "Got it."
+   },
+   {
+    "role": "user",
+    "content": "Thanks, and Rome?"
+   }
+  ]
+ },
+ {
+  "name": "user_tool_response_wrapper",
+  "thinking": true,
+  "messages": [
+   {
+    "role": "user",
+    "content": "q"
+   },
+   {
+    "role": "assistant",
+    "content": "calling",
+    "reasoning_content": "r1"
+   },
+   {
+    "role": "user",
+    "content": "<tool_response>\nresult\n</tool_response>"
+   }
+  ]
+ },
+ {
+  "name": "prefill",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a haiku."
+   },
+   {
+    "role": "assistant",
+    "content": "Autumn moon"
+   }
+  ]
+ },
+ {
+  "name": "prefill_thinking",
+  "thinking": true,
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a haiku."
+   },
+   {
+    "role": "assistant",
+    "content": "Autumn moon",
+    "reasoning_content": "Five syllables first."
+   }
+  ]
+ },
+ {
+  "name": "tool_first_message",
+  "messages": [
+   {
+    "role": "tool",
+    "content": "orphan result"
+   },
+   {
+    "role": "user",
+    "content": "hi"
+   }
+  ]
+ },
+ {
+  "name": "unicode_content",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Ünïcödé 你好 🦊 ​"
+   }
+  ]
+ },
+ {
+  "name": "empty_messages",
+  "messages": []
+ },
+ {
+  "name": "reject_image_url",
+  "reject": true,
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "what is this"
+     },
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "data:,"
+      }
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "name": "reject_image",
+  "reject": true,
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "image",
+      "image": "x"
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "name": "reject_unknown_part",
+  "reject": true,
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "input_audio",
+      "input_audio": {}
+     }
+    ]
+   }
+  ]
+ }
+]

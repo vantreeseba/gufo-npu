@@ -1,9 +1,11 @@
+#include <pthread.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -14,6 +16,7 @@
 #include <random>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "build_info.hpp"
@@ -35,6 +38,9 @@
 #include "models/qwen36_35b_a3b/npu_prefill.hpp"
 #include "npu/device.hpp"
 #include "npu/gemv.hpp"
+#include "serve/chat_format.hpp"
+#include "serve/engine.hpp"
+#include "serve/server.hpp"
 
 namespace {
 
@@ -68,9 +74,22 @@ constexpr char kUsage[] =
     "  generate --model GGUF --prompt TEXT [--system TEXT] [--max-tokens N]\n"
     "           [--think] [--device cpu|npu] [--draft mtp|none] [--kernels "
     "DIR]\n"
-    "                           greedy chat completion; cpu is the reference,\n"
-    "                           npu decodes on the NPU, by default with MTP\n"
-    "                           speculation (same output, fewer passes)\n"
+    "           [--temperature T] [--top-p P] [--top-k K] [--min-p P] "
+    "[--seed N]\n"
+    "                           chat completion, greedy by default; cpu is "
+    "the\n"
+    "                           reference, npu decodes on the NPU, by default\n"
+    "                           with MTP speculation (same output\n"
+    "                           distribution, fewer passes); temperature 0 is\n"
+    "                           greedy\n"
+    "  serve --model GGUF [--host ADDR] [--port N] [--device npu|cpu]\n"
+    "        [--kernels DIR] [--model-id NAME] [--max-queue N] [--api-key "
+    "KEY]\n"
+    "        [--context-length N] [--prompt-cache N]\n"
+    "                           OpenAI-compatible server (docs/SERVING.md),\n"
+    "                           by default on 127.0.0.1:8080; --prompt-cache\n"
+    "                           keeps N checkpoints of earlier prompts for\n"
+    "                           multi-turn reuse (default 2, 0: off)\n"
     "  version                  print the version\n";
 
 void PrintChecks(const std::vector<Check>& checks) {
@@ -796,28 +815,44 @@ int Generate(const std::vector<std::string_view>& args) {
   std::string device = "cpu";
   std::string draft = "mtp";
   std::optional<std::string> kernels;
-  for (std::size_t i = 0; i < args.size(); ++i) {
-    const bool has_value = i + 1 < args.size();
-    if (args[i] == "--model" && has_value) {
-      model = std::string(args[++i]);
-    } else if (args[i] == "--prompt" && has_value) {
-      prompt = std::string(args[++i]);
-    } else if (args[i] == "--system" && has_value) {
-      system = std::string(args[++i]);
-    } else if (args[i] == "--max-tokens" && has_value) {
-      max_tokens = std::atoi(std::string(args[++i]).c_str());
-    } else if (args[i] == "--think") {
-      thinking = true;
-    } else if (args[i] == "--device" && has_value) {
-      device = std::string(args[++i]);
-    } else if (args[i] == "--draft" && has_value) {
-      draft = std::string(args[++i]);
-    } else if (args[i] == "--kernels" && has_value) {
-      kernels = std::string(args[++i]);
-    } else {
-      std::cerr << kUsage;
-      return 2;
+  gufo_npu::SamplingParams sampling;
+  try {
+    for (std::size_t i = 0; i < args.size(); ++i) {
+      const bool has_value = i + 1 < args.size();
+      if (args[i] == "--model" && has_value) {
+        model = std::string(args[++i]);
+      } else if (args[i] == "--temperature" && has_value) {
+        sampling.temperature = std::stof(std::string(args[++i]));
+      } else if (args[i] == "--top-p" && has_value) {
+        sampling.top_p = std::stof(std::string(args[++i]));
+      } else if (args[i] == "--top-k" && has_value) {
+        sampling.top_k = std::stoi(std::string(args[++i]));
+      } else if (args[i] == "--min-p" && has_value) {
+        sampling.min_p = std::stof(std::string(args[++i]));
+      } else if (args[i] == "--seed" && has_value) {
+        sampling.seed = std::stoull(std::string(args[++i]));
+      } else if (args[i] == "--prompt" && has_value) {
+        prompt = std::string(args[++i]);
+      } else if (args[i] == "--system" && has_value) {
+        system = std::string(args[++i]);
+      } else if (args[i] == "--max-tokens" && has_value) {
+        max_tokens = std::atoi(std::string(args[++i]).c_str());
+      } else if (args[i] == "--think") {
+        thinking = true;
+      } else if (args[i] == "--device" && has_value) {
+        device = std::string(args[++i]);
+      } else if (args[i] == "--draft" && has_value) {
+        draft = std::string(args[++i]);
+      } else if (args[i] == "--kernels" && has_value) {
+        kernels = std::string(args[++i]);
+      } else {
+        std::cerr << kUsage;
+        return 2;
+      }
     }
+  } catch (const std::logic_error&) {  // a number that does not parse
+    std::cerr << kUsage;
+    return 2;
   }
   if (model.empty() || prompt.empty() || (device != "cpu" && device != "npu") ||
       (draft != "mtp" && draft != "none")) {
@@ -840,6 +875,7 @@ int Generate(const std::vector<std::string_view>& args) {
       std::fputs(tokenizer.TokenBytes(id).c_str(), stdout);
       std::fflush(stdout);
     }
+    return true;
   };
 
   // Qwen3.5-4B runs on its own NPU program (src/models/qwen35_4b), picked by
@@ -853,7 +889,7 @@ int Generate(const std::vector<std::string_view>& args) {
     qwen35::SpeculativeStats stats;
     gufo_npu::qwen35_4b::SpeculativeGenerate(
         npu, ids, max_tokens, stop, draft == "mtp", print, &stats,
-        gufo_npu::qwen35_4b::PrefillPrompt(prefill));
+        gufo_npu::qwen35_4b::PrefillPrompt(prefill), sampling);
     std::fprintf(stderr,
                  "\n[%d prompt tokens in %.2f s; %d generated in %.2f s, "
                  "%.2f tok/s; NPU (Qwen3.5-4B), %s]\n",
@@ -894,7 +930,8 @@ int Generate(const std::vector<std::string_view>& args) {
         npu, ids, max_tokens, stop, speculate, print, &stats,
         prefill       ? qwen35::PrefillPrompt(*prefill)
         : moe_prefill ? gufo_npu::qwen36_35b_a3b::PrefillPrompt(*moe_prefill)
-                      : qwen35::PromptPrefill{});
+                      : qwen35::PromptPrefill{},
+        sampling);
     if (moe_prefill && moe_prefill->profile().passes > 0) {
       const auto& pp = moe_prefill->profile();
       std::fprintf(stderr,
@@ -949,7 +986,7 @@ int Generate(const std::vector<std::string_view>& args) {
   };
   qwen35::GenerateStats stats;
   qwen35::GreedyGenerate(forward, reference.config().vocab, ids, max_tokens,
-                         stop, print, &stats);
+                         stop, print, &stats, sampling);
   std::fprintf(stderr,
                "\n[%d prompt tokens in %.2f s; %d generated in %.2f s, "
                "%.2f tok/s; CPU reference]\n",
@@ -962,6 +999,89 @@ int Generate(const std::vector<std::string_view>& args) {
 }
 
 }  // namespace
+
+int Serve(const std::vector<std::string_view>& args) {
+  namespace serve = gufo_npu::serve;
+  serve::EngineOptions engine_options;
+  serve::ServerOptions server_options;
+  std::optional<std::string> kernels;
+  for (std::size_t i = 0; i < args.size(); ++i) {
+    const bool has_value = i + 1 < args.size();
+    if (args[i] == "--model" && has_value) {
+      engine_options.model_path = std::string(args[++i]);
+    } else if (args[i] == "--host" && has_value) {
+      server_options.host = std::string(args[++i]);
+    } else if (args[i] == "--port" && has_value) {
+      server_options.port = std::atoi(std::string(args[++i]).c_str());
+    } else if (args[i] == "--device" && has_value) {
+      engine_options.device = std::string(args[++i]);
+    } else if (args[i] == "--kernels" && has_value) {
+      kernels = std::string(args[++i]);
+    } else if (args[i] == "--model-id" && has_value) {
+      engine_options.model_id = std::string(args[++i]);
+    } else if (args[i] == "--max-queue" && has_value) {
+      server_options.max_queue = std::atoi(std::string(args[++i]).c_str());
+    } else if (args[i] == "--context-length" && has_value) {
+      engine_options.context_length = std::atoi(std::string(args[++i]).c_str());
+    } else if (args[i] == "--prompt-cache" && has_value) {
+      engine_options.prompt_cache = std::atoi(std::string(args[++i]).c_str());
+    } else if (args[i] == "--api-key" && has_value) {
+      server_options.api_key = std::string(args[++i]);
+    } else {
+      std::cerr << kUsage;
+      return 2;
+    }
+  }
+  if (engine_options.model_path.empty() ||
+      (engine_options.device != "npu" && engine_options.device != "cpu") ||
+      server_options.port <= 0 || server_options.port > 65535 ||
+      server_options.max_queue < 0 || engine_options.context_length < 0 ||
+      engine_options.prompt_cache < 0) {
+    std::cerr << kUsage;
+    return 2;
+  }
+  if (engine_options.device == "npu") {
+    engine_options.kernels = KernelDir(kernels).string();
+  }
+
+  // SIGINT/SIGTERM stop the server: blocked in every thread (set before any
+  // starts) and taken by one waiter.
+  sigset_t signals;
+  sigemptyset(&signals);
+  sigaddset(&signals, SIGINT);
+  sigaddset(&signals, SIGTERM);
+  pthread_sigmask(SIG_BLOCK, &signals, nullptr);
+
+  std::unique_ptr<serve::Engine> engine;
+  std::unique_ptr<serve::ChatFormat> format;
+  std::unique_ptr<serve::Server> server;
+  int port = 0;
+  try {
+    const auto load_start = std::chrono::steady_clock::now();
+    engine = serve::LoadEngine(engine_options);
+    format = serve::NewQwen35ChatFormat();
+    std::fprintf(stderr, "[loaded %s in %.1f s]\n", engine->info().id.c_str(),
+                 std::chrono::duration<double>(
+                     std::chrono::steady_clock::now() - load_start)
+                     .count());
+    server = std::make_unique<serve::Server>(*engine, *format, server_options);
+    port = server->Bind();
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "serve: %s\n", e.what());
+    return 1;
+  }
+  std::thread waiter([&] {
+    int signal = 0;
+    sigwait(&signals, &signal);
+    server->Stop();
+  });
+  std::fprintf(stderr, "[serving http://%s:%d/v1]\n",
+               server_options.host.c_str(), port);
+  server->Run();
+  kill(getpid(), SIGTERM);  // wakes the waiter if Run ended on its own
+  waiter.join();
+  return 0;
+}
 
 int main(int argc, char** argv) {
   const std::vector<std::string_view> args(argv + 1, argv + argc);
@@ -979,6 +1099,9 @@ int main(int argc, char** argv) {
   }
   if (args[0] == "generate") {
     return Generate(rest);
+  }
+  if (args[0] == "serve") {
+    return Serve(rest);
   }
   if (args[0] == "smoke") {
     return Smoke(rest);

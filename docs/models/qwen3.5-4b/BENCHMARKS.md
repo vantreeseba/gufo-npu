@@ -140,6 +140,80 @@ MTP equal to plain greedy for both, and TTFT the same (35 tokens 0.188 s,
 | Prompt, ~1k (`generate`) | 0.31 s | 0.84 s |
 | TTFT, 1,024 tokens (`bench prefill`, warm, 2026-10-28) | 0.29 s | 0.66 s |
 
+## Prompt cache across requests (2026-10-28)
+
+`PromptCache` (`src/models/qwen35/prompt_cache.hpp`) keeps the decode state
+after a prompt prefix, so a multi-turn chat runs only what is new each turn.
+DeltaNet state is recurrent and cannot be cut back to an earlier position,
+so reuse starts from checkpoints:
+
+- **Where:** before the prompt's last `<|im_start|>`, the history through
+  the last user message. The GGUF's chat template renders earlier
+  assistant turns as `<|im_start|>assistant\n{content}`, without the think
+  block the generation prompt opens (`<think>\n\n</think>\n\n`), so the
+  next request matches the previous prompt only up to there.
+- **How:** the prefill copies the DeltaNet layers' conv window and state
+  as its pass goes past that position (`StateCapture`); the attention and
+  MTP caches are cut to it afterwards. A checkpoint costs a copy, not a
+  pass. Remainders below the prefill threshold run through the decoder.
+- **Kept:** two checkpoints, least recently used out first (configurable,
+  with an optional byte budget).
+
+`qwen35_4b_prompt_cache_test` (labels `qwen35_4b;npu;model`), warm (each conversation's second round),
+2026-10-28. A conversation over a document of numbered notes, three turns of
+24 greedy MTP tokens. Time to the first token (`SpeculativeStats`), per
+turn, three ways: the model's own `PrefillPrompt` (no cache), through the
+cache with nothing to restore (a miss), and through the cache (turn 1 is a
+miss).
+
+| History | Turn | Prompt tokens | Restored | No cache | Cache miss | Cache hit |
+|---|---|---|---|---|---|---|
+| ~1k | 1 | 1,124 | – | 0.861 s | 0.874 s | **0.869 s** |
+| ~1k | 2 | 1,157 | 1,117 | 0.879 s | 0.888 s | **0.220 s** |
+| ~1k | 3 | 1,190 | 1,150 | 0.887 s | 0.898 s | **0.217 s** |
+| ~4k | 1 | 4,091 | – | 2.820 s | 2.835 s | **2.841 s** |
+| ~4k | 2 | 4,124 | 4,084 | 3.031 s | 3.065 s | **0.278 s** |
+| ~4k | 3 | 4,157 | 4,117 | 3.024 s | 3.053 s | **0.268 s** |
+
+- **Turns 2 and 3** restore the previous turn's checkpoint and run ~40
+  tokens (the previous reply, the next question and the generation
+  prompt): time to the first token falls 4× at ~1k tokens of
+  history and 11× at ~4k, and stays flat as the history grows.
+- **A miss** costs the checkpoint copy on top of the plain prefill:
+  10–35 ms.
+- **Memory per checkpoint:** 89.5 MiB at 1,124 tokens, 193.8 MiB
+  at 4,091 and 339.1 MiB at 8,221: 24 DeltaNet layers' states (~49 MiB) plus 36 KiB per token (8 attention layers' fp16 K/V, 32 KiB, and the MTP layer's, 4 KiB). Two checkpoints of
+  8k-token conversations hold ~678 MiB of host memory.
+- One run (each conversation's second round).
+
+## Sampling (2026-10-28)
+
+`gufo-npu generate --temperature T --seed N` (`Sampler` in
+`src/core/sampling.hpp`): temperature, top-k, top-p, min-p and repetition,
+presence and frequency penalties. With MTP the draft is still the MTP head's
+argmax; each step draws the first token from the main model's distribution
+and keeps the draft when they agree, so a draft is accepted with probability
+p(draft) and the output follows the main model's distribution exactly (see
+QUALITY.md). Box, warm, 3 seeds per row (one load per run), default top-k,
+top-p and min-p (off); ranges over the seeds:
+
+| Prompt | Temperature | No draft | MTP | Drafts accepted |
+|---|---|---|---|---|
+| Sky (~90 tokens) | 0 | 18.7 tok/s | 27.5–27.6 tok/s | 67% |
+|  | 0.7 | 18.7 | 26.6–27.3 | 61–67% |
+|  | 1.0 | 18.7 | 26.0–27.1 | 58–64% |
+| Fibonacci (~250) | 0 | 18.5 | 31.1–31.3 | 92% |
+|  | 0.7 | 18.5 | 30.6–31.0 | 89–91% |
+|  | 1.0 | 18.5 | 30.7–30.9 | 89–91% |
+
+- Sampling itself costs under 1% of decode time without a draft: one
+  vectorized pass weighs the whole vocabulary per token.
+- Temperature 0 is greedy and bit-identical to the greedy path before the
+  sampler (same hashes).
+- With MTP, acceptance falls as temperature spreads the distribution: 26–27
+  tok/s on the sky answer at temperature 1 against 27.5 greedy, 30.7–30.9
+  against 31.2 on the code answer.
+
 ## Where the work runs (computed, 2026-10-28)
 
 The share of the work on the NPU and on the CPU, **computed** from the

@@ -23,3 +23,5 @@ The runtime image bundles XRT (https://github.com/Xilinx/XRT), Apache-2.0.
 Vendored in third_party/:
 - nlohmann/json v3.12.0 (https://github.com/nlohmann/json), MIT License,
   Copyright (c) 2013-2025 Niels Lohmann.
+- cpp-httplib v0.26.0 (https://github.com/yhirose/cpp-httplib), MIT License,
+  Copyright (c) 2025 Yuji Hirose.

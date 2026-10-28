@@ -37,6 +37,10 @@ target_link_libraries(thread_pool_test PRIVATE gufo_npu_core)
 add_test(NAME thread_pool_test COMMAND thread_pool_test)
 set_tests_properties(thread_pool_test PROPERTIES TIMEOUT 300)
 
+add_executable(sampling_test core/sampling_test.cpp)
+target_link_libraries(sampling_test PRIVATE gufo_npu_core)
+add_test(NAME sampling_test COMMAND sampling_test)
+
 add_executable(simd_test core/simd_test.cpp)
 target_link_libraries(simd_test PRIVATE gufo_npu_core)
 # The vector paths, as the prefill builds them.
@@ -50,6 +54,22 @@ add_test(NAME bfp16_test COMMAND bfp16_test)
 add_executable(q4nx_test core/q4nx_test.cpp)
 target_link_libraries(q4nx_test PRIVATE gufo_npu_core)
 add_test(NAME q4nx_test COMMAND q4nx_test)
+
+# The OpenAI-compatible server over a scripted engine (no model, no NPU).
+add_executable(serve_text_test serve/text_test.cpp)
+target_link_libraries(serve_text_test PRIVATE gufo_npu_serve)
+add_test(NAME serve_text_test COMMAND serve_text_test)
+add_executable(serve_server_test serve/server_test.cpp)
+target_link_libraries(serve_server_test PRIVATE gufo_npu_serve cpp_httplib)
+add_test(NAME serve_server_test COMMAND serve_server_test)
+# The same with the real Qwen3.5 chat format: reasoning and tool calls end
+# to end.
+add_executable(serve_chat_test serve/server_chat_test.cpp)
+target_link_libraries(serve_chat_test PRIVATE gufo_npu_serve
+                      gufo_npu_serve_chat cpp_httplib)
+add_test(NAME serve_chat_test COMMAND serve_chat_test)
+set_tests_properties(serve_text_test serve_server_test serve_chat_test
+                     PROPERTIES LABELS serve TIMEOUT 120)
 
 add_executable(tokenizer_test core/tokenizer_test.cpp)
 target_link_libraries(tokenizer_test PRIVATE gufo_npu_core nlohmann_json)
@@ -74,3 +94,13 @@ add_subdirectory(models/qwen35)
 add_subdirectory(models/qwen35_2b)
 add_subdirectory(models/qwen36_35b_a3b)
 add_subdirectory(models/qwen35_4b)
+
+# The server's chat format against the GGUF chat template (fixtures rendered
+# by tools/reference/qwen35_chat_template.py); no model needed.
+add_executable(chat_format_test serve/chat_format_test.cpp)
+target_link_libraries(chat_format_test PRIVATE gufo_npu_serve_chat
+                      gufo_npu_qwen35)
+add_test(NAME chat_format_test
+         COMMAND chat_format_test "${CMAKE_CURRENT_SOURCE_DIR}/serve/fixtures")
+set_tests_properties(chat_format_test PROPERTIES LABELS serve)
+add_subdirectory(serve)

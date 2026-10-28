@@ -99,6 +99,8 @@ struct NpuPrefill::Impl {
   };
 
   Profile profile;
+  // The current Run's capture request, if any.
+  const qwen35::StateCapture* capture = nullptr;
   Config config;
   const gguf::TensorInfo* embed = nullptr;
   std::vector<Layer> layers;
@@ -347,7 +349,8 @@ struct NpuPrefill::Impl {
         profile.attention_seconds += SecondsSince(start);
       } else {
         mixer->DeltaNet(in.data(), in_rows, normed.data(), l.mix, st,
-                        mixed.data());
+                        mixed.data(),
+                        qwen35::CaptureIn(capture, il, state.position + s, n));
         profile.deltanet_seconds += SecondsSince(start);
       }
       start = Clock::now();
@@ -634,9 +637,11 @@ ExpertBackend NpuPrefill::experts() const {
 }
 
 void NpuPrefill::Run(const int* tokens, int count, qwen35::DecodeState& state,
-                     float* hidden) {
+                     float* hidden, const qwen35::StateCapture* capture) {
   const BurstPool::Burst burst(impl_->pool);
+  impl_->capture = capture;
   impl_->Run(tokens, count, state, hidden);
+  impl_->capture = nullptr;
 }
 
 void NpuPrefill::FillMtp(const float* hidden, const int* tokens, int count,
@@ -686,6 +691,47 @@ qwen35::PromptPrefill PrefillPrompt(NpuPrefill& prefill) {
     }
     return k;
   };
+}
+
+qwen35::PromptCacheModel MakePromptCacheModel(qwen35::NpuDecoder& decoder,
+                                              NpuPrefill& prefill) {
+  const Config& c = prefill.config();
+  const int min_prefill = MinPrefillPrompt(prefill.experts());
+  qwen35::PromptCacheModel m;
+  m.hidden = c.hidden;
+  m.vocab = c.vocab;
+  m.layers = c.layers;
+  m.keep_last = 1;
+  m.min_prefill = min_prefill;
+  m.run = [&decoder, &prefill, min_prefill](
+              const int* tokens, int count, DecodeState& state, float* hidden,
+              const qwen35::StateCapture* capture) {
+    if (count >= min_prefill) {
+      prefill.Run(tokens, count, state, hidden, capture);
+      return;
+    }
+    qwen35::StepPrompt(
+        decoder,
+        [&decoder](const int* t, int n, DecodeState& s) {
+          decoder.Step(t, n, s, false);
+        },
+        decoder.config().hidden, tokens, count, state, hidden, capture);
+  };
+  m.fill_mtp = [&decoder, &prefill, min_prefill](
+                   const float* hidden, const int* tokens, int count,
+                   int position, DecodeState& mtp) {
+    if (count >= min_prefill - 1) {
+      prefill.FillMtp(hidden, tokens, count, position, mtp);
+      return;
+    }
+    qwen35::StepMtp(decoder, decoder.config().hidden, hidden, tokens, count,
+                    position, mtp);
+  };
+  m.new_state = [&decoder] { return decoder.AcquireState(); };
+  m.recycle = [&decoder](DecodeState&& state) {
+    decoder.ReleaseState(std::move(state));
+  };
+  return m;
 }
 
 }  // namespace gufo_npu::qwen36_35b_a3b
