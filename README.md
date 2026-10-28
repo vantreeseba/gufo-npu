@@ -83,9 +83,22 @@ The NPU's share of the FLOPs (and of the bytes read, in decode). These are **com
 | 2 | CPU reference models (GGUF): forward pass, tokenizer, chat, greedy generate | done: 2B matches HF transformers, 35B matches llama.cpp |
 | 3 | NPU decode | 2B, 4B and 35B, all with MTP |
 | 4 | NPU prefill | 2B and 4B: bfp16 GEMMs (11–18 TFLOPS), ~1.56 GB (2B) / ~4 GB (4B) more pinned memory; 35B: dense matrices as bfp16 GEMMs on the NPU (converted once), experts on the CPU from the decoder's q4nx, ~1.5 GB more pinned |
-| 5 | OpenAI-compatible server | |
+| 5 | OpenAI-compatible server | done: `gufo-npu serve` with streaming, tools, reasoning, sampling (MTP kept) and a multi-turn prompt cache; one model and one request at a time ([docs/SERVING.md](docs/SERVING.md)) |
 
 ## Try it
+
+Serve a model with an OpenAI-compatible API on port 8080:
+
+```sh
+docker run -d --name gufo-npu-serve --device /dev/accel/accel0 \
+  --ulimit memlock=-1:-1 -p 8080:8080 \
+  -v /path/to/MODEL.gguf:/models/model.gguf:ro \
+  ghcr.io/vantreeseba/gufo-npu:main \
+  serve --model /models/model.gguf --host 0.0.0.0
+```
+
+Endpoints, options and limits: [docs/SERVING.md](docs/SERVING.md). Checks
+and benchmarks:
 
 ```sh
 docker run --rm --device /dev/accel/accel0 --ulimit memlock=-1:-1 \
