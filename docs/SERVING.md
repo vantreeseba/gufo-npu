@@ -62,7 +62,7 @@ Request fields:
 |---|---|
 | `messages` | `system`, `user`, `assistant` and `tool` messages, rendered with the model's chat template. A final `assistant` message is continued (prefill). |
 | `model` | Accepted and ignored: the server runs one model, and replies carry its id. |
-| `tools`, `tool_choice` | Function tools. `tool_choice` may be `"auto"` (default) or `"none"`; `"required"` and named functions are refused. |
+| `tools`, `tool_choice` | Function tools. `tool_choice` may be `"auto"` (default), `"none"`, `"required"` (the reply is one or more tool calls) or `{"type": "function", "function": {"name": ...}}` (calls to that function). Forced calls are constrained token by token; see [Structured outputs](#structured-outputs). |
 | `max_completion_tokens`, `max_tokens` | Most generated tokens (the first wins). Default and ceiling: the rest of the context. |
 | `temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `seed` | Sampling. `temperature` 0 (the default) is greedy decoding. |
 | `stop` | Up to 16 strings. Matched in the generated text, also across tokens; the stop string itself is never sent. |
@@ -72,7 +72,7 @@ Request fields:
 | `logprobs`, `top_logprobs` | Each generated token's log probability and up to 20 alternatives (see below). |
 | `logit_bias` | Token id to a bias in [-100, 100], added to the logit before sampling (greedy too): -100 bans a token, 100 all but forces it. Ids outside the vocabulary are refused. |
 | `parallel_tool_calls` | `false` ends the reply after its first tool call (anything after it is dropped). Default `true`. |
-| `response_format` | Only `{"type": "text"}`. |
+| `response_format` | `{"type": "text"}` (default), `{"type": "json_object"}` (any JSON object) or `{"type": "json_schema", "json_schema": {"name", "schema", "strict"}}` (JSON matching the schema). See [Structured outputs](#structured-outputs). |
 
 Other fields (`user`, `metadata`, ...) are ignored.
 
@@ -135,6 +135,47 @@ Generation also ends at the chat template's end-of-turn tokens
 (`<|im_end|>`, `<|endoftext|>`). The reply is `{"object": "text_completion",
 "choices": [{"text", "index", "logprobs", "finish_reason"}], "usage"}`;
 streaming sends the same shape per piece of text, then `data: [DONE]`.
+
+### Structured outputs
+
+`response_format` json_object / json_schema and a forced `tool_choice`
+constrain sampling: before each token, the tokens that cannot continue a
+valid reply are masked out (their logits count as -inf, before penalties,
+temperature and the filters), so the reply always parses unless it is cut
+off by `max_tokens` (`finish_reason: "length"`).
+
+- **JSON schema keywords enforced:** `type` (one or a list), `properties`,
+  `required`, `additionalProperties` (boolean or a schema), `items`,
+  `minItems`, `maxItems`, `minLength`, `maxLength` (characters), `enum`,
+  `const`, `anyOf`, `oneOf` (as anyOf), `allOf` with one schema, and `$ref`
+  to `#`, `#/$defs/...` or `#/definitions/...` (recursion included). Not
+  enforced: `pattern`, `format`, `minimum`/`maximum`, `multipleOf`,
+  `uniqueItems` and other keywords; they are accepted and ignored. With
+  `strict: true`, an object without `additionalProperties` allows no other
+  keys (OpenAI's strict mode); without it, other keys are allowed, as JSON
+  Schema says. A schema the server cannot compile (an unresolved `$ref`, an
+  empty `enum`, an unknown type, more than 128 properties or enum values)
+  is a 400 with `param: "response_format"`.
+- **Forced tool calls** follow the model's tool-call markup
+  (`<tool_call>\n<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>\n
+  ...</function>\n</tool_call>`): only the allowed function names, only
+  declared parameters (any, when a function declares none), every required
+  parameter before `</function>`. A string parameter is free text (it may
+  not contain `</parameter>` or `</tool_call>`), a string enum one of its
+  values, other types JSON matching their schema. More calls may follow,
+  separated by a newline.
+- **Thinking:** with thinking on, the think block is free text; the
+  constraint applies after `</think>`.
+- **MTP drafts** stay exact: a draft is kept only when the masked sample
+  equals it, so a draft the grammar refuses is never kept.
+- **Cost:** the mask is found by walking a trie of the vocabulary's bytes
+  from the grammar's state; inside strings and free text only the tokens
+  that could end them are walked. `serve_structured_test` prints the cost
+  per token on a 248k-token vocabulary. JSON whitespace is limited to 48
+  bytes in a row, integers to 18 digits (they fit in 64 bits), other
+  numbers to 24 digits and a two-digit exponent, and nesting to 32 levels,
+  so a constrained reply cannot run on in whitespace or digits. Strings,
+  keys and raw parameter text are valid UTF-8.
 
 ### `GET /v1/models`, `GET /v1/models/{id}`
 
@@ -266,8 +307,6 @@ client (`pip install openai httpx`). Each takes `--base-url` (default
 ## Not supported yet
 
 - More than one model per process, or switching models per request.
-- JSON mode and structured outputs, forced tool calls (`tool_choice:
-  "required"` or a named function).
 - Tool-call arguments streamed while the model writes them (a call is sent
   once complete).
 - Images and audio.

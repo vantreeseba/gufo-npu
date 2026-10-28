@@ -66,6 +66,11 @@ public:
   virtual int FindToken(std::string_view token) const {  // -1 if absent
     return tokenizer().Find(token);
   }
+  // An added token (control or user-defined, e.g. "<|im_end|>"), whose
+  // TokenBytes is its text, not bytes the model writes.
+  virtual bool IsSpecialToken(int id) const {
+    return tokenizer().IsSpecial(id);
+  }
 
   // Runs one generation. `on_token` sees each generated id as it is
   // produced (including a stop id); returning false ends the generation

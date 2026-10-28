@@ -51,6 +51,16 @@ struct ChatRequest {
   bool logprobs = false;
   int top_logprobs = 0;             // 0..kMaxTopLogprobs, with logprobs
   bool parallel_tool_calls = true;  // false: end after the first tool call
+  // Structured output (response_format): constrained to a JSON object or
+  // to JSON matching a schema.
+  enum class Format { kText, kJsonObject, kJsonSchema };
+  Format format = Format::kText;
+  nlohmann::ordered_json json_schema;  // kJsonSchema
+  bool json_strict = false;            // json_schema.strict
+  // tool_choice "required", or a named function (tool_name): the reply is
+  // constrained to tool calls.
+  bool tool_required = false;
+  std::string tool_name;
 };
 
 // A /v1/completions request (the legacy text API): the prompt goes to the

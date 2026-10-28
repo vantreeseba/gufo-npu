@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <climits>
+#include <cstdint>
 #include <ctime>
 #include <memory>
 #include <mutex>
@@ -22,6 +23,7 @@
 #include "serve/openai.hpp"
 #include "serve/reply.hpp"
 #include "serve/scheduler.hpp"
+#include "serve/structured.hpp"
 #include "serve/text.hpp"
 
 namespace gufo_npu::serve {
@@ -272,6 +274,7 @@ struct Server::Impl {
       }
       job->gens.push_back(Gen(engine.Encode(text), job->chat.max_tokens,
                               job->chat.sampling, "messages"));
+      job->gens.back().sampling.constraint = Constraint(job->chat);
     } catch (const ApiError& e) {
       metrics.Request(e.status);
       SendError(res, e);
@@ -293,6 +296,54 @@ struct Server::Impl {
     } else {
       Complete(*job, req, res);
     }
+  }
+
+  // The constraint a request's response_format or tool_choice asks for,
+  // or none.
+  std::shared_ptr<TokenConstraint> Constraint(const ChatRequest& chat) {
+    std::shared_ptr<const Grammar> grammar;
+    try {
+      if (chat.tool_required) {
+        grammar = ToolCallGrammar(chat.prompt.tools, chat.tool_name);
+      } else if (chat.format == ChatRequest::Format::kJsonSchema) {
+        grammar = JsonSchemaGrammar(chat.json_schema, chat.json_strict);
+      } else if (chat.format == ChatRequest::Format::kJsonObject) {
+        grammar = JsonObjectGrammar();
+      } else {
+        return nullptr;
+      }
+    } catch (const GrammarError& e) {
+      throw InvalidRequest(
+          e.what(), chat.tool_required ? "tool_choice" : "response_format");
+    }
+    return NewGrammarConstraint(std::move(grammar), Vocab(), stop_ids,
+                                chat.prompt.thinking);
+  }
+
+  // The vocabulary's bytes for constraints, built on first use.
+  std::shared_ptr<const VocabIndex> Vocab() {
+    std::lock_guard lock(vocab_mutex);
+    if (!vocab) {
+      const int n = std::max(0, engine.info().vocab);
+      std::vector<std::string> bytes(static_cast<std::size_t>(n));
+      std::vector<std::uint8_t> special(static_cast<std::size_t>(n), 0);
+      for (int id = 0; id < n; ++id) {
+        try {
+          bytes[static_cast<std::size_t>(id)] = engine.TokenBytes(id);
+        } catch (const std::exception&) {
+          continue;  // padding past the tokenizer: never allowed
+        }
+        try {
+          special[static_cast<std::size_t>(id)] =
+              engine.IsSpecialToken(id) ? 1 : 0;
+        } catch (const std::exception&) {
+          // An engine without a tokenizer (tests): no added tokens.
+        }
+      }
+      vocab = std::make_shared<const VocabIndex>(std::move(bytes),
+                                                 std::move(special));
+    }
+    return vocab;
   }
 
   // Waits for the engine. False when the client left first.
@@ -849,6 +900,8 @@ struct Server::Impl {
   Metrics metrics;
   std::vector<int> stop_ids;
   std::int64_t created;
+  std::mutex vocab_mutex;
+  std::shared_ptr<const VocabIndex> vocab;
 };
 
 Server::Server(Engine& engine, const ChatFormat& format, ServerOptions options)

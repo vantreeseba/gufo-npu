@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -30,6 +31,12 @@ public:
   // Id of an exact token string such as "<|im_end|>", or -1.
   int Find(std::string_view token) const;
   int VocabSize() const { return static_cast<int>(bytes_.size()); }
+  // Whether `id` is an added token (control or user-defined, such as
+  // "<|im_end|>" or "<tool_call>"), which TokenBytes gives as its text.
+  bool IsSpecial(int id) const {
+    return id >= 0 && id < VocabSize() &&
+           special_[static_cast<std::size_t>(id)] != 0;
+  }
 
 private:
   void EncodePiece(const std::string& piece, std::vector<int>& out) const;
@@ -37,8 +44,9 @@ private:
 
   struct Regex;
   std::unique_ptr<Regex> regex_;
-  std::vector<std::string> tokens_;  // byte-level encoded token strings
-  std::vector<std::string> bytes_;   // decoded UTF-8 bytes per token
+  std::vector<std::string> tokens_;    // byte-level encoded token strings
+  std::vector<std::string> bytes_;     // decoded UTF-8 bytes per token
+  std::vector<std::uint8_t> special_;  // 1 for added tokens
   std::unordered_map<std::string, int> vocab_;
   std::unordered_map<std::string, int> merge_rank_;  // "left right" -> rank
   // Added tokens (control / user-defined), longest first, for splitting.
