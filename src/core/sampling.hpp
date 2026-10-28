@@ -12,6 +12,15 @@
 // models' greedy paths.
 namespace gufo_npu {
 
+// Sees every token a Sampler picks, with the logits it picked from (the
+// model's own, before penalties, logit_bias and temperature). The server
+// uses it for logprobs; Sample calls it after each pick.
+class SampleObserver {
+public:
+  virtual ~SampleObserver() = default;
+  virtual void Sampled(const float* logits, int vocab, int id) = 0;
+};
+
 struct SamplingParams {
   float temperature = 0.0f;  // 0: greedy
   float top_p = 1.0f;        // nucleus mass kept; 1: off
@@ -21,9 +30,22 @@ struct SamplingParams {
   float frequency_penalty = 0.0f;
   float repetition_penalty = 1.0f;  // 1: off
   std::optional<std::uint64_t> seed;
+  // Added to a token's logit before sampling (OpenAI logit_bias: -100
+  // bans a token, 100 all but forces it). Ids outside the vocab are ignored.
+  std::vector<std::pair<int, float>> logit_bias;
+  SampleObserver* observer = nullptr;  // not owned
 
   bool greedy() const { return temperature <= 0.0f; }
 };
+
+// A token's log probability under softmax(logits), and the `top` most
+// likely tokens with theirs (best first, equal logits in id order).
+struct TokenLogprobs {
+  int id = -1;
+  float logprob = 0;
+  std::vector<std::pair<int, float>> top;
+};
+TokenLogprobs ComputeLogprobs(const float* logits, int vocab, int id, int top);
 
 // Picks tokens from logits under SamplingParams. Penalties apply to the
 // tokens generated so far (Accept), not to the prompt:
@@ -65,6 +87,9 @@ public:
 
 private:
   bool HasPenalties() const;
+  // Penalties or logit_bias change the logits before the pick.
+  bool Adjusts() const;
+  int Pick(const float* logits, int vocab);
   // The logit after penalties.
   float Penalized(int id, float logit) const;
   // The logits after penalties: `logits` itself when none apply.

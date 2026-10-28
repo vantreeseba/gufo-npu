@@ -11,6 +11,7 @@
 #include <functional>
 #include <map>
 #include <random>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -441,7 +442,123 @@ void SpeculativeRule() {
 
 }  // namespace
 
+// logit_bias shifts the logits before the pick, greedy or not; without it
+// greedy stays std::max_element.
+void LogitBias() {
+  const std::vector<float> logits = {1.0f, 3.0f, 2.0f, 0.5f};
+  SamplingParams p;
+  p.logit_bias = {{2, 2.0f}};
+  Sampler greedy(p);
+  Check(greedy.Sample(logits.data(), 4) == 2, "logit_bias: greedy follows it");
+  p.logit_bias = {{1, -100.0f}};
+  Sampler banned(p);
+  Check(banned.Sample(logits.data(), 4) == 2, "logit_bias: -100 bans");
+  p.logit_bias = {{0, 100.0f}, {99, 5.0f}};  // 99 is outside: ignored
+  p.temperature = 1.0f;
+  p.seed = 3;
+  Sampler forced(p);
+  bool all = true;
+  for (int i = 0; i < 200; ++i) {
+    all = all && forced.Sample(logits.data(), 4) == 0;
+  }
+  Check(all, "logit_bias: +100 forces when sampling");
+  // Sampling: the distribution is softmax of the biased logits.
+  SamplingParams q;
+  q.temperature = 1.0f;
+  q.logit_bias = {{3, 1.5f}};
+  Sampler biased(q);
+  const auto dist = biased.Distribution(logits.data(), 4);
+  double z = 0;
+  const std::vector<double> shifted = {1.0, 3.0, 2.0, 2.0};
+  for (const double v : shifted) {
+    z += std::exp(v);
+  }
+  bool match = dist.size() == 4;
+  for (const auto& [id, prob] : dist) {
+    match = match && std::fabs(prob - std::exp(shifted[id]) / z) < 1e-5;
+  }
+  Check(match, "logit_bias: biased softmax");
+  SamplingParams bad;
+  bad.logit_bias = {{0, NAN}};
+  bool threw = false;
+  try {
+    Sampler s(bad);
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  Check(threw, "logit_bias: non-finite refused");
+}
+
+// The observer sees every pick with the raw logits; ComputeLogprobs is
+// log-softmax with the top tokens best first.
+void ObserverAndLogprobs() {
+  struct Seen : gufo_npu::SampleObserver {
+    void Sampled(const float* logits, int vocab, int id) override {
+      ids.push_back(id);
+      first.push_back(logits[0]);
+      sizes.push_back(vocab);
+    }
+    std::vector<int> ids;
+    std::vector<float> first;
+    std::vector<int> sizes;
+  } seen;
+  const std::vector<float> logits = {0.25f, 3.0f, 2.0f, 2.0f, -1.0f};
+  SamplingParams p;
+  p.observer = &seen;
+  p.logit_bias = {{0, 10.0f}};  // the observer still sees the raw logits
+  Sampler sampler(p);
+  const int a = sampler.Sample(logits.data(), 5);
+  p.logit_bias.clear();
+  Sampler plain(p);
+  const int b = plain.Sample(logits.data(), 5);
+  Check(seen.ids == std::vector<int>{a, b} && a == 0 && b == 1 &&
+            seen.first == std::vector<float>{0.25f, 0.25f} &&
+            seen.sizes == std::vector<int>{5, 5},
+        "observer: every pick, raw logits");
+
+  double z = 0;
+  for (const float v : logits) {
+    z += std::exp(static_cast<double>(v));
+  }
+  const auto lp = gufo_npu::ComputeLogprobs(logits.data(), 5, 4, 3);
+  Check(lp.id == 4 && std::fabs(lp.logprob - (-1.0 - std::log(z))) < 1e-5,
+        "logprobs: log-softmax");
+  Check(lp.top.size() == 3 && lp.top[0].first == 1 && lp.top[1].first == 2 &&
+            lp.top[2].first == 3 &&
+            std::fabs(lp.top[1].second - lp.top[2].second) < 1e-7 &&
+            std::fabs(lp.top[0].second - (3.0 - std::log(z))) < 1e-5,
+        "logprobs: top tokens best first, ties in id order");
+  Check(gufo_npu::ComputeLogprobs(logits.data(), 5, 1, 0).top.empty() &&
+            gufo_npu::ComputeLogprobs(logits.data(), 5, 1, 9).top.size() == 5,
+        "logprobs: top 0 and top above the vocab");
+  // A 248k vocabulary of spread logits: probabilities sum to 1.
+  std::vector<float> big(248320);
+  std::mt19937 rng(5);
+  std::normal_distribution<float> normal(0.0f, 3.0f);
+  for (auto& v : big) {
+    v = normal(rng);
+  }
+  double total = 0;
+  for (int id = 0; id < 248320; id += 97) {
+    total += std::exp(static_cast<double>(
+        gufo_npu::ComputeLogprobs(big.data(), 248320, id, 0).logprob));
+  }
+  double direct = 0;
+  const float best = *std::max_element(big.begin(), big.end());
+  double zb = 0;
+  for (const float v : big) {
+    zb += std::exp(static_cast<double>(v - best));
+  }
+  for (int id = 0; id < 248320; id += 97) {
+    direct += std::exp(static_cast<double>(big[id] - best)) / zb;
+  }
+  Check(std::fabs(total - direct) < 1e-5 * std::max(direct, 1e-3),
+        "logprobs: agree with a double-precision softmax on 248k");
+}
+
 int main() {
+  LogitBias();
+  ObserverAndLogprobs();
   Greedy();
   Seeds();
   Temperature();

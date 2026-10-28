@@ -47,6 +47,11 @@ Sampler::Sampler(const SamplingParams& params) : params_(params) {
       !std::isfinite(params_.frequency_penalty)) {
     throw std::invalid_argument("sampling: settings must be finite");
   }
+  for (const auto& [id, bias] : params_.logit_bias) {
+    if (!std::isfinite(bias)) {
+      throw std::invalid_argument("sampling: logit_bias must be finite");
+    }
+  }
   if (params_.seed) {
     rng_.seed(*params_.seed);
   } else {
@@ -82,14 +87,25 @@ float Sampler::Penalized(int id, float logit) const {
   return v;
 }
 
+bool Sampler::Adjusts() const {
+  return !params_.logit_bias.empty() || (HasPenalties() && !counts_.empty());
+}
+
 const float* Sampler::Source(const float* logits, int vocab) {
-  if (!HasPenalties() || counts_.empty()) {
+  if (!Adjusts()) {
     return logits;
   }
   penalized_.assign(logits, logits + vocab);
-  for (const auto& [id, count] : counts_) {
-    if (id < vocab) {
-      penalized_[static_cast<std::size_t>(id)] = Penalized(id, logits[id]);
+  if (HasPenalties()) {
+    for (const auto& [id, count] : counts_) {
+      if (id < vocab) {
+        penalized_[static_cast<std::size_t>(id)] = Penalized(id, logits[id]);
+      }
+    }
+  }
+  for (const auto& [id, bias] : params_.logit_bias) {
+    if (id >= 0 && id < vocab) {
+      penalized_[static_cast<std::size_t>(id)] += bias;
     }
   }
   return penalized_.data();
@@ -255,7 +271,15 @@ std::vector<std::pair<int, double>> Sampler::Distribution(const float* logits,
 }
 
 int Sampler::Sample(const float* logits, int vocab) {
-  if (params_.greedy() && (!HasPenalties() || counts_.empty())) {
+  const int id = Pick(logits, vocab);
+  if (params_.observer != nullptr) {
+    params_.observer->Sampled(logits, vocab, id);
+  }
+  return id;
+}
+
+int Sampler::Pick(const float* logits, int vocab) {
+  if (params_.greedy() && !Adjusts()) {
     return static_cast<int>(std::max_element(logits, logits + vocab) - logits);
   }
   Candidates(logits, vocab);
@@ -285,6 +309,55 @@ int Sampler::Sample(const float* logits, int vocab) {
     }
   }
   return list_.back().first;
+}
+
+TokenLogprobs ComputeLogprobs(const float* logits, int vocab, int id, int top) {
+  if (vocab <= 0 || id < 0 || id >= vocab) {
+    throw std::invalid_argument("logprobs: token id out of range");
+  }
+  const float best = *std::max_element(logits, logits + vocab);
+  // log sum exp, summed in 16 lanes of float then in double.
+  constexpr int kLanes = 16;
+  float lanes[kLanes] = {};
+  int i = 0;
+  for (; i + kLanes <= vocab; i += kLanes) {
+    for (int j = 0; j < kLanes; ++j) {
+      lanes[j] += FastExp(std::max(logits[i + j] - best, -87.0f));
+    }
+  }
+  for (; i < vocab; ++i) {
+    lanes[0] += FastExp(std::max(logits[i] - best, -87.0f));
+  }
+  double sum = 0;
+  for (const float lane : lanes) {
+    sum += lane;
+  }
+  const double log_z = best + std::log(sum);
+  TokenLogprobs out;
+  out.id = id;
+  out.logprob = static_cast<float>(logits[id] - log_z);
+  top = std::min(top, vocab);
+  if (top > 0) {
+    // The `top` best ids: a small sorted list, best first.
+    auto better = [logits](int a, int b) {
+      return logits[a] > logits[b] || (logits[a] == logits[b] && a < b);
+    };
+    std::vector<int> ids;
+    ids.reserve(static_cast<std::size_t>(top) + 1);
+    for (int t = 0; t < vocab; ++t) {
+      if (static_cast<int>(ids.size()) == top && !better(t, ids.back())) {
+        continue;
+      }
+      ids.insert(std::upper_bound(ids.begin(), ids.end(), t, better), t);
+      if (static_cast<int>(ids.size()) > top) {
+        ids.pop_back();
+      }
+    }
+    for (const int t : ids) {
+      out.top.emplace_back(t, static_cast<float>(logits[t] - log_z));
+    }
+  }
+  return out;
 }
 
 }  // namespace gufo_npu
