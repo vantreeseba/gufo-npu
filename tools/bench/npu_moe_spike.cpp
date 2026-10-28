@@ -128,11 +128,11 @@ int main(int argc, char** argv) {
     ups.push_back(
         q4nx::PackRows({{gguf::GgmlType::kBF16,
                          reinterpret_cast<const uint8_t*>(bits.data()), 1024}},
-                       kHidden, q4nx::SwiGluOrder(kFfn)));
+                       kHidden, q4nx::Fit::kSearch, q4nx::SwiGluOrder(kFfn)));
     std::vector<float> d(kHidden * kFfn);
     for (auto& v : d)
       v = wd(rng);
-    downs.push_back(q4nx::PackFloat(d.data(), kHidden, kFfn));
+    downs.push_back(q4nx::PackFloat(d.data(), kHidden, kFfn, q4nx::Fit::kSearch));
   }
   const size_t up_bytes = ups[0].bytes.size(),
                down_bytes = downs[0].bytes.size();

@@ -244,6 +244,9 @@ void BenchMoeFfn(const gufo_npu::gguf::File& file,
         t.data + first * gufo_npu::quant::RowBytes(t.type, t.RowElements()),
         count};
   };
+  // Packed as the decoder packs this model.
+  const q4nx::Fit fit =
+      gufo_npu::qwen35::Q4nxFit(gufo_npu::qwen35::ReadConfig(file));
   // Arena slots 0..15: routed experts 0..15; slot 16: the shared expert.
   for (std::size_t e = 0; e < arena.experts; ++e) {
     const bool shared = e + 1 == arena.experts;
@@ -256,11 +259,11 @@ void BenchMoeFfn(const gufo_npu::gguf::File& file,
                                                  e * ffn, ffn),
                                             rows("blk.0.ffn_up_exps.weight",
                                                  e * ffn, ffn)},
-        hidden, q4nx::SwiGluOrder(ffn));
+        hidden, fit, q4nx::SwiGluOrder(ffn));
     const auto down = q4nx::PackRows(
         {shared ? rows("blk.0.ffn_down_shexp.weight", 0, hidden)
                 : rows("blk.0.ffn_down_exps.weight", e * hidden, hidden)},
-        ffn);
+        ffn, fit);
     std::memcpy(arena_buf.as<std::uint8_t>() + arena.UpOffset(e),
                 up.bytes.data(), up.bytes.size());
     std::memcpy(arena_buf.as<std::uint8_t>() + arena.DownOffset(e),
@@ -418,7 +421,8 @@ int BenchGemv(const std::vector<std::string_view>& args) {
       segments.push_back({t.type, t.data, static_cast<std::size_t>(t.Rows())});
     }
     const std::size_t dim = file->Tensor(c.tensors[0]).RowElements();
-    const auto packed = q4nx::PackRows(segments, dim);
+    // Timing only: the fit does not change the bytes.
+    const auto packed = q4nx::PackRows(segments, dim, q4nx::Fit::kMinMax);
     npu::Q4nxGemv gemv(runtime, packed, c.prologue, c.epilogue);
     // Unit inputs: timing only (tests/models/qwen35_2b/q4nx_gemv_test.cpp
     // checks values).

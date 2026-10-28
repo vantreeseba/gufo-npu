@@ -75,6 +75,12 @@ over the same q4nx weights, 2026-10-27:
 | long (230) | 230/230 | 4.5e-3 | 197/230 |
 | all | 301/301 | | 266/301 (88.4%) |
 
+These are with main's min/max fit. With the search fit this model now
+packs with (`qwen35_4b::kQ4nxFit`, EXPERIMENTS.md), 2026-10-27: chat
+17/17, code 14/15, prose 36/39, long 202/230 against llama.cpp, 269/301
+(89.4%) in all; NPU against the CPU 300/301; logits rel. L2 3.3e-3 to
+5.6e-3.
+
 The NPU adds only its bf16 inputs (as on the 2B); the 35 top-1 changes
 against llama.cpp are q4nx's requantization of the GGUF's Q5_K, Q6_K (the
 LM head among them) and Q8_0 tensors, as measured for the 35B

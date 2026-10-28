@@ -188,7 +188,8 @@ unpacked on the fly by the same rule, checked bit for bit against
 inputs, so how the NPU stacks or orders rows does not change any weight. F32
 matrices (router, DeltaNet alpha/beta) and the embedding lookup stay as
 stored. KL is KL(softmax(a) ‖ softmax(set)) per position, in nats.
-2026-10-27, deterministic across two runs:
+2026-10-27, with the min/max fit the packer used until the change in the
+next section, deterministic across two runs:
 
 | Set | Packed | Top-1 vs llama.cpp | Top-1 vs reference | Top-1 vs (a) | First top-1 change vs (a): chat / code / prose / long | KL vs (a): mean | max | Logits rel. L2 vs reference (per prompt) |
 |---|---|---|---|---|---|---|---|---|
@@ -224,7 +225,95 @@ more. Keeping the non-expert matrices at 8 bits on the NPU (an 8-bit GEMV
 variant; 1.9 B weights, ~2 GB at Q8_0 against 1.1 GB in q4nx) would recover
 most of it; the experts, which dominate the bytes, can stay q4nx. Peak RSS
 of the test 26.6 GB, of which 8.2 GB anonymous (the packed matrices) and the
-rest page cache of the memory-mapped GGUF; ~7 minutes.
+rest page cache of the memory-mapped GGUF; ~7 minutes. Choosing the 4-bit
+values better, in the same format, recovers part of it without the bytes
+(next section).
+
+## Choosing the 4-bit values
+
+The q4nx format fixes the bytes and the kernel, but for every weight that
+is not Q4_K the packer still chooses each row's d and dmin and each group's
+sub-scale, sub-minimum and codes. `tests/models/qwen36_35b_a3b/q4nx_quality_test.cpp`
+(label `model`; `GUFO_NPU_QWEN36_TEXT` is the output of
+`tools/reference/fetch_text.py`) compares ways of choosing them, against the
+GGUF as stored, with the weight sets above:
+
+- **Evaluation text:** six pinned rows of public datasets (English, German
+  and Chinese Wikipedia, an UltraChat reply, a CodeFeedback answer, a
+  NuminaMath solution), the first 256 tokens of each: 1,515 positions,
+  teacher forced through the fp32 CPU decoder. KL(a ‖ set) mean is the main
+  number, top-1 agreement with (a) the second. The 301 oracle positions give
+  top-1 against (a) and against llama.cpp as a cross-check.
+- **Calibration text**, for the methods that use activations: 16 other rows
+  (Wikipedia in five languages, UltraChat, CodeFeedback, NuminaMath,
+  alpaca-zh), 3,739 tokens.
+- **Methods**, all in the same format:
+  - *min/max*: per 32 weights the minimum and range, rounded onto the
+    grids (minimum down, step up); the packer until 2026-10-27.
+  - *search*: llama.cpp's Q4_K fit (`make_qkx3_quants`): per group the
+    weighted least-squares step and minimum over the code assignments of 37
+    candidate steps, weighting each weight by av + |w|; then each group takes
+    the sub-scale and sub-minimum within one grid step of its fit with the
+    lowest error. *Equal weights* drops the |w| term; *refit* then solves d
+    and dmin by least squares with the integers fixed.
+  - *library*: `q4nx::PackRows` with `Fit::kSearch` (the search fit,
+    vectorized), which `qwen35::Q4nxFit` names for this model: the NPU
+    decoder, its MTP block and draft head load these weights, and the NPU
+    prefill converts the decoder's buffers.
+  - *imatrix*: search with each weight's error weighted by its input's mean
+    x² from the calibration pass (llama.cpp's `qw * sqrt(sigma2 + w²)`);
+    *mean x² alone* drops the sqrt term; *Unsloth's imatrix* takes the mean
+    x² from the `imatrix_unsloth.gguf` published with this GGUF
+    (847k calibration tokens; it has no LM head entry, which comes from our
+    calibration pass).
+  - *AWQ*: per-input scales s = mean|x|^α, rounded to powers of two and α
+    chosen per matrix on 64 calibration inputs, multiplied into the weights
+    and divided out of the input. Only where the NPU path can absorb 1/s
+    exactly: in the norm weight of the mixers' input projections and of the
+    LM head, in the CPU-written inputs of the mixers' output projections,
+    and in the shared expert's up rows for its down projection. Not the
+    shared expert's gate/up, which shares its NPU call and input with the
+    routed Q4_K experts.
+
+2026-10-27, deterministic:
+
+| Method | (d) KL | (d) top-1 | (b) KL | (b) top-1 | (c) KL | (c) top-1 | (b) oracle top-1 vs (a) / llama.cpp | Packing, 32 threads |
+|---|---|---|---|---|---|---|---|---|
+| min/max (before) | 0.0316 | 93.33% | 0.0359 | 92.21% | 0.0394 | 91.95% | 274 / 269 | 0.4 ns per weight |
+| search, equal weights | | | 0.0338 | 93.07% | | | 277 / 274 | |
+| search | | | 0.0261 | 93.66% | | | 280 / 279 | |
+| search + refit | | | 0.0267 | 93.80% | | | 278 / 277 | |
+| **library (this model's fit)** | **0.0230** | **94.65%** | **0.0268** | **93.80%** | **0.0301** | **93.07%** | 278 / 277 | 1.4 ns per weight |
+| imatrix | 0.0111 | 95.84% | 0.0149 | 94.65% | | | 281 / 281 | |
+| imatrix, mean x² alone | | | 0.0157 | 95.51% | | | 282 / 280 | |
+| Unsloth's imatrix | 0.0107 | 96.70% | 0.0147 | 95.64% | 0.0175 | 94.85% | 280 / 279 | |
+| AWQ + search | | | 0.0194 | 94.79% | | | 280 / 276 | |
+| AWQ + imatrix | | | 0.0153 | 94.92% | | | 283 / 284 | |
+
+For scale: llama.cpp against (a) has KL 0.006 on the oracle prompts.
+
+Reading:
+
+- The search fit cuts KL by about a quarter on every set at no cost in
+  format, kernel or decode speed, so it is this model's fit
+  (`qwen35::Q4nxFit`). Each model names its own: Qwen3.5-4B takes it too,
+  Qwen3.5-2B keeps min/max (its EXPERIMENTS.md). Its weighting of larger weights does most of that:
+  with equal weights it gains only 6%. Refitting d and dmin adds nothing.
+- Weighting by activation statistics halves KL again (0.0149 against 0.0261
+  at (b)) and moves the oracle's top-1 against llama.cpp from 269 (min/max)
+  and 279 (search) to 281. Unsloth's published imatrix does as well as our
+  own calibration pass. Next step, not built: the NPU path needs the
+  statistics at load time (an importance argument to `q4nx::PackRows`, the
+  imatrix GGUF read by tensor name, per expert for the expert tensors, and
+  a calibration-pass fallback for the LM head, which llama.cpp's imatrix
+  leaves out).
+- AWQ helps the data-free fit (0.0194) but adds nothing on top of the
+  importance weighting (0.0153 against 0.0149), and it needs calibration
+  data too.
+- Packing the 35B's 1.9 B non-expert weights takes ~3–4 s on 32 threads
+  (an AVX2 loop; the scalar version took 6.6 ns per weight). Per-text
+  numbers are in the test's output; German Wikipedia and Chinese are the
+  hardest texts for every method.
 
 ## NPU decode
 
@@ -410,6 +499,31 @@ within the 95% limit); the first token is the decode path's on 9 of 10
 prompts (the 230-token passage again a 0.01-logit tie); every repeat is
 bit-identical; speculation after the prefill equals plain greedy (48 tokens,
 57% of drafts kept). The same limits hold.
+
+**With the search fit** (this model's fit since 2026-10-28, `qwen35::Q4nxFit`)
+argmax agrees 167/170 (pass ≥ 95%); the states after prefill are as close to
+the decode path's as with min/max or closer (len1024/1025: hidden 4.1e-2
+against 4.5e-2, conv 5.3e-2 against 5.9e-2, ssm 3.9e-2 against 5.2e-2, kv
+5.5e-2 against 6.5e-2). The test prints each top-1 change with both sides'
+top-2 gaps, and for every prompt each step's logits error and the number of
+layers routed unlike the decode path's same step:
+
+| Prompt, step | Decode path's top-2 gap | After prefill: top-2 gap |
+|---|---|---|
+| prose, step 5 | 0.042 | 0.065 |
+| len2, step 11 | 0.008 | 0.019 |
+| len1025, step 6 | 1.114 | 0.420 |
+
+Two are near ties. The third is not, but it sits in a divergence the
+min/max weights show as well: from 1,024 prompt tokens on, the steps after
+prefill route unlike the decode path in 15–34 of the 40 layers at nearly
+every step with either fit, and single steps reach logits errors of 0.3–0.65
+on main's weights too (len2049 steps 0, 2, 8 and 12; len4000 step 6) without
+changing top-1 there. At len1025 step 6 the search fit's run has a step error
+of 0.097 with 19 layers routed differently, and top-1 changes. The prefill
+itself is not less accurate; how often a long prompt's routing divergence
+flips a top-1 is luck of the positions, and the GEMM's bfp16 rounding is what
+a tighter bound needs (as above).
 
 **Where the error comes from.** It is the GEMMs' bfp16 rounding (activations
 rounded to bfp16 inside the mmul, 8 values sharing an exponent; outputs to

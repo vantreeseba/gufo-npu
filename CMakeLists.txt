@@ -73,6 +73,10 @@ set_source_files_properties(src/models/qwen35/decoder.cpp
   src/models/qwen35/gguf_projections.cpp
   src/models/qwen35/npu_decoder.cpp PROPERTIES
   COMPILE_OPTIONS "-march=x86-64-v3;-O3")
+# The q4nx packer's fit vectorizes too; no fused multiply-adds, so Unpack and
+# Gemv round exactly as written (tests compare unpacked weights bit for bit).
+set_source_files_properties(src/core/q4nx.cpp PROPERTIES
+  COMPILE_OPTIONS "-march=x86-64-v3;-O3;-ffp-contract=off")
 
 # NPU runtime: XRT when enabled, otherwise a stub that reports it is absent.
 if(GUFO_NPU_ENABLE_XRT)

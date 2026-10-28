@@ -151,28 +151,31 @@ void PackDense(const gufo_npu::gguf::File& file, const qwen35::Config& c,
       l.in = q4nx::PackRows(
           {SegmentOf(t("attn_q.weight")), SegmentOf(t("attn_k.weight")),
            SegmentOf(t("attn_v.weight"))},
-          hidden);
+          hidden, qwen35::Q4nxFit(c));
       const auto& o = t("attn_output.weight");
-      l.out = q4nx::Pack(o.type, o.data, o.Rows(), o.RowElements());
+      l.out = q4nx::Pack(o.type, o.data, o.Rows(), o.RowElements(),
+                         qwen35::Q4nxFit(c));
     } else {
       l.in = q4nx::PackRows(
           {SegmentOf(t("attn_qkv.weight")), SegmentOf(t("attn_gate.weight"))},
-          hidden);
+          hidden, qwen35::Q4nxFit(c));
       const auto& o = t("ssm_out.weight");
-      l.out = q4nx::Pack(o.type, o.data, o.Rows(), o.RowElements());
+      l.out = q4nx::Pack(o.type, o.data, o.Rows(), o.RowElements(),
+                         qwen35::Q4nxFit(c));
     }
     l.ffn_in = q4nx::PackRows({SegmentOf(t("ffn_gate_shexp.weight")),
                                SegmentOf(t("ffn_up_shexp.weight"))},
-                              hidden);
+                              hidden, qwen35::Q4nxFit(c));
     const auto& down = t("ffn_down_shexp.weight");
-    l.ffn_down =
-        q4nx::Pack(down.type, down.data, down.Rows(), down.RowElements());
+    l.ffn_down = q4nx::Pack(down.type, down.data, down.Rows(),
+                            down.RowElements(), qwen35::Q4nxFit(c));
     l.gate_exps = &t("ffn_gate_exps.weight");
     l.up_exps = &t("ffn_up_exps.weight");
     l.down_exps = &t("ffn_down_exps.weight");
   }
   const auto& head = file.Tensor("output.weight");
-  store.lm_head = q4nx::Pack(head.type, head.data, head.Rows(), hidden);
+  store.lm_head =
+      q4nx::Pack(head.type, head.data, head.Rows(), hidden, qwen35::Q4nxFit(c));
 }
 
 void PackExperts(const qwen35::Config& c, Store& store) {
@@ -185,11 +188,12 @@ void PackExperts(const qwen35::Config& c, Store& store) {
         l.expert_in.push_back(
             q4nx::PackRows({SegmentOf(*l.gate_exps, e * ef, ef),
                             SegmentOf(*l.up_exps, e * ef, ef)},
-                           hidden));
+                           hidden, qwen35::Q4nxFit(c)));
       }
       if (l.down_exps->type != GgmlType::kQ4_K) {
         l.expert_down.push_back(
-            q4nx::PackRows({SegmentOf(*l.down_exps, e * hidden, hidden)}, ef));
+            q4nx::PackRows({SegmentOf(*l.down_exps, e * hidden, hidden)}, ef,
+                           qwen35::Q4nxFit(c)));
       }
     }
   }
@@ -448,8 +452,8 @@ int main() {
     const auto& gate = file->Tensor("blk.0.ffn_gate_exps.weight");
     const auto ef = static_cast<std::size_t>(c.expert_ffn);
     const auto dim = static_cast<std::size_t>(c.hidden);
-    const auto packed =
-        q4nx::Unpack(q4nx::PackRows({SegmentOf(gate, 7 * ef, ef)}, dim));
+    const auto packed = q4nx::Unpack(
+        q4nx::PackRows({SegmentOf(gate, 7 * ef, ef)}, dim, qwen35::Q4nxFit(c)));
     std::vector<float> mine(ef * dim);
     for (std::size_t r = 0; r < ef; ++r) {
       UnpackQ4KAsQ4nx(

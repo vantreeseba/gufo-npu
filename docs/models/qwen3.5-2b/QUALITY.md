@@ -63,11 +63,13 @@ error < 1e-2, and the resnorm residual (H + D) within 1e-6 of its scale.
   unchanged and gave 1.1e-2.
 - `q4nx_test` (hosted CI) checks the packing: Q4_K codes, sub-scales and
   sub-minima carry over unchanged (only d and dmin round to bf16),
-  requantized weights stay within half their step (the group's range / 15,
-  widened by the int8 minimum's grid and rounded up onto d's), fused stacks
-  equal their parts, row orders (SwiGLU) apply, and the CPU q4nx GEMV matches
-  the reference. Requantizing N(0, 0.02) weights: relative RMS error 0.0787
-  (0.0783 with 5120-byte blocks).
+  requantized weights stay within half their step with `Fit::kMinMax`, this
+  model's fit (the group's range / 15, widened by the int8 minimum's grid
+  and rounded up onto d's) and within a whole step with `Fit::kSearch`
+  (which may clip a group's extremes), fused stacks equal their parts, row
+  orders (SwiGLU) apply, and the CPU q4nx GEMV matches the reference.
+  Requantizing N(0, 0.02) weights: relative RMS error 0.0787 with min/max
+  (0.0783 with 5120-byte blocks), 0.0702 with the search fit.
 
 ## NPU decode, teacher-forced
 
@@ -102,6 +104,34 @@ With the compact 4736-byte blocks (same day, same test):
   positions as the NPU here, except 2 prose positions where the GGUF weights
   do better: requantizing the 5–8-bit tensors costs 2 of 73. A longer quality
   run decides whether an 8-bit kernel variant is needed.
+
+### The search fit, measured and not adopted
+
+Each model names its q4nx fit (`q4nx::Fit`; this package's rule is
+`qwen35::Q4nxFit`). Qwen3.6-35B-A3B and Qwen3.5-4B pack with the search
+fit (llama.cpp's weighted least-squares Q4_K fit,
+[measured on the 35B](../qwen3.6-35b-a3b/QUALITY.md#choosing-the-4-bit-values));
+this model keeps min/max, because on its decode weights the search fit
+lowers KL but not top-1. With the search fit (2026-10-27, compact
+blocks):
+
+| Prompt | Tokens | NPU vs q4nx CPU: argmax | Logits rel err | NPU argmax vs HF |
+|---|---|---|---|---|
+| chat | 19 | 19/19 | 8.2e-3 | 17/19 |
+| code | 15 | 15/15 | 5.1e-3 | 14/15 |
+| prose | 39 | 39/39 | 4.9e-3 | 30/39 |
+
+- 73/73 against its own weights on the CPU; 61/73 against HF (63/73 with
+  the min/max fit), a difference of two near ties in 73 positions. On
+  1,515 positions of held-out text against the GGUF as stored (the 35B's
+  quality test's harness run on this model, same texts): with every matrix
+  in q4nx KL falls from 0.0424 to 0.0332 but top-1 agreement with the GGUF
+  goes from 91.29% to 90.89% (6 positions); without the LM head (the tied
+  Q6_K embedding) KL falls from 0.0336 to 0.0258 and top-1 rises from
+  93.14% to 93.47%.
+- The NPU decoder would pack and upload in 2.6 s instead of 1.3 s.
+- With min/max kept, the 2B's outputs are main's: the same hashes and
+  speed (see EXPERIMENTS.md).
 
 ## Speculative decoding
 
