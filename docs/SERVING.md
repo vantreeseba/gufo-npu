@@ -14,13 +14,23 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -d '{"messages": [{"role": "user", "content": "Hi!"}], "stream": true}'
 ```
 
-In the container, publish the port and give it the NPU:
+In the container, publish the port, give it the NPU and mount the model
+read-only. The image's entrypoint runs `gufo-npu`, so the command starts
+with `serve`; the installed kernels are found by default:
 
 ```sh
-docker run --rm --device /dev/accel/accel0 --ulimit memlock=-1:-1 \
-  -v /path/to/models:/models -p 8080:8080 ghcr.io/vantreeseba/gufo-npu:main \
-  gufo-npu serve --model /models/MODEL.gguf --host 0.0.0.0
+docker run -d --name gufo-npu-serve --device /dev/accel/accel0 \
+  --ulimit memlock=-1:-1 -p 8080:8080 \
+  -v /path/to/MODEL.gguf:/models/model.gguf:ro \
+  ghcr.io/vantreeseba/gufo-npu:main \
+  serve --model /models/model.gguf --host 0.0.0.0
+docker inspect -f '{{.State.Health.Status}}' gufo-npu-serve   # healthy once loaded
 ```
+
+The image's health check polls `/health` on port 8080 (set `GUFO_NPU_PORT`
+with `-e` when serving on another port). Add
+`-v /opt/xilinx/xrt:/opt/xilinx/xrt:ro` when the host's amdxdna driver
+needs the host's XRT (see the Dockerfile).
 
 ## Options
 
@@ -143,15 +153,16 @@ official `openai` Python client (3.40).
 - Queue full: 429.
 - A second turn reusing 929 of 993 prompt tokens.
 
-**Server overhead:** HTTP adds nothing measurable. The first token arrives in
-the same time as `gufo-npu generate`'s prompt phase, and decode runs at the
-same tok/s (median of 3 after a warm-up; `--prompt-cache 0`):
+**Server overhead:** HTTP adds nothing measurable. The first token arrives
+as fast as through `gufo-npu generate`, and decode runs at the same tok/s
+(`tools/serve/serve_bench.py`, median of 3 after a warm-up, `--prompt-cache
+0`):
 
-| Model | Short prompt (24 tokens): TTFT, decode | ~1k prompt (932 tokens): TTFT, decode | In process, ~1k |
-|---|---|---|---|
-| Qwen3.5-2B | 0.093 s, 53.4 tok/s | 0.293 s, 55.4 tok/s | 0.29 s, 55.3 tok/s |
-| Qwen3.5-4B | 0.204 s, 27.6 tok/s | 0.661 s, 25.6 tok/s | 0.79 s*, 26.0 tok/s |
-| Qwen3.6-35B-A3B | 0.255 s, 26.6 tok/s | 1.088 s, 25.7 tok/s | 1.11 s, 25.5 tok/s |
+| Model | Short prompt (24 tokens): HTTP | In process | ~1k prompt (932 tokens): HTTP | In process |
+|---|---|---|---|---|
+| Qwen3.5-2B | 0.089 s, 53.8 tok/s | 0.09 s, 53.6 tok/s | 0.284 s, 55.3 tok/s | 0.29 s, 55.4 tok/s |
+| Qwen3.5-4B | 0.193 s, 27.6 tok/s | 0.33 s*, 27.6 tok/s | 0.643 s, 25.8 tok/s | 0.79 s*, 26.0 tok/s |
+| Qwen3.6-35B-A3B | 0.243 s, 27.3 tok/s | 0.24 s, 26.0 tok/s | 1.046 s, 26.2 tok/s | 1.08 s, 26.2 tok/s |
 
 \* `generate`'s prompt time for the 4B also counts work after the first
 token.
@@ -164,22 +175,50 @@ token.
 | Qwen3.5-4B | 0.22 s | 0.67 s |
 | Qwen3.6-35B-A3B | 0.31 s | 1.13 s |
 
-**Soak** (mixed load: 2–4-turn conversations with 0.1k–4k
-tokens of history, 70% streamed, 30% sampled, 10% of streams hung up):
+**Soak** (`tools/serve/serve_soak.py`):
+- **Traffic:** 2–4-turn conversations with 0.1k–4k tokens of history; 70% streamed, 30% sampled, 10% of streams hung up.
+- **Memory:** anonymous memory grows only when a longer prompt than any before arrives, then stays flat (see docs/serve/ENGINE.md, "Memory between requests").
 
-| Model | Run | Requests | Errors | TTFT on a cache hit / miss | Decode | Anonymous memory |
+| Model | Run | Requests | Errors | TTFT on a cache hit / miss | Decode by window | Anonymous memory: start, peak, end |
 |---|---|---|---|---|---|---|
-| Qwen3.6-35B-A3B | 30 min | 513 | 0 | 0.33–0.35 s / 1.5–2.4 s | 25.1–25.3 tok/s in every 10 min | 0.7 → 8.8 GB* |
-| Qwen3.6-35B-A3B | 15 min, with the fix | 235 | 0 | 0.41–0.43 s / 2.0–2.7 s | 24.6–25.0 tok/s | 0.7 → 1.25 GB (peak 1.55) |
-| Qwen3.5-4B | 5 min | 79 | 0 | 0.26 s / 1.6–1.7 s | 25.5 tok/s | 0.45 → 5.9 GB* |
-| Qwen3.5-2B | 5 min, with the fix | 163 | 0 | 0.15 s / 0.65–0.76 s | 50.5–52.5 tok/s | 0.33 → 0.68 GB (peak 0.75) |
+| Qwen3.6-35B-A3B | 30 min | 518 | 0 | 0.33–0.35 s / 1.5–2.3 s | 25.1, 25.4, 25.5 tok/s (10 min each) | 0.72, 2.24, 2.24 GB (flat from 10 min) |
+| Qwen3.5-4B | 5 min | 80 | 0 | 0.24–0.25 s / 1.6 s | 25.8, 25.9 tok/s | 0.45, 1.95, 1.95 GB (flat from 3 min) |
+| Qwen3.5-2B | 5 min | 168 | 0 | 0.12 s / 0.62–0.66 s | 52.7, 51.2 tok/s | 0.33, 1.12, 1.12 GB |
 
-\* Before the fix: glibc kept the prompt buffers of every new mix of
-lengths in its heaps. The engine now hands free heap pages back between
-requests once more than 1 GiB is unused (`ReleaseFreeMemory` in
-`src/serve/engine.cpp`). On a fixed second-turn prompt this costs nothing
-(2B: 0.104 s against 0.103 s). The runs' cache-hit times differ with their
-conversations' history lengths.
+Before buffer reuse, the same traffic grew without bound: the 35B reached
+8.8 GB at 30 minutes, the 4B 5.9 GB and the 2B 3.3 GB at 5 minutes.
+
+**Container:** the runtime image (`docker build .`) serves the 2B with the
+`docker run` line above. It reports healthy 15 s after start and passes all
+18 checks.
+
+## Testing a server
+
+`tools/serve/` drives a running server through the official `openai` Python
+client (`pip install openai httpx`). Each takes `--base-url` (default
+`http://127.0.0.1:8080`) and `--api-key` when the server has one:
+
+- `serve_e2e.py`: 18 checks, printing one line each and exiting 1 on a
+  failure:
+  - `/health`, `/v1/models` and `/metrics`
+  - chat, streamed and not
+  - thinking on and off
+  - a tool call round trip
+  - seeded sampling and a stop string
+  - a disconnect mid-stream (499)
+  - a full queue (429)
+  - a second turn served from the prompt cache
+
+  Start the server with `--max-queue 1` for the queue check.
+- `serve_bench.py`: warm time to the first token and decode tok/s for a
+  short and a ~1k-token prompt. Start the server with `--prompt-cache 0`.
+  With `--gufo-npu BIN --model GGUF` it also times `gufo-npu generate` on
+  the same prompts (`--skip-http` times only that).
+- `serve_soak.py --minutes N`: mixed multi-turn traffic (streamed, sampled
+  and hung-up requests). It prints time to the first token and decode tok/s
+  per `--window` seconds. With `--server-pid` (on the server's machine) it
+  also prints the server's anonymous memory over time; `--out` keeps every
+  record as JSON.
 
 ## Not supported yet
 

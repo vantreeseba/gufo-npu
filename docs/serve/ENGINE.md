@@ -130,13 +130,26 @@ buffers and the prefill's resident bfp16 matrices.
 
 ## Memory between requests
 
-Prompt buffers are sized by each request's length, and glibc keeps freed
-large buffers in its heaps, so a long-running server's anonymous memory
-would grow with each new mix of lengths. Before the fix it reached 8.8 GB
-after a 30-minute 35B soak, and 3.3 GB after 5 minutes on the 2B. After each
-request, once the heaps hold more than 1 GiB unused, `malloc_trim` hands
-their free pages back (`ReleaseFreeMemory`). The same soaks then stay at
-1.25 GB (35B, 15 min) and 0.68 GB (2B). See docs/SERVING.md, "Measured".
+A request's buffers are sized by its prompt. Freed and reallocated per
+request, glibc kept them in its heaps, so a long-running server's anonymous
+memory grew with every new mix of lengths: 8.8 GB after a 30-minute 35B
+soak, and 3.3 GB after 5 minutes on the 2B. Requests now reuse their
+buffers:
+- **Decode states:** each NPU decoder keeps a `StatePool`
+  (`models/qwen35/decoder.hpp`). A generation's main and MTP states, and the
+  prompt cache's checkpoints, come from it and go back to it. `Acquire`
+  resets a state to `NewState()`'s exact contents, so the K/V caches and
+  DeltaNet states keep their capacity.
+- **Prompt buffers:** the per-prompt-token residuals are a grow-only buffer
+  in the decoder (`PromptHidden`).
+- **Checkpoints:** evicted checkpoints hand their MTP caches to new ones.
+- **Prefills:** the prefills' own buffers were already grow-only members.
+
+Memory now grows only when a longer prompt than any before arrives, to that
+prompt's working set (a few pooled states plus the cache checkpoints), and
+stays flat between such steps. In the same soaks, the 35B levelled off at
+2.24 GB and the 2B at 1.12 GB (docs/SERVING.md, "Measured"). Outputs are
+bit-identical.
 
 ## The CLI
 
