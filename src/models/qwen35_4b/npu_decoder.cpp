@@ -518,10 +518,6 @@ int NpuDecoder::Draft(const float* const* hidden, const int* tokens, int count,
 
 namespace {
 
-int Argmax(const float* logits, int vocab) {
-  return static_cast<int>(std::max_element(logits, logits + vocab) - logits);
-}
-
 double SecondsSince(std::chrono::steady_clock::time_point start) {
   return std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
       .count();
@@ -529,13 +525,11 @@ double SecondsSince(std::chrono::steady_clock::time_point start) {
 
 }  // namespace
 
-std::vector<int> SpeculativeGenerate(NpuDecoder& model,
-                                     const std::vector<int>& prompt,
-                                     int max_tokens,
-                                     const std::vector<int>& stop, bool draft,
-                                     const std::function<void(int)>& on_token,
-                                     SpeculativeStats* stats,
-                                     const PromptPrefill& prefill) {
+std::vector<int> SpeculativeGenerate(
+    NpuDecoder& model, const std::vector<int>& prompt, int max_tokens,
+    const std::vector<int>& stop, bool draft,
+    const std::function<bool(int)>& on_token, SpeculativeStats* stats,
+    const PromptPrefill& prefill, const SamplingParams& sampling) {
   if (prompt.empty()) {
     throw std::invalid_argument("generate: empty prompt");
   }
@@ -547,16 +541,16 @@ std::vector<int> SpeculativeGenerate(NpuDecoder& model,
   auto state = model.NewState();
   auto mtp = model.NewMtpState();
   std::vector<int> out;
+  Sampler sampler(sampling);
   auto is_stop = [&](int id) {
     return std::find(stop.begin(), stop.end(), id) != stop.end();
   };
   // Emits a decided token; false once generation is over.
   auto emit = [&](int id) {
     out.push_back(id);
-    if (on_token) {
-      on_token(id);
-    }
-    return !is_stop(id) && static_cast<int>(out.size()) < max_tokens;
+    sampler.Accept(id);
+    const bool more = on_token ? on_token(id) : true;
+    return more && !is_stop(id) && static_cast<int>(out.size()) < max_tokens;
   };
 
   // Prompt, two tokens per pass (both kept). hidden[p]: final residual after
@@ -589,7 +583,7 @@ std::vector<int> SpeculativeGenerate(NpuDecoder& model,
     }
     logits += static_cast<std::size_t>(count - 1) * vocab;
   }
-  int y1 = Argmax(logits, vocab);
+  int y1 = sampler.Sample(logits, vocab);
   int y2 = -1;
   if (draft) {
     // The MTP cache over the prompt: pair (h[p - 1], token p) at p.
@@ -610,7 +604,7 @@ std::vector<int> SpeculativeGenerate(NpuDecoder& model,
   std::vector<float> h2(d);
   while (going) {
     if (!draft) {
-      y1 = Argmax(model.Step(&y1, 1, state), vocab);
+      y1 = sampler.Sample(model.Step(&y1, 1, state), vocab);
       ++local.steps;
       going = emit(y1);
       continue;
@@ -618,14 +612,21 @@ std::vector<int> SpeculativeGenerate(NpuDecoder& model,
     const int pair[2] = {y1, y2};
     const float* both = model.Step(pair, 2, state);
     ++local.steps;
-    const int z1 = Argmax(both, vocab);
-    const int z2 = Argmax(both + vocab, vocab);
+    // z1 from the main model's distribution; it equals the draft with
+    // probability p(y2), which is the draft's acceptance (see the header).
+    const int z1 = sampler.Sample(both, vocab);
     std::copy_n(model.hidden(0), d, h1.data());
     std::copy_n(model.hidden(1), d, h2.data());
     if (z1 == y2) {
       model.Resolve(state, true);
       ++local.accepted;
-      going = emit(y2) && emit(z2);
+      going = emit(y2);
+      if (!going) {
+        break;
+      }
+      // The token after the draft, with the draft in the penalties' history.
+      const int z2 = sampler.Sample(both + vocab, vocab);
+      going = emit(z2);
       if (!going) {
         break;
       }

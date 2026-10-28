@@ -74,9 +74,14 @@ constexpr char kUsage[] =
     "  generate --model GGUF --prompt TEXT [--system TEXT] [--max-tokens N]\n"
     "           [--think] [--device cpu|npu] [--draft mtp|none] [--kernels "
     "DIR]\n"
-    "                           greedy chat completion; cpu is the reference,\n"
-    "                           npu decodes on the NPU, by default with MTP\n"
-    "                           speculation (same output, fewer passes)\n"
+    "           [--temperature T] [--top-p P] [--top-k K] [--min-p P] "
+    "[--seed N]\n"
+    "                           chat completion, greedy by default; cpu is "
+    "the\n"
+    "                           reference, npu decodes on the NPU, by default\n"
+    "                           with MTP speculation (same output\n"
+    "                           distribution, fewer passes); temperature 0 is\n"
+    "                           greedy\n"
     "  serve --model GGUF [--host ADDR] [--port N] [--device npu|cpu]\n"
     "        [--kernels DIR] [--model-id NAME] [--max-queue N] [--api-key "
     "KEY]\n"
@@ -807,28 +812,44 @@ int Generate(const std::vector<std::string_view>& args) {
   std::string device = "cpu";
   std::string draft = "mtp";
   std::optional<std::string> kernels;
-  for (std::size_t i = 0; i < args.size(); ++i) {
-    const bool has_value = i + 1 < args.size();
-    if (args[i] == "--model" && has_value) {
-      model = std::string(args[++i]);
-    } else if (args[i] == "--prompt" && has_value) {
-      prompt = std::string(args[++i]);
-    } else if (args[i] == "--system" && has_value) {
-      system = std::string(args[++i]);
-    } else if (args[i] == "--max-tokens" && has_value) {
-      max_tokens = std::atoi(std::string(args[++i]).c_str());
-    } else if (args[i] == "--think") {
-      thinking = true;
-    } else if (args[i] == "--device" && has_value) {
-      device = std::string(args[++i]);
-    } else if (args[i] == "--draft" && has_value) {
-      draft = std::string(args[++i]);
-    } else if (args[i] == "--kernels" && has_value) {
-      kernels = std::string(args[++i]);
-    } else {
-      std::cerr << kUsage;
-      return 2;
+  gufo_npu::SamplingParams sampling;
+  try {
+    for (std::size_t i = 0; i < args.size(); ++i) {
+      const bool has_value = i + 1 < args.size();
+      if (args[i] == "--model" && has_value) {
+        model = std::string(args[++i]);
+      } else if (args[i] == "--temperature" && has_value) {
+        sampling.temperature = std::stof(std::string(args[++i]));
+      } else if (args[i] == "--top-p" && has_value) {
+        sampling.top_p = std::stof(std::string(args[++i]));
+      } else if (args[i] == "--top-k" && has_value) {
+        sampling.top_k = std::stoi(std::string(args[++i]));
+      } else if (args[i] == "--min-p" && has_value) {
+        sampling.min_p = std::stof(std::string(args[++i]));
+      } else if (args[i] == "--seed" && has_value) {
+        sampling.seed = std::stoull(std::string(args[++i]));
+      } else if (args[i] == "--prompt" && has_value) {
+        prompt = std::string(args[++i]);
+      } else if (args[i] == "--system" && has_value) {
+        system = std::string(args[++i]);
+      } else if (args[i] == "--max-tokens" && has_value) {
+        max_tokens = std::atoi(std::string(args[++i]).c_str());
+      } else if (args[i] == "--think") {
+        thinking = true;
+      } else if (args[i] == "--device" && has_value) {
+        device = std::string(args[++i]);
+      } else if (args[i] == "--draft" && has_value) {
+        draft = std::string(args[++i]);
+      } else if (args[i] == "--kernels" && has_value) {
+        kernels = std::string(args[++i]);
+      } else {
+        std::cerr << kUsage;
+        return 2;
+      }
     }
+  } catch (const std::logic_error&) {  // a number that does not parse
+    std::cerr << kUsage;
+    return 2;
   }
   if (model.empty() || prompt.empty() || (device != "cpu" && device != "npu") ||
       (draft != "mtp" && draft != "none")) {
@@ -851,6 +872,7 @@ int Generate(const std::vector<std::string_view>& args) {
       std::fputs(tokenizer.TokenBytes(id).c_str(), stdout);
       std::fflush(stdout);
     }
+    return true;
   };
 
   // Qwen3.5-4B runs on its own NPU program (src/models/qwen35_4b), picked by
@@ -864,7 +886,7 @@ int Generate(const std::vector<std::string_view>& args) {
     qwen35::SpeculativeStats stats;
     gufo_npu::qwen35_4b::SpeculativeGenerate(
         npu, ids, max_tokens, stop, draft == "mtp", print, &stats,
-        gufo_npu::qwen35_4b::PrefillPrompt(prefill));
+        gufo_npu::qwen35_4b::PrefillPrompt(prefill), sampling);
     std::fprintf(stderr,
                  "\n[%d prompt tokens in %.2f s; %d generated in %.2f s, "
                  "%.2f tok/s; NPU (Qwen3.5-4B), %s]\n",
@@ -905,7 +927,8 @@ int Generate(const std::vector<std::string_view>& args) {
         npu, ids, max_tokens, stop, speculate, print, &stats,
         prefill       ? qwen35::PrefillPrompt(*prefill)
         : moe_prefill ? gufo_npu::qwen36_35b_a3b::PrefillPrompt(*moe_prefill)
-                      : qwen35::PromptPrefill{});
+                      : qwen35::PromptPrefill{},
+        sampling);
     if (moe_prefill && moe_prefill->profile().passes > 0) {
       const auto& pp = moe_prefill->profile();
       std::fprintf(stderr,
@@ -960,7 +983,7 @@ int Generate(const std::vector<std::string_view>& args) {
   };
   qwen35::GenerateStats stats;
   qwen35::GreedyGenerate(forward, reference.config().vocab, ids, max_tokens,
-                         stop, print, &stats);
+                         stop, print, &stats, sampling);
   std::fprintf(stderr,
                "\n[%d prompt tokens in %.2f s; %d generated in %.2f s, "
                "%.2f tok/s; CPU reference]\n",

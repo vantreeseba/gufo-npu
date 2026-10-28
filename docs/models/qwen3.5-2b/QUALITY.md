@@ -318,3 +318,30 @@ cache and the last prompt row's final residual.
   the decoder; short prompts go to the decoder untouched; a repeat runs
   only the generation prompt; least-recently-used and byte-budget
   eviction; and a draft request skips checkpoints without the MTP cache.
+
+## Sampling with MTP drafts (2026-10-28)
+
+`qwen35_npu_sampling_test` (`tests/models/qwen35/sampling_check.hpp`):
+1000 continuations of 5 tokens of one chat prompt ("Write a short poem about
+the sea.") at temperature 1, top-k 20, with and without the MTP draft, each run
+on its own seed. A two-sample chi-square test (p = 1e-6) per position and for
+tokens 1 and 2 jointly finds no difference (21% of drafts accepted):
+
+| Compared | Chi-square | df | Limit |
+|---|---|---|---|
+| token 0 | 3.4 | 6 | 39.7 |
+| token 1 | 23.1 | 25 | 74.5 |
+| token 2 | 43.3 | 37 | 93.6 |
+| token 3 | 21.6 | 36 | 92.0 |
+| token 4 | 24.8 | 28 | 79.4 |
+| tokens 1 and 2 | 32.8 | 38 | 95.1 |
+
+- The rule needs no draft probabilities: the draft is a point proposal, so
+  drawing the first token from the main model and keeping the draft when they
+  agree is speculative sampling's acceptance (probability p(draft)), and a
+  miss is distributed as p without the draft.
+- `sampling_test` (CPU) checks the same loop against exact enumeration on a
+  toy model, with and without a frequency penalty, and each filter's
+  distribution.
+- Greedy (temperature 0) output is unchanged: the hashes and the
+  speculative-equals-greedy checks of the decode tests are as before.

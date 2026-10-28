@@ -2,6 +2,10 @@
 
 #include <cstdint>
 #include <optional>
+#include <random>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 // Token sampling settings, shared by the models' generate loops and the
 // server. Temperature 0 is greedy decoding (argmax), bit-identical to the
@@ -19,6 +23,67 @@ struct SamplingParams {
   std::optional<std::uint64_t> seed;
 
   bool greedy() const { return temperature <= 0.0f; }
+};
+
+// Picks tokens from logits under SamplingParams. Penalties apply to the
+// tokens generated so far (Accept), not to the prompt:
+//   repetition: a seen token's logit is divided by the penalty when
+//     positive and multiplied by it when negative (CTRL / llama.cpp);
+//   presence / frequency: subtract presence + count * frequency (OpenAI).
+// Then, unless greedy: logits / temperature, top_k and min_p (both keep the
+// best tokens, so their order does not matter), softmax, top_p, and one
+// draw. Tokens more than kTailNats below the best scaled logit are never
+// candidates: on a 248k vocab they hold at most ~3.5e-6 of the best token's
+// probability in all.
+//
+// Greedy without penalties is std::max_element over the logits (the first
+// maximum), exactly as the models' greedy paths pick.
+class Sampler {
+public:
+  static constexpr float kTailNats = 25.0f;
+
+  // A seed in `params` makes the draws reproducible; without one the
+  // sampler seeds from std::random_device.
+  explicit Sampler(const SamplingParams& params = {});
+
+  const SamplingParams& params() const { return params_; }
+  bool greedy() const { return params_.greedy(); }
+
+  // The next token for `logits` (`vocab` values, not modified).
+  int Sample(const float* logits, int vocab);
+
+  // Records a generated token for the penalties.
+  void Accept(int id);
+
+  // The candidates Sample draws from and their probabilities (summing to
+  // 1), best first; greedy gives the one token it picks. For tests.
+  std::vector<std::pair<int, double>> Distribution(const float* logits,
+                                                   int vocab);
+
+  // A uniform draw in [0, 1) from the sampler's generator.
+  double Uniform();
+
+private:
+  bool HasPenalties() const;
+  // The logit after penalties.
+  float Penalized(int id, float logit) const;
+  // The logits after penalties: `logits` itself when none apply.
+  const float* Source(const float* logits, int vocab);
+  // The candidates and their unnormalized weights: dense_ (weights_ over
+  // the vocab, zero for non-candidates) or list_ (id, weight); total_ sums
+  // them.
+  void Candidates(const float* logits, int vocab);
+
+  SamplingParams params_;
+  std::mt19937_64 rng_;
+  std::unordered_map<int, int> counts_;  // generated token -> occurrences
+  std::vector<float> penalized_;
+  std::vector<float> weights_;
+  std::vector<std::pair<int, double>> list_;
+  std::vector<int> ids_;
+  std::vector<double> mass_;
+  bool dense_ = false;
+  double total_ = 0;
 };
 
 }  // namespace gufo_npu

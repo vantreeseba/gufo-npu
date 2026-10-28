@@ -37,6 +37,13 @@ if(GUFO_NPU_ENABLE_XRT AND GUFO_NPU_BUILD_KERNELS)
   set_tests_properties(qwen35_npu_decode_test PROPERTIES
                        LABELS "qwen35_2b;npu;model" SKIP_RETURN_CODE 77)
 
+  # Speculative sampling: MTP drafts keep the sampled distribution.
+  add_executable(qwen35_npu_sampling_test npu_sampling_test.cpp)
+  target_link_libraries(qwen35_npu_sampling_test PRIVATE gufo_npu_qwen35_npu)
+  add_test(NAME qwen35_npu_sampling_test COMMAND qwen35_npu_sampling_test "${kernels}")
+  set_tests_properties(qwen35_npu_sampling_test PROPERTIES
+                       LABELS "qwen35_2b;npu;model" SKIP_RETURN_CODE 77 TIMEOUT 3600)
+
   add_executable(qwen35_npu_prefill_test npu_prefill_test.cpp)
   target_link_libraries(qwen35_npu_prefill_test PRIVATE gufo_npu_qwen35_npu)
   add_test(NAME qwen35_npu_prefill_test

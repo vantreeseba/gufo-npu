@@ -406,3 +406,30 @@ miss).
   at 4,091 and 239.3 MiB at 8,221: 30 DeltaNet layers' states (~61 MiB) plus 22 KiB per token (10 attention layers' fp16 K/V, 20 KiB, and the MTP layer's, 2 KiB). Two checkpoints of
   8k-token conversations hold ~479 MiB of host memory.
 - One run (each conversation's second round), experts on the CPU.
+
+## Sampling (2026-10-28)
+
+`gufo-npu generate --temperature T --seed N` (`Sampler` in
+`src/core/sampling.hpp`): temperature, top-k, top-p, min-p and repetition,
+presence and frequency penalties. With MTP the draft is still the MTP head's
+argmax; each step draws the first token from the main model's distribution
+and keeps the draft when they agree, so a draft is accepted with probability
+p(draft) and the output follows the main model's distribution exactly (see
+QUALITY.md). Box, warm, 2 seeds per row (one load per run), default top-k,
+top-p and min-p (off); ranges over the seeds:
+
+| Prompt | Temperature | No draft | MTP | Drafts accepted |
+|---|---|---|---|---|
+| Sky (60–92 tokens) | 0 | 19.4–19.8 tok/s | 25.8–26.7 tok/s | 71% |
+|  | 0.7 | 19.8–20.4 | 25.7–27.2 | 69–78% |
+|  | 1.0 | 19.2–20.4 | 24.7–27.5 | 71–74% |
+| Fibonacci (~230) | 0 | 20.0 | 29.5–29.6 | 97% |
+|  | 0.7 | 19.8–19.9 | 28.4–29.5 | 93–95% |
+|  | 1.0 | 19.5–20.1 | 29.3–30.0 | 93–97% |
+
+- Sampling itself costs under 1% of decode time without a draft: one
+  vectorized pass weighs the whole vocabulary per token.
+- Temperature 0 is greedy and bit-identical to the greedy path before the
+  sampler (same hashes).
+- With MTP, acceptance barely moves with temperature on this model (sky
+  69–78%, code 93–97%), so MTP keeps its 1.3–1.5x.
