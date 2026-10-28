@@ -36,16 +36,18 @@ needs the host's XRT (see the Dockerfile).
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--model GGUF` | (required) | The model: Qwen3.5-2B, Qwen3.5-4B or Qwen3.6-35B-A3B (Unsloth UD-Q4_K_XL). |
+| `--model GGUF` | (required) | The model: Qwen3.5-2B, Qwen3.5-4B or Qwen3.6-35B-A3B (Unsloth UD-Q4_K_XL). Repeat it to serve several, one loaded at a time ([Several models](#several-models)). |
 | `--host ADDR` | `127.0.0.1` | Address to listen on. Use `0.0.0.0` to accept other machines. |
 | `--port N` | `8080` | Port. |
 | `--device npu\|cpu` | `npu` | `cpu` runs the fp32 CPU reference (slow; for checks). |
 | `--kernels DIR` | installed kernels | NPU kernel directory, as for `generate`. |
-| `--model-id NAME` | from the GGUF | The model name `/v1/models` lists and replies carry. |
+| `--model-id NAME` | from the GGUF | The model name `/v1/models` lists and replies carry. Only with a single `--model`; several models keep their GGUFs' ids. |
 | `--max-queue N` | `8` | Requests that may wait behind the running one; more get 429. |
 | `--api-key KEY` | none | When set, `/v1/*` needs `Authorization: Bearer KEY`. `/health` and `/metrics` stay open. |
 | `--context-length N` | 32,768 | Most prompt + generated tokens per request, up to the model's trained 262,144. Memory per token: [docs/serve/ENGINE.md](serve/ENGINE.md#context-length). |
 | `--prompt-cache N` | `2` | Checkpoints of earlier prompts kept for multi-turn reuse; `0` turns the cache off. |
+| `--preload ID` | the first `--model` | The model loaded at start. |
+| `--unload-after SECONDS` | `0` (never) | Unload a model that has been idle this long, freeing its device and pinned memory; the next request loads it again. |
 
 `SIGINT` or `SIGTERM` stops the server.
 
@@ -61,7 +63,7 @@ Request fields:
 | Field | Support |
 |---|---|
 | `messages` | `system`, `user`, `assistant` and `tool` messages, rendered with the model's chat template. A final `assistant` message is continued (prefill). |
-| `model` | Accepted and ignored: the server runs one model, and replies carry its id. |
+| `model` | With one model, accepted and ignored: replies carry the model's id. With several, the model to run (404 `model_not_found` if unknown; the loaded model when absent). |
 | `tools`, `tool_choice` | Function tools. `tool_choice` may be `"auto"` (default), `"none"`, `"required"` (the reply is one or more tool calls) or `{"type": "function", "function": {"name": ...}}` (calls to that function). Forced calls are constrained token by token; see [Structured outputs](#structured-outputs). |
 | `max_completion_tokens`, `max_tokens` | Most generated tokens (the first wins). Default and ceiling: the rest of the context. |
 | `temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty`, `frequency_penalty`, `repetition_penalty`, `seed` | Sampling. `temperature` 0 (the default) is greedy decoding. |
@@ -179,12 +181,15 @@ off by `max_tokens` (`finish_reason: "length"`).
 
 ### `GET /v1/models`, `GET /v1/models/{id}`
 
-The one loaded model.
+The served models. With several, each carries an extension field
+`"loaded": true|false` (whether it is on the device now).
 
 ### `GET /health`
 
 `{"status": "ok", "model": "..."}` once the model is loaded (the server
-listens only after loading).
+listens only after loading). With several models, `model` is the loaded
+one (`null` after an idle unload) and `loading` the one loading now, if
+any.
 
 ### `GET /metrics`
 
@@ -192,7 +197,39 @@ Prometheus text: requests by HTTP status (499 counts clients that hung up),
 prompt, cached and generated tokens, engine prefill and decode seconds,
 decode steps and accepted MTP drafts, the queue (`gufo_npu_queue_waiting`,
 `gufo_npu_generation_running`), and histograms of time to first token and
-request duration (both from arrival, queue included).
+request duration (both from arrival, queue included). With several models,
+also per model: `gufo_npu_model_loaded` and `gufo_npu_model_loading`
+(gauges), and `gufo_npu_model_loads_total`, `gufo_npu_model_unloads_total`
+and their `_seconds_total`.
+
+## Several models
+
+```sh
+gufo-npu serve --model 2b.gguf --model 4b.gguf --model 35b.gguf \
+  --preload qwen3.6-35b-a3b --unload-after 600
+```
+
+- **Ids** come from each GGUF (`qwen3.5-2b`, `qwen3.5-4b`,
+  `qwen3.6-35b-a3b`); two models with the same id are refused.
+- **One model on the NPU at a time.** A request for another model first
+  unloads the current one, releasing its device buffers and pinned memory
+  (the 35B pins ~22 GB), then loads the requested one. The switch is part
+  of that request's time to first token: ~4 s for the 2B, ~12 s for the 4B
+  and ~19 s for the 35B (their load times).
+- **Queue order** stays arrival order (FIFO) whatever model a request
+  names, so a client never waits behind later requests. Alternating
+  between models pays a load per switch; clients that mix models heavily
+  are better served by one server per model.
+- **Before loading**, the server already knows each model's tokenizer and
+  limits (read from its GGUF at start, no weights), so requests are
+  checked and tokenized without a load.
+- Each model's prompt cache is dropped when it unloads.
+- `--unload-after SECONDS` also works with one model, to free its memory
+  while idle.
+
+[docs/examples/docker-compose.yml](examples/docker-compose.yml) runs all
+three models from one container (and has one service per model as the
+alternative).
 
 ## Errors
 
@@ -306,7 +343,8 @@ client (`pip install openai httpx`). Each takes `--base-url` (default
 
 ## Not supported yet
 
-- More than one model per process, or switching models per request.
+- More than one model on the NPU at once (models take turns;
+  [Several models](#several-models)).
 - Tool-call arguments streamed while the model writes them (a call is sent
   once complete).
 - Images and audio.

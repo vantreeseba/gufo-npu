@@ -8,6 +8,7 @@
 #include <climits>
 #include <cstdint>
 #include <ctime>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <nlohmann/json.hpp>
@@ -18,6 +19,7 @@
 #include <utility>
 #include <vector>
 
+#include "serve/engine_pool.hpp"
 #include "serve/logprobs.hpp"
 #include "serve/metrics.hpp"
 #include "serve/openai.hpp"
@@ -77,6 +79,7 @@ json Bytes(const std::string& text) {
 // A request between its admission and its reply: a chat completion or a
 // legacy completion.
 struct Job {
+  Engine* engine = nullptr;  // the requested model's
   ChatRequest chat;
   CompletionRequest completion;
   // One per prompt (a chat has one; a completion may have several).
@@ -109,17 +112,14 @@ struct Hooks {
 }  // namespace
 
 struct Server::Impl {
-  Impl(Engine& engine, const ChatFormat& format, ServerOptions options)
-      : engine(engine),
+  Impl(Engine* single, EnginePool* pool, const ChatFormat& format,
+       ServerOptions options)
+      : single(single),
+        pool(pool),
         format(format),
         options(std::move(options)),
         scheduler(this->options.max_queue),
         created(static_cast<std::int64_t>(std::time(nullptr))) {
-    for (const auto& token : format.StopTokens()) {
-      if (const int id = engine.FindToken(token); id >= 0) {
-        stop_ids.push_back(id);
-      }
-    }
     // Waiting requests hold a worker each; keep some for /health etc.
     const std::size_t workers =
         static_cast<std::size_t>(std::max(0, this->options.max_queue)) + 8;
@@ -166,29 +166,44 @@ struct Server::Impl {
 
     http.Get(
         "/health", [this](const httplib::Request&, httplib::Response& res) {
-          res.set_content(Dump({{"status", "ok"}, {"model", engine.info().id}}),
+          json health = {{"status", "ok"}};
+          if (pool) {
+            const auto s = pool->status();
+            health["model"] = s.loaded ? json(*s.loaded) : json(nullptr);
+            health["loading"] = s.loading ? json(*s.loading) : json(nullptr);
+          } else {
+            health["model"] = single->info().id;
+          }
+          res.set_content(Dump(health), "application/json");
+        });
+    http.Get(
+        "/v1/models", [this](const httplib::Request&, httplib::Response& res) {
+          json data = json::array();
+          for (Engine* engine : Engines()) {
+            data.push_back(Model(*engine));
+          }
+          res.set_content(Dump({{"object", "list"}, {"data", std::move(data)}}),
                           "application/json");
         });
-    http.Get("/v1/models",
-             [this](const httplib::Request&, httplib::Response& res) {
-               res.set_content(
-                   Dump({{"object", "list"}, {"data", json::array({Model()})}}),
-                   "application/json");
-             });
     http.Get(R"(/v1/models/(.+))", [this](const httplib::Request& req,
                                           httplib::Response& res) {
-      if (req.matches[1] != engine.info().id) {
+      Engine* engine = FindModel(req.matches[1]);
+      if (engine == nullptr) {
         SendError(res, ApiError(404, "invalid_request_error", "model_not_found",
                                 "no such model", "model"));
         return;
       }
-      res.set_content(Dump(Model()), "application/json");
+      res.set_content(Dump(Model(*engine)), "application/json");
     });
-    http.Get("/metrics", [this](const httplib::Request&,
-                                httplib::Response& res) {
-      res.set_content(metrics.Render(scheduler.waiting(), scheduler.running()),
-                      "text/plain; version=0.0.4");
-    });
+    http.Get("/metrics",
+             [this](const httplib::Request&, httplib::Response& res) {
+               std::string text =
+                   metrics.Render(scheduler.waiting(), scheduler.running());
+               if (pool) {
+                 text += pool->RenderMetrics();
+               }
+               res.set_content(text, "text/plain; version=0.0.4");
+             });
     http.Post("/v1/chat/completions",
               [this](const httplib::Request& req, httplib::Response& res) {
                 Chat(req, res);
@@ -199,11 +214,63 @@ struct Server::Impl {
               });
   }
 
-  json Model() const {
-    return {{"id", engine.info().id},
-            {"object", "model"},
-            {"created", created},
-            {"owned_by", "gufo-npu"}};
+  json Model(const Engine& engine) const {
+    json model = {{"id", engine.info().id},
+                  {"object", "model"},
+                  {"created", created},
+                  {"owned_by", "gufo-npu"}};
+    if (pool) {  // extension: which model is on the device
+      model["loaded"] = pool->status().loaded == engine.info().id;
+    }
+    return model;
+  }
+
+  std::vector<Engine*> Engines() const {
+    return pool ? pool->engines() : std::vector<Engine*>{single};
+  }
+
+  Engine* FindModel(const std::string& id) const {
+    if (pool) {
+      return pool->Find(id);
+    }
+    return single->info().id == id ? single : nullptr;
+  }
+
+  // The engine a request names. One model: any name (or none) is it.
+  // Several: the named one (404 if unknown), or the default without a name.
+  Engine& RequestedEngine(const nlohmann::ordered_json& body) const {
+    if (!pool) {
+      return *single;
+    }
+    if (const auto all = pool->engines(); all.size() == 1) {
+      return *all.front();
+    }
+    const auto it = body.find("model");
+    if (it == body.end() || it->is_null() ||
+        (it->is_string() && it->get<std::string>().empty())) {
+      return pool->Default();
+    }
+    if (!it->is_string()) {
+      throw InvalidRequest("model must be a string", "model");
+    }
+    Engine* engine = pool->Find(it->get<std::string>());
+    if (engine == nullptr) {
+      throw ApiError(404, "invalid_request_error", "model_not_found",
+                     "the model " + it->get<std::string>() +
+                         " does not exist; GET /v1/models lists the models",
+                     "model");
+    }
+    return *engine;
+  }
+
+  std::vector<int> StopIds(const Engine& engine) const {
+    std::vector<int> ids;
+    for (const auto& token : format.StopTokens()) {
+      if (const int id = engine.FindToken(token); id >= 0) {
+        ids.push_back(id);
+      }
+    }
+    return ids;
   }
 
   static nlohmann::ordered_json ParseBody(const httplib::Request& req) {
@@ -214,7 +281,7 @@ struct Server::Impl {
     }
   }
 
-  void CheckBias(const SamplingParams& s) const {
+  void CheckBias(const Engine& engine, const SamplingParams& s) const {
     for (const auto& [id, bias] : s.logit_bias) {
       if (id >= engine.info().vocab) {
         throw InvalidRequest("logit_bias token id " + std::to_string(id) +
@@ -225,7 +292,8 @@ struct Server::Impl {
   }
 
   // A generation request for `prompt`, checked against the context.
-  GenerateRequest Gen(std::vector<int> prompt, std::optional<int> max_tokens,
+  GenerateRequest Gen(const Engine& engine, std::vector<int> prompt,
+                      std::optional<int> max_tokens,
                       const SamplingParams& sampling, const char* param) const {
     GenerateRequest gen;
     gen.prompt = std::move(prompt);
@@ -241,7 +309,7 @@ struct Server::Impl {
     const int room = context > 0 ? context - size : INT_MAX;
     gen.max_tokens = std::min(max_tokens.value_or(room), room);
     gen.sampling = sampling;
-    gen.stop_ids = stop_ids;
+    gen.stop_ids = StopIds(engine);
     return gen;
   }
 
@@ -255,7 +323,7 @@ struct Server::Impl {
       return false;
     }
     job.id = NewId(id_prefix);
-    job.model = engine.info().id;
+    job.model = job.engine->info().id;
     job.created = static_cast<std::int64_t>(std::time(nullptr));
     return true;
   }
@@ -264,17 +332,21 @@ struct Server::Impl {
     auto job = std::make_shared<Job>();
     job->arrived = Clock::now();
     try {
-      job->chat = ParseChatRequest(ParseBody(req));
-      CheckBias(job->chat.sampling);
+      const auto body = ParseBody(req);
+      job->chat = ParseChatRequest(body);
+      job->engine = &RequestedEngine(body);
+      Engine& engine = *job->engine;
+      CheckBias(engine, job->chat.sampling);
       std::string text;
       try {
         text = format.Render(job->chat.prompt);
       } catch (const std::invalid_argument& e) {
         throw InvalidRequest(e.what(), "messages");
       }
-      job->gens.push_back(Gen(engine.Encode(text), job->chat.max_tokens,
+      job->gens.push_back(Gen(engine, engine.Encode(text), job->chat.max_tokens,
                               job->chat.sampling, "messages"));
-      job->gens.back().sampling.constraint = Constraint(job->chat);
+      job->gens.back().sampling.constraint =
+          Constraint(job->chat, engine, job->gens.back().stop_ids);
     } catch (const ApiError& e) {
       metrics.Request(e.status);
       SendError(res, e);
@@ -300,7 +372,9 @@ struct Server::Impl {
 
   // The constraint a request's response_format or tool_choice asks for,
   // or none.
-  std::shared_ptr<TokenConstraint> Constraint(const ChatRequest& chat) {
+  std::shared_ptr<TokenConstraint> Constraint(const ChatRequest& chat,
+                                             const Engine& engine,
+                                             const std::vector<int>& stop_ids) {
     std::shared_ptr<const Grammar> grammar;
     try {
       if (chat.tool_required) {
@@ -316,13 +390,15 @@ struct Server::Impl {
       throw InvalidRequest(
           e.what(), chat.tool_required ? "tool_choice" : "response_format");
     }
-    return NewGrammarConstraint(std::move(grammar), Vocab(), stop_ids,
+    return NewGrammarConstraint(std::move(grammar), Vocab(engine), stop_ids,
                                 chat.prompt.thinking);
   }
 
-  // The vocabulary's bytes for constraints, built on first use.
-  std::shared_ptr<const VocabIndex> Vocab() {
+  // An engine's vocabulary bytes for constraints, built on first use (one
+  // per model; a pool's engines keep their tokenizer while unloaded).
+  std::shared_ptr<const VocabIndex> Vocab(const Engine& engine) {
     std::lock_guard lock(vocab_mutex);
+    auto& vocab = vocabs[&engine];
     if (!vocab) {
       const int n = std::max(0, engine.info().vocab);
       std::vector<std::string> bytes(static_cast<std::size_t>(n));
@@ -360,6 +436,7 @@ struct Server::Impl {
               std::unique_ptr<OutputParser> parser,
               const std::vector<std::string>& stop, int max_tool_calls,
               const Hooks& hooks) {
+    Engine& engine = *job.engine;
     Outcome out;
     GenerateRequest gen = base;
     // Choices differ: each draws from its own seed (seed + choice).
@@ -445,16 +522,16 @@ struct Server::Impl {
             {"prompt_tokens_details", {{"cached_tokens", cached}}}};
   }
 
-  json LogprobEntry(int id, float logprob) const {
+  json LogprobEntry(const Engine& engine, int id, float logprob) const {
     const std::string text = engine.TokenBytes(id);
     return {{"token", text}, {"logprob", logprob}, {"bytes", Bytes(text)}};
   }
 
-  json ChatLogprob(const TokenLogprobs& lp) const {
-    json entry = LogprobEntry(lp.id, lp.logprob);
+  json ChatLogprob(const Engine& engine, const TokenLogprobs& lp) const {
+    json entry = LogprobEntry(engine, lp.id, lp.logprob);
     json top = json::array();
     for (const auto& [id, logprob] : lp.top) {
-      top.push_back(LogprobEntry(id, logprob));
+      top.push_back(LogprobEntry(engine, id, logprob));
     }
     entry["top_logprobs"] = std::move(top);
     return entry;
@@ -544,7 +621,7 @@ struct Server::Impl {
       if (job.chat.logprobs) {
         hooks.top_logprobs = job.chat.top_logprobs;
         hooks.logprob = [&](TokenLogprobs&& lp) {
-          pending.push_back(ChatLogprob(lp));
+          pending.push_back(ChatLogprob(*job.engine, lp));
         };
       }
       if (!write(Dump(Chunk(job, c, {{"role", "assistant"}, {"content", ""}},
@@ -617,7 +694,7 @@ struct Server::Impl {
       if (job.chat.logprobs) {
         hooks.top_logprobs = job.chat.top_logprobs;
         hooks.logprob = [&](TokenLogprobs&& lp) {
-          logprobs.push_back(ChatLogprob(lp));
+          logprobs.push_back(ChatLogprob(*job.engine, lp));
         };
       }
       Outcome out = Run(job, job.gens[0], c, format.NewParser(job.chat.prompt),
@@ -671,7 +748,7 @@ struct Server::Impl {
   // ---- /v1/completions (legacy) ----
 
   // The prompt's text for echo: its tokens' bytes as whole characters.
-  std::string Text(const std::vector<int>& ids) const {
+  std::string Text(const Engine& engine, const std::vector<int>& ids) const {
     Utf8Assembler utf8;
     std::string text;
     for (const int id : ids) {
@@ -684,9 +761,12 @@ struct Server::Impl {
     auto job = std::make_shared<Job>();
     job->arrived = Clock::now();
     try {
-      job->completion = ParseCompletionRequest(ParseBody(req));
+      const auto body = ParseBody(req);
+      job->completion = ParseCompletionRequest(body);
+      job->engine = &RequestedEngine(body);
+      Engine& engine = *job->engine;
       auto& c = job->completion;
-      CheckBias(c.sampling);
+      CheckBias(engine, c.sampling);
       for (std::size_t p = 0; p < c.prompts(); ++p) {
         std::vector<int> ids;
         if (c.texts.empty()) {
@@ -705,10 +785,10 @@ struct Server::Impl {
           }
         }
         if (c.echo) {
-          job->echo.push_back(c.texts.empty() ? Text(ids) : c.texts[p]);
+          job->echo.push_back(c.texts.empty() ? Text(engine, ids) : c.texts[p]);
         }
         job->gens.push_back(
-            Gen(std::move(ids), c.max_tokens, c.sampling, "prompt"));
+            Gen(engine, std::move(ids), c.max_tokens, c.sampling, "prompt"));
       }
     } catch (const ApiError& e) {
       metrics.Request(e.status);
@@ -753,7 +833,8 @@ struct Server::Impl {
     }
   };
 
-  void AddLegacy(Legacy& legacy, const TokenLogprobs& lp) const {
+  void AddLegacy(const Engine& engine, Legacy& legacy,
+                 const TokenLogprobs& lp) const {
     const std::string text = engine.TokenBytes(lp.id);
     legacy.tokens.push_back(text);
     legacy.token_logprobs.push_back(lp.logprob);
@@ -826,7 +907,7 @@ struct Server::Impl {
         };
         if (c.logprobs) {
           hooks.top_logprobs = *c.logprobs;
-          hooks.logprob = [&](TokenLogprobs&& lp) { AddLegacy(legacy, lp); };
+          hooks.logprob = [&](TokenLogprobs&& lp) { AddLegacy(*job.engine, legacy, lp); };
         }
         Outcome out =
             Run(job, job.gens[p], i, std::make_unique<PlainTextParser>(),
@@ -892,20 +973,26 @@ struct Server::Impl {
                      "application/json");
   }
 
-  Engine& engine;
+  Engine* single;    // one model, or
+  EnginePool* pool;  // several
   const ChatFormat& format;
   ServerOptions options;
   httplib::Server http;
   Scheduler scheduler;
   Metrics metrics;
-  std::vector<int> stop_ids;
   std::int64_t created;
   std::mutex vocab_mutex;
-  std::shared_ptr<const VocabIndex> vocab;
+  std::map<const Engine*, std::shared_ptr<const VocabIndex>> vocabs;
 };
 
 Server::Server(Engine& engine, const ChatFormat& format, ServerOptions options)
-    : impl_(std::make_unique<Impl>(engine, format, std::move(options))) {}
+    : impl_(std::make_unique<Impl>(&engine, nullptr, format,
+                                   std::move(options))) {}
+
+Server::Server(EnginePool& pool, const ChatFormat& format,
+               ServerOptions options)
+    : impl_(
+          std::make_unique<Impl>(nullptr, &pool, format, std::move(options))) {}
 
 Server::~Server() = default;
 

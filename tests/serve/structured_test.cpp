@@ -23,6 +23,7 @@
 #include "core/sampling.hpp"
 #include "serve/chat_format.hpp"
 #include "serve/engine.hpp"
+#include "serve/engine_pool.hpp"
 #include "serve/server.hpp"
 
 namespace {
@@ -752,8 +753,8 @@ void SamplerAndDrafts() {
 
 class SamplingEngine : public gufo_npu::serve::Engine {
 public:
-  SamplingEngine() {
-    info_.id = "toy";
+  explicit SamplingEngine(std::string id = "toy") {
+    info_.id = std::move(id);
     info_.architecture = "toy";
     info_.context_length = 1 << 16;
     info_.vocab = static_cast<int>(toy().bytes.size());
@@ -1057,6 +1058,128 @@ void Benchmark() {
 
 }  // namespace
 
+// --- Structured output together with logprobs, n and several models. ----
+
+void CrossFeatures() {
+  using gufo_npu::serve::EngineOptions;
+  const json schema = {{"type", "object"},
+                       {"properties",
+                        {{"name", {{"type", "string"}, {"maxLength", 8}}},
+                         {"age", {{"type", "integer"}}}}},
+                       {"required", {"name", "age"}},
+                       {"additionalProperties", false}};
+  const ordered_json format_field = {
+      {"type", "json_schema"},
+      {"json_schema",
+       {{"name", "person"},
+        {"strict", true},
+        {"schema", ordered_json::parse(schema.dump())}}}};
+  const ordered_json messages = {{{"role", "user"}, {"content", "hi"}}};
+  auto valid = [&](const json& choice) {
+    if (!choice.is_object() || !choice["message"]["content"].is_string()) {
+      return false;
+    }
+    const json v = json::parse(
+        choice["message"]["content"].get<std::string>(), nullptr, false);
+    return !v.is_discarded() && Validate(v, schema, schema);
+  };
+  const auto format = gufo_npu::serve::NewQwen35ChatFormat();
+  gufo_npu::serve::ServerOptions options;
+  options.host = "127.0.0.1";
+  options.port = 0;
+
+  {
+    SamplingEngine engine;
+    gufo_npu::serve::Server server(engine, *format, options);
+    const int port = server.Bind();
+    std::thread thread([&] { server.Run(); });
+    httplib::Client client("127.0.0.1", port);
+    client.set_read_timeout(60, 0);
+
+    // json_schema + logprobs: the reply validates and every token has a
+    // logprob (the raw model's, so it may be any value <= 0).
+    auto res = client.Post("/v1/chat/completions",
+                           ordered_json({{"messages", messages},
+                                         {"max_tokens", 400},
+                                         {"logprobs", true},
+                                         {"top_logprobs", 2},
+                                         {"response_format", format_field}})
+                               .dump(),
+                           "application/json");
+    const json b1 = res && res->status == 200
+                        ? json::parse(res->body, nullptr, false)
+                        : json();
+    const json c1 = b1.is_object() ? b1["choices"][0] : json();
+    const json lp = c1.is_object() ? c1["logprobs"]["content"] : json();
+    bool lp_ok = lp.is_array() && !lp.empty();
+    std::string joined;
+    if (lp_ok) {
+      for (const auto& e : lp) {
+        lp_ok = lp_ok && e["logprob"].get<double>() <= 1e-6 &&
+                e["top_logprobs"].size() == 2;
+        joined += e["token"].get<std::string>();
+      }
+    }
+    Check(valid(c1) && lp_ok &&
+              c1["message"]["content"].get<std::string>().find(joined) !=
+                  std::string::npos,
+          "json_schema + logprobs: valid reply, one logprob per token");
+
+    // n = 2 with json_schema: both choices validate.
+    res = client.Post("/v1/chat/completions",
+                      ordered_json({{"messages", messages},
+                                    {"max_tokens", 400},
+                                    {"n", 2},
+                                    {"response_format", format_field}})
+                          .dump(),
+                      "application/json");
+    const json b2 = res && res->status == 200
+                        ? json::parse(res->body, nullptr, false)
+                        : json();
+    Check(b2.is_object() && b2["choices"].size() == 2 &&
+              valid(b2["choices"][0]) && valid(b2["choices"][1]),
+          "n = 2 + json_schema: both choices validate");
+    server.Stop();
+    thread.join();
+  }
+
+  {
+    // Several models: a constrained request on each side of a switch uses
+    // that model's vocabulary and validates.
+    std::vector<EngineOptions> models(2);
+    models[0].model_path = "toy-a";
+    models[1].model_path = "toy-b";
+    auto make = [](const EngineOptions& o) {
+      return std::make_unique<SamplingEngine>(o.model_path);
+    };
+    gufo_npu::serve::EnginePool pool(models, make, make);
+    pool.Preload();
+    gufo_npu::serve::Server server(pool, *format, options);
+    const int port = server.Bind();
+    std::thread thread([&] { server.Run(); });
+    httplib::Client client("127.0.0.1", port);
+    client.set_read_timeout(60, 0);
+    bool ok = true;
+    for (const char* id : {"toy-a", "toy-b", "toy-a"}) {
+      auto res = client.Post("/v1/chat/completions",
+                             ordered_json({{"model", id},
+                                           {"messages", messages},
+                                           {"max_tokens", 400},
+                                           {"response_format", format_field}})
+                                 .dump(),
+                             "application/json");
+      const json b = res && res->status == 200
+                         ? json::parse(res->body, nullptr, false)
+                         : json();
+      ok = ok && b.is_object() && b["model"] == id && valid(b["choices"][0]) &&
+           pool.status().loaded == std::string(id);
+    }
+    Check(ok, "pool + json_schema: valid replies across model switches");
+    server.Stop();
+    thread.join();
+  }
+}
+
 int main(int argc, char** argv) {
   // --bench: only the mask benchmark (the image build prints it).
   if (argc > 1 && std::string(argv[1]) == "--bench") {
@@ -1069,6 +1192,7 @@ int main(int argc, char** argv) {
   Errors();
   SamplerAndDrafts();
   ServerEndToEnd();
+  CrossFeatures();
   Benchmark();
   if (failures > 0) {
     std::printf("%d failure(s)\n", failures);
