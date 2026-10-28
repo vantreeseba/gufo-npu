@@ -25,6 +25,7 @@
 #include "models/qwen35_4b/npu_decoder.hpp"
 #include "models/qwen35_4b/npu_prefill.hpp"
 #include "models/qwen36_35b_a3b/npu_prefill.hpp"
+#include "serve/engine_pool.hpp"
 #include "serve/model_registry.hpp"
 
 namespace gufo_npu::serve {
@@ -340,9 +341,11 @@ int ContextLengthFor(const gguf::File& file, const qwen35::Config& config,
   return requested > 0 ? requested : std::min(kDefaultContextLength, trained);
 }
 
-}  // namespace
-
-std::unique_ptr<Engine> LoadEngine(const EngineOptions& options) {
+// The checks and ModelInfo shared by LoadEngine and ProbeEngine; the
+// package is nullopt only on the CPU device.
+ModelInfo Describe(const EngineOptions& options, const gguf::File& file,
+                   const qwen35::Config& config,
+                   std::optional<ModelPackage>& package) {
   if (options.device != "npu" && options.device != "cpu") {
     throw std::invalid_argument("device must be npu or cpu, not " +
                                 options.device);
@@ -350,9 +353,7 @@ std::unique_ptr<Engine> LoadEngine(const EngineOptions& options) {
   if (options.prompt_cache < 0) {
     throw std::invalid_argument("prompt_cache must not be negative");
   }
-  auto file = gguf::File::Open(options.model_path);
-  const auto config = qwen35::ReadConfig(*file);
-  const auto package = NpuPackageFor(config);
+  package = NpuPackageFor(config);
   if (options.device == "npu" && !package) {
     throw std::invalid_argument(
         "no NPU model package for this GGUF (" + config.architecture +
@@ -360,11 +361,48 @@ std::unique_ptr<Engine> LoadEngine(const EngineOptions& options) {
         "); gufo-npu runs Qwen3.5-2B, Qwen3.5-4B and Qwen3.6-35B-A3B");
   }
   ModelInfo info;
-  info.id = options.model_id.empty() ? ModelIdFor(*file, options.model_path)
+  info.id = options.model_id.empty() ? ModelIdFor(file, options.model_path)
                                      : options.model_id;
   info.architecture = config.architecture;
-  info.context_length = ContextLengthFor(*file, config, options.context_length);
+  info.context_length = ContextLengthFor(file, config, options.context_length);
   info.vocab = config.vocab;
+  return info;
+}
+
+// A model's info and tokenizer, no weights (engine_pool.hpp).
+class ProbedEngine final : public Engine {
+public:
+  ProbedEngine(const gguf::File& file, ModelInfo info)
+      : tokenizer_(file), info_(std::move(info)) {}
+
+  const ModelInfo& info() const override { return info_; }
+  const Tokenizer& tokenizer() const override { return tokenizer_; }
+  GenerateResult Generate(const GenerateRequest&,
+                          const std::function<bool(int)>&) override {
+    throw std::logic_error(info_.id + " is not loaded");
+  }
+
+private:
+  Tokenizer tokenizer_;  // copies what it needs; the GGUF can close
+  ModelInfo info_;
+};
+
+}  // namespace
+
+std::unique_ptr<Engine> ProbeEngine(const EngineOptions& options) {
+  const auto file = gguf::File::Open(options.model_path);
+  const auto config = qwen35::ReadConfig(*file);
+  std::optional<ModelPackage> package;
+  ModelInfo info = Describe(options, *file, config, package);
+  info.can_draft = options.device == "npu" && config.mtp_layers > 0;
+  return std::make_unique<ProbedEngine>(*file, std::move(info));
+}
+
+std::unique_ptr<Engine> LoadEngine(const EngineOptions& options) {
+  auto file = gguf::File::Open(options.model_path);
+  const auto config = qwen35::ReadConfig(*file);
+  std::optional<ModelPackage> package;
+  const ModelInfo info = Describe(options, *file, config, package);
   auto engine = std::make_unique<ModelEngine>(std::move(file), info);
   if (options.device == "cpu") {
     AttachReference(*engine);
