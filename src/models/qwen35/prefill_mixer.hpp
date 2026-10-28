@@ -8,6 +8,7 @@
 #include "core/gguf.hpp"
 #include "models/qwen35/config.hpp"
 #include "models/qwen35/decoder.hpp"
+#include "models/qwen35/state_capture.hpp"
 
 // The token mixers of a prompt chunk on the CPU, for the NPU prefills of the
 // Qwen3.5 family (src/models/qwen35/npu_prefill.cpp, the 2B's; the 35B's in
@@ -80,9 +81,10 @@ public:
                  float* mixed);
   // Gated DeltaNet of the chunk into `mixed` (value_dim per token); `normed`
   // holds the layer's normalized input (hidden per token), for the gates.
+  // With `capture`, also copies the state after its first offset tokens.
   void DeltaNet(const float* in, std::size_t in_stride, const float* normed,
                 const PrefillMixerWeights& w, DecodeState::Layer& state,
-                float* mixed);
+                float* mixed, const DeltaCapture& capture = {});
 
 private:
   void Rope(float* x, int t) const;

@@ -74,6 +74,15 @@ if(GUFO_NPU_ENABLE_XRT AND GUFO_NPU_BUILD_KERNELS)
                        LABELS "qwen36_35b_a3b;npu;model" SKIP_RETURN_CODE 77
                        TIMEOUT 3600)
 
+  add_executable(qwen36_prompt_cache_test prompt_cache_test.cpp)
+  target_link_libraries(qwen36_prompt_cache_test PRIVATE
+                        gufo_npu_qwen36_35b_a3b)
+  add_test(NAME qwen36_prompt_cache_test
+           COMMAND qwen36_prompt_cache_test "${kernels}")
+  set_tests_properties(qwen36_prompt_cache_test PROPERTIES
+                       LABELS "qwen36_35b_a3b;npu;model" SKIP_RETURN_CODE 77
+                       TIMEOUT 3600)
+
   # Op tests of the prefill programs (dequant, GEMM).
   add_executable(qwen36_prefill_ops_test prefill_ops_test.cpp)
   target_link_libraries(qwen36_prefill_ops_test PRIVATE gufo_npu_runtime)

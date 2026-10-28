@@ -563,7 +563,8 @@ void PrefillMixer::Attention(const float* in, std::size_t in_stride,
 
 void PrefillMixer::DeltaNet(const float* in, std::size_t in_stride,
                             const float* normed, const PrefillMixerWeights& w,
-                            DecodeState::Layer& st, float* mixed) {
+                            DecodeState::Layer& st, float* mixed,
+                            const DeltaCapture& capture) {
   const Config& cfg = config_;
   const int n = n_;
   const int d = cfg.hidden;
@@ -623,6 +624,10 @@ void PrefillMixer::DeltaNet(const float* in, std::size_t in_stride,
           simd::SiluRow(out, out, width);
         }
       });
+  if (capture.layer != nullptr) {
+    ConvWindowAfter(in, in_stride, st.conv.data(), window, channels,
+                    capture.offset, capture.layer->conv.data());
+  }
   // The window after these tokens: their last `window` inputs. Ascending
   // s reads older entries (src + window = n + s > s) before they are
   // overwritten.
@@ -678,6 +683,14 @@ void PrefillMixer::DeltaNet(const float* in, std::size_t in_stride,
           local, dk, kDeltaColumns, ut + key_dim + kh * dk, ut + kh * dk,
           ut + 2 * key_dim + head * dk + j0, g[head], g[hv + head],
           mixed + static_cast<std::size_t>(t) * value_dim + head * dk + j0);
+      if (t + 1 == capture.offset) {
+        float* cm = capture.layer->ssm.data() +
+                    static_cast<std::size_t>(head) * dk * dk + j0;
+        for (int i = 0; i < dk; ++i) {
+          std::copy_n(local + i * kDeltaColumns, kDeltaColumns,
+                      cm + static_cast<std::size_t>(i) * dk);
+        }
+      }
     }
     for (int i = 0; i < dk; ++i) {
       std::copy_n(local + i * kDeltaColumns, kDeltaColumns,
