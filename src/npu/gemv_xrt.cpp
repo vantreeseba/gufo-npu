@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "core/quant.hpp"
+#include "npu/buffer_xrt.hpp"
 #include "npu/gemv.hpp"
 #include "npu/xrt_kernel.hpp"
 
@@ -104,11 +105,6 @@ GemvRuntime::~GemvRuntime() = default;
 Flow GemvRuntime::flow() const {
   return impl_->flow;
 }
-
-struct Buffer::Impl {
-  xrt::bo bo;
-  std::size_t bytes;
-};
 
 Buffer::Buffer(GemvRuntime& runtime, std::size_t bytes)
     : impl_(std::make_shared<Impl>(Impl{
@@ -265,6 +261,11 @@ Q4nxGemv::Timing Q4nxGemv::Time(int iterations) {
 
 std::size_t Q4nxGemv::weight_bytes() const {
   return impl_->w_bytes;
+}
+
+Buffer Q4nxGemv::weights() const {
+  return Buffer(
+      std::make_shared<Buffer::Impl>(Buffer::Impl{impl_->w, impl_->w_bytes}));
 }
 
 namespace {

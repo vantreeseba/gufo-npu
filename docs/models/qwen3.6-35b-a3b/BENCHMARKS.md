@@ -8,7 +8,7 @@ xdna-driver 2.26, NPU runtime power control `auto`.
 | | FastFlowLM (measured below) | gufo-npu NPU (below) | MVP target | Ceiling |
 |---|---|---|---|---|
 | Decode, 1k context | 16.9 tok/s | **26.3 tok/s** with MTP (19.2 without) | ≥ 22 tok/s | ~33 tok/s without MTP (56 GB/s NPU read ÷ 1.69 GB per token with every matrix in q4nx) |
-| Prefill, ~1k | ~120 tok/s (8.75 s) | ~30 tok/s (31 s; no prefill yet: two tokens per pass) | ≥ 400 tok/s | |
+| Prefill, ~1k | ~120 tok/s (8.75 s) | **190 tok/s** (5.56 s at 1,055; NPU prefill v1, below) | ≥ 400 tok/s | |
 | TTFT, 35-token prompt | 3.48 s | 0.9 s (24 tokens) | < 1 s | |
 
 ## NPU decode
@@ -120,6 +120,89 @@ arenas, 467 MB each, are 18.7 GB; the dense matrices ~1 GB), anonymous
 memory ~0.6 GB, and up to
 ~20 GB of the memory-mapped GGUF in page cache while loading. Loading
 (packing every matrix to q4nx, Q4_K experts code for code) takes 19.8–24 s.
+
+## NPU prefill (v1)
+
+`qwen36_35b_a3b::NpuPrefill` through `PrefillPrompt` (the hook
+`generate --device npu` and `bench prefill` use): prompts of at least
+`kMinPrefillPrompt` (108) tokens run layer by layer over the whole prompt on
+the NPU, shorter ones through the decoder's two-token passes. Per layer: the
+input projection, the CPU mixer and the output projection in blocks of 1,024
+tokens (GEMM program), routing on the CPU, one visit to the dequant program
+(the experts with tokens, from the decoder's arena, and the next layer's
+dense matrices), then every expert's gate + up and down GEMMs (GEMM program)
+with SwiGLU and the sum on the CPU. 80 program switches per pass. Design:
+[docs/research/NPU-MOE-PREFILL.md](../../research/NPU-MOE-PREFILL.md).
+
+`gufo-npu bench prefill` (the first N tokens of one long chat prompt, MTP
+cache and first token included, as `generate` runs them), warm, a warm-up
+then 3 runs back to back, 2026-10-27. The NPU autosuspends after ~5 s idle,
+which adds ~150–330 ms to the next request; runs here follow each other
+without a gap.
+
+| Prompt tokens | TTFT (min–max) | Decode path (main) | FLM |
+|---|---|---|---|
+| 35 | 1.02 s (decode path: below the crossover) | ~1.0 s | 3.49 s |
+| 125 | **3.32 s** (3.29–3.34) | ~3.8 s | 5.17 s |
+| 1,055 | **5.56 s** (5.52–5.58) | 31.0 s (942 tokens) | 8.75 s |
+| 2,119 | **6.95 s** (6.93–6.98) | ~62 s | 11.91 s |
+| 4,246 | **9.77 s** (9.73–9.79) | ~125 s | 19.47 s |
+| 8,499 | **16.00 s** (15.98–16.01) | ~250 s | 34.17 s |
+
+The decode-path figures past 1k are 30 ms per token times the length (the
+model test measured 93.6 s at 2,049 and 186.9 s at 4,000 one token per
+pass, without speculation). Faster than FLM by 1.6× at 125 tokens and
+2.1× at 4k and 8.5k.
+
+Where the time goes (seconds per run; the GEMM and dequant columns include
+their program switches):
+
+| Tokens | Dequant | GEMMs | Building calls | Syncs | DeltaNet | Attention | Routing | Expert CPU | Other |
+|---|---|---|---|---|---|---|---|---|---|
+| 125 | 1.107 | 1.227 | 0.683 | 0.132 | 0.022 | 0.003 | 0.023 | 0.029 | 0.008 |
+| 1,055 | 1.544 | 1.910 | 1.051 | 0.229 | 0.190 | 0.065 | 0.161 | 0.242 | 0.054 |
+| 2,119 | 1.651 | 2.292 | 1.170 | 0.297 | 0.375 | 0.207 | 0.315 | 0.401 | 0.110 |
+| 4,246 | 1.743 | 3.012 | 1.305 | 0.428 | 0.757 | 0.734 | 0.637 | 0.757 | 0.225 |
+| 8,499 | 1.802 | 4.449 | 1.483 | 0.686 | 1.512 | 2.676 | 1.289 | 1.433 | 0.447 |
+
+- **Fixed cost:** ~2.3 s per pass even for short prompts: the 80 switches
+  (~0.4 s), converting each layer's experts with tokens (~70 of 257 at 125
+  tokens), one GEMM call per expert and matrix at a 256-row minimum, and
+  building ~10k–35k calls (~25–30 µs each on the ELF flow, where setting a
+  buffer argument patches the run's own instruction stream).
+- **Long prompts** turn CPU-bound: at 8.5k, attention 2.7 s, DeltaNet 1.5 s,
+  routing 1.3 s (fp32 router dot products) and the experts' gather, SwiGLU
+  and sum 1.4 s.
+- **Crossover** (same bench, `--decode-path`): 64 tokens 2.78 s against
+  1.86 s on the decode path, 96 tokens 3.11 against 2.84, 128 tokens 3.36
+  against 3.80. The prefill costs ~2.78 s at 64 plus ~9 ms per token, the
+  decode path ~30 ms per token: even at ~108, `kMinPrefillPrompt`.
+- **Call setup, measured alternatives** (EXPERIMENTS.md): reusing runs,
+  keeping the buffer windows, and the instruction-buffer flow were each
+  slower than a fresh run and window per call.
+
+**Memory.** On top of the decoder's 19.4 GiB of device buffers the prefill
+pins ~1.25 GB: bfp16 slots for all 257 arena experts (910 MB), the dense and
+MTP matrices of one layer (68 MB), the dense GEMM operands (34 MB) and the
+expert group operands (242 MB, sized for 16,384-token passes); ~21.6 GB in
+all. Its host scratch is ~0.45 GB at 16k tokens. It loads in 0.4 s after
+the decoder (nothing is packed: it reads the decoder's buffers).
+
+### Decode-path prompts: no LM head before the last pass
+
+Prompts below the crossover (and every prompt without a prefill) run through
+the decoder two tokens per pass; only the last pass's logits are read, so the
+others now skip the 248k-row LM head (~5.6 ms per pass). 942-token prompt
+(the oracle's long passage four times, then a question; MTP drafting),
+`SpeculativeGenerate` without a prefill hook, main's build against this one
+interleaved, warm-up then one run each, two rounds:
+
+| Build | Round 1 | Round 2 |
+|---|---|---|
+| main | 31.02 s | 31.00 s |
+| LM head skipped | **28.38 s** | **28.38 s** |
+
+−8.4%, the same first token.
 
 ## FastFlowLM baseline
 
