@@ -103,10 +103,14 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
-// Host-visible device memory, or a window of it.
+class Program;
+
+// Host-visible device memory, or a window of it. Any call on the device can
+// take it, whichever runtime or program (npu/program.hpp) allocated it.
 class Buffer {
 public:
   Buffer(GemvRuntime& runtime, std::size_t bytes);
+  Buffer(Program& program, std::size_t bytes);
   ~Buffer();
   Buffer(const Buffer&);
   Buffer& operator=(const Buffer&);
@@ -124,9 +128,9 @@ public:
 
   struct Impl;
   Impl& impl() const { return *impl_; }
+  explicit Buffer(std::shared_ptr<Impl> impl);
 
 private:
-  explicit Buffer(std::shared_ptr<Impl> impl);
   std::shared_ptr<Impl> impl_;
 };
 
@@ -163,6 +167,9 @@ public:
   std::size_t rows() const { return rows_; }
   std::size_t padded_rows() const { return padded_rows_; }
   std::size_t weight_bytes() const;
+  // The resident weights (q4nx, in the GEMV's block order), e.g. for a
+  // prefill that converts them on the device.
+  Buffer weights() const;
   // Where token t's output starts in y: t * y_token_stride() fp32 (store) or
   // fp32 words of packed bf16 (SwiGLU). Calls that output a hidden vector
   // (rows() == the design's hidden) put token t in slot t of the next input

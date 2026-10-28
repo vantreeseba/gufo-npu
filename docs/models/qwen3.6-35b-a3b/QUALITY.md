@@ -6,9 +6,10 @@ Planned contracts (see [the plan](../../PLAN.md)):
 |---|---|---|
 | CPU reference vs llama.cpp (CPU), teacher-forced logits | see below | enforced |
 | Each NPU op vs CPU reference | relative error < 1e-2 | enforced: MoE gathers 4.8e-4 (1 token), 4.8e-4 to 7.9e-4 (2 tokens, unions of 9 to 17) |
+| Prefill ops vs CPU over the same q4nx weights | GEMMs relative error < 1e-2; dequant weights within 5% of the host's bfp16 packing | enforced: GEMMs 9.1–9.4e-3, dequant 6.170e-3 against 6.163e-3 (below) |
 | NPU decode vs CPU decoder over the same q4nx weights, teacher-forced, routing followed | logits rel. L2 < 1e-2 per prompt, argmax ≥ 98%, routing differences at near ties only | enforced (below) |
 | NPU MTP speculation vs plain greedy decode | identical output | enforced: 400 tokens after 4 prompts, 73% of drafts accepted |
-| Prefill vs one-token decode | identical next token | reference: identical logits |
+| NPU prefill vs NPU decode, routing followed | hidden < 0.15, states < 0.2, logits < 0.3, argmax ≥ 95%, first token identical unless the decode path's top two are within 0.1 | enforced: hidden ≤ 8.2e-2, states ≤ 0.111, logits ≤ 0.21, argmax 170/170 (below) |
 | CPU decoder vs reference | see below | enforced |
 | MTP head (reference) vs main model's top-1 | ≥ 50% of drafts | enforced (69%) |
 | MTP head vs reference | cosine > 0.999 | |
@@ -393,6 +394,85 @@ selections: one token with 9 experts (twice), and two tokens with unions of
 runs; every byte each selection writes is identical to its first run.
 `q4nx_moe_gather_test` checks the same gathers against the CPU (worst
 relative error 4.8e-4 to 7.9e-4).
+
+## NPU prefill
+
+`qwen36_35b_a3b::NpuPrefill` (src/models/qwen36_35b_a3b): every prompt
+token but the last through the model layer by layer on the NPU (bfp16 GEMMs
+on bfp16 weights converted from the decoder's own q4nx), the mixers and the
+routing on the CPU; then the decoder runs the last token. Measured
+2026-10-27 on the box.
+
+### Ops (`qwen36_prefill_ops_test`, labels `qwen36_35b_a3b;npu;kernels`)
+
+Random q4nx weights (σ 0.02) of every converted shape, against the CPU over
+the same q4nx weights:
+
+| Op | Shapes | Result | Limit |
+|---|---|---|---|
+| Dequant (`qwen36_35b_a3b_dequant`): q4nx in the GEMV's block order to bfp16 in the GEMM's B order | DeltaNet in, attention in, mixer out, one expert's gate + up and down | weights vs q4nx 6.170–6.174e-3, host packing 6.163–6.167e-3 | ≤ 1.05× the host's |
+| GEMM (`qwen36_35b_a3b_prefill`) on the converted weights, M = 256, 512, 1024 | the same five | output rel. L2 9.13e-3 – 9.38e-3 | < 1e-2 |
+
+The dequant now rounds each weight once (the spike's kernel gave 8.4e-3 and a
+GEMM output of 1.08e-2). About 0.3% of its bytes still differ from the
+host's: q4nx weights have few significant bits, so exact ties to an 8-bit
+block mantissa are common and the core breaks some of them the other way;
+the error is the host's to 0.1%.
+
+### Against the decode path (`qwen36_npu_prefill_test`, labels `qwen36_35b_a3b;npu;model`)
+
+Each prompt runs once through `NpuDecoder` one token per pass (recording each
+layer's experts) and once through the prefill, which follows those experts
+(`FollowRouting`: the decode path's choice, weighed by the prefill's own
+router probabilities renormalized over it). Compared: every position's final
+residual, every layer's conv window, DeltaNet state and K/V cache, the MTP
+layer's K/V cache (`FillMtp` from the same hidden rows), then the logits of
+the last token and 16 greedy steps from both states. Then the prefill routes
+on its own: its first token against the decode path's, and a second run must
+be bit-identical. The prompts are the oracle's four and repetitions of them
+cut to 1, 2, 1,024, 1,025, 2,049 and 4,000 tokens.
+
+| Prompt | Tokens | Hidden | Conv | DeltaNet state | K/V | MTP K/V | Logits | Argmax | Routings unlike the prefill's own | Own routing: first token (decode margin) | Hidden per token: median / max / over 0.1 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| chat | 17 | 8.6e-3 | 1.4e-2 | 1.8e-2 | 1.8e-2 | 1.2e-2 | 5.1e-2 | 17/17 | 44 of 640 | same (1.44) | 1.7e-2 / 3.6e-2 / 0 |
+| code | 15 | 3.4e-2 | 1.4e-2 | 7.5e-2 | 3.7e-2 | 1.3e-2 | 4.3e-2 | 17/17 | 53 of 560 | same (3.87) | 1.7e-2 / 0.10 / 1 |
+| prose | 39 | 1.6e-2 | 1.2e-2 | 1.6e-2 | 1.8e-2 | 1.4e-2 | 2.8e-2 | 17/17 | 110 of 1,520 | same (0.60) | 1.6e-2 / 2.9e-2 / 0 |
+| long | 230 | 1.9e-2 | 1.5e-2 | 1.6e-2 | 1.9e-2 | 1.4e-2 | 2.6e-2 | 17/17 | 682 of 9,160 | differs, a tie (0.01) | 1.8e-2 / 3.3e-2 / 0 |
+| 2 | 2 | 6.2e-3 | 1.2e-2 | 2.3e-2 | 2.1e-2 | 1.8e-2 | 2.1e-2 | 17/17 | 3 of 40 | same (7.84) | 6.2e-3 / 6.2e-3 / 0 |
+| 1,024 | 1,024 | 4.5e-2 | 5.8e-2 | 6.1e-2 | 6.5e-2 | 1.5e-2 | 9.2e-2 | 17/17 | 7,759 of 40,920 | same (7.74) | 3.0e-2 / 0.52 / 45 |
+| 1,025 | 1,025 | 4.5e-2 | 5.9e-2 | 5.2e-2 | 6.5e-2 | 1.5e-2 | 8.9e-2 | 17/17 | 7,776 of 40,960 | same (9.89) | 3.0e-2 / 0.52 / 45 |
+| 2,049 | 2,049 | 7.4e-2 | 6.2e-2 | 6.0e-2 | 0.10 | 1.5e-2 | 0.21 | 17/17 | 21,282 of 81,920 | same (9.49) | 3.7e-2 / 0.88 / 205 |
+| 4,000 | 4,000 | 8.2e-2 | 2.0e-2 | 5.6e-2 | 0.11 | 1.6e-2 | 0.12 | 17/17 | 47,085 of 159,960 | same (8.62) | 3.9e-2 / 0.88 / 426 |
+
+(A one-token prompt prefills nothing; its row is all zeros.) Argmax agrees
+170/170; every prompt's repeat is bit-identical; MTP speculation after the
+prefill gives exactly the plain greedy output after it (48 tokens, 68% of
+drafts kept).
+
+**Where the error comes from.** It is the GEMMs' bfp16 rounding (activations
+rounded to bfp16 inside the mmul, 8 values sharing an exponent; outputs to
+bf16), compounding over 40 layers, not the batched CPU side: the family's
+mixers (src/models/qwen35/prefill_mixer.cpp, also the 4B's arithmetic) match
+token-by-token decode to ~1e-4 when the GEMMs are replaced by exact fp32
+products ([the 4B's measurement](../qwen3.5-4b/QUALITY.md)). On natural text
+every token stays under 0.1 (the 230-token passage: largest 3.3e-2). On the
+long repetitive prompts a minority of tokens drift further (45 of 1,023
+tokens over 0.1 at 1k, ~10% at 2k and 4k, up to 0.88), and routing
+amplifies it: once a token's residual is off, its router logits can rank
+experts very differently, so the share of routings unlike the decode path's
+grows from 7–10% on the short prompts to 19–29% on the long ones, and the largest gap reaches 1
+(an expert the prefill's own router all but rules out). The decode test's
+near-tie check (`kNearTie`) therefore does not carry over; the prefill test
+reports the gap and checks the states, the logits and the argmax instead.
+The one first-token difference (the 230-token passage) is a tie: the decode
+path's top two are 0.01 apart.
+
+**Limits.** Hidden < 0.15, conv / DeltaNet state / K/V and MTP K/V < 0.2,
+logits < 0.3, argmax ≥ 95%, first token identical unless the decode path's
+top two are within 0.1 logits: about 1.5–2× the largest measured. A wrong
+offset, a stale window or a misrouted token gives errors of order 1. A more
+precise GEMM (a second, lo-part pass, or bf16 activations in the expert
+GEMMs) would tighten them; that is open (EXPERIMENTS.md).
 
 ## GGUF load
 

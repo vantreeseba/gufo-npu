@@ -61,6 +61,9 @@ Q4nxGemv::Timing Q4nxGemv::Time(int) {
 std::size_t Q4nxGemv::weight_bytes() const {
   return 0;
 }
+Buffer Q4nxGemv::weights() const {
+  NoXrt();
+}
 std::size_t Q4nxGemv::y_bytes() const {
   return 0;
 }

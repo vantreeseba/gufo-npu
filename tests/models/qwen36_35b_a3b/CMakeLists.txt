@@ -52,6 +52,23 @@ if(GUFO_NPU_ENABLE_XRT AND GUFO_NPU_BUILD_KERNELS)
                        LABELS "qwen36_35b_a3b;npu;model" SKIP_RETURN_CODE 77
                        TIMEOUT 3600)
 
+  add_executable(qwen36_npu_prefill_test npu_prefill_test.cpp)
+  target_link_libraries(qwen36_npu_prefill_test PRIVATE gufo_npu_qwen36_35b_a3b)
+  add_test(NAME qwen36_npu_prefill_test
+           COMMAND qwen36_npu_prefill_test "${kernels}")
+  set_tests_properties(qwen36_npu_prefill_test PROPERTIES
+                       LABELS "qwen36_35b_a3b;npu;model" SKIP_RETURN_CODE 77
+                       TIMEOUT 3600)
+
+  # Op tests of the prefill programs (dequant, GEMM).
+  add_executable(qwen36_prefill_ops_test prefill_ops_test.cpp)
+  target_link_libraries(qwen36_prefill_ops_test PRIVATE gufo_npu_runtime)
+  add_test(NAME qwen36_prefill_ops_test
+           COMMAND qwen36_prefill_ops_test "${kernels}")
+  set_tests_properties(qwen36_prefill_ops_test PROPERTIES
+                       LABELS "qwen36_35b_a3b;npu;kernels" SKIP_RETURN_CODE 77
+                       TIMEOUT 600)
+
   # Op tests of the MoE expert gathers.
   add_executable(q4nx_moe_gather_test q4nx_moe_gather_test.cpp)
   target_link_libraries(q4nx_moe_gather_test PRIVATE gufo_npu_runtime)

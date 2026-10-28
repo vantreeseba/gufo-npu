@@ -32,3 +32,5 @@ gufo_npu_add_kernel(NAME bfp16_gemm DESIGN designs/bfp16_gemm.py
 # scope so they share the settings above.
 add_subdirectory("${PROJECT_SOURCE_DIR}/src/models/qwen35_4b/kernels"
                  "${CMAKE_CURRENT_BINARY_DIR}/qwen35_4b")
+add_subdirectory("${PROJECT_SOURCE_DIR}/src/models/qwen36_35b_a3b/kernels"
+                 "${CMAKE_CURRENT_BINARY_DIR}/qwen36_35b_a3b")
