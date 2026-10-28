@@ -52,6 +52,22 @@ toolchain so every bottleneck can be fixed. See [docs/PLAN.md](docs/PLAN.md).
 - **Short-prompt decode with MTP** depends on how many drafts are accepted: more on code, fewer on prose.
 - **The 35B** prefills prompts of 6 tokens or more layer by layer: its dense matrices as bfp16 GEMMs on the NPU (converted once from the decoder's 4-bit weights), its experts on the CPU straight from the decoder's 4-bit weights (AVX-512 BF16); shorter prompts run two tokens per decode pass, which is faster there.
 
+### Where the work runs
+
+The NPU's share of the FLOPs (and of the bytes read, in decode). These are **computed** from each model's shapes and where each op runs, not measured (`tools/bench/work_split.py`; per op group in each model's BENCHMARKS.md):
+
+| Model | Decode, short context | Decode, 9k context | Prefill, ~1k tokens | Prefill, longest prompt |
+|---|---|---|---|---|
+| Qwen3.5-2B | 99% (97.5% of bytes) | 89% (89%) | 98% | 95% (4k) |
+| Qwen3.5-4B | 99% (97%) | 87% (87%) | 98% | 91% (9k) |
+| Qwen3.6-35B-A3B | 97% (91%) | 78% (83%) | 51%, experts on the CPU | 46% (8.5k) |
+
+- **gufo-npu:**
+  - **Decode:** every weight matrix runs on the NPU except two small fp32 ones on the CPU: DeltaNet's alpha/beta projections and the 35B's router. The CPU also runs DeltaNet's recurrence, attention over the K/V cache (its share grows with the context) and the argmax. MTP steps are within a point of these numbers.
+  - **The 35B's prefill:** it runs its experts on the CPU (44% of the FLOPs), because that is faster than its NPU expert kernels at every prompt length.
+- **FastFlowLM** keeps more than 99.9% of the FLOPs on the NPU in every mode, including the router, DeltaNet and attention. Its CPU only samples in decode and does elementwise steps (SwiGLU, gates, top-8) in prefill. That comes from its v1.0.10 engine libraries' symbols and call graph, not its docs.
+- **Work is not time:** the CPU is slower per FLOP, so its share of the measured time is larger.
+
 **How it works:**
 - Every weight matrix is stored as q4nx (4.625 bits per weight) and read by NPU GEMVs that run at up to the NPU's ~56 GB/s read ceiling. The same GEMVs also do the norms, residual adds and SwiGLU.
 - Calls are chained into a few NPU submissions per token.

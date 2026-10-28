@@ -360,3 +360,87 @@ within noise.
   against ~5.4 ms when issued one at a time.
 - The first dispatch after idle took 270–1,100 µs with runtime power control
   `auto`.
+
+## Where the work runs (computed, 2026-10-28)
+
+The share of the work on the NPU and on the CPU, **computed** from the
+model's shapes and where gufo-npu places each op, not measured;
+`python3 tools/bench/work_split.py` prints these tables.
+- **FLOPs** count 2 per multiply-add and 1 per elementwise op.
+- **Decode bytes** are the weights, recurrent state and K/V cache read per
+  step. **Prefill bytes** are each weight read once per prompt.
+- **Work is not time.** The NPU's matrix products are bound by its ~56 GB/s
+  read ceiling, and the CPU does fewer FLOPs per second, so CPU ops take a
+  larger share of the measured times above than of the work.
+- Attention's share grows with the context in decode and with the prompt in
+  prefill. Everything else is per token.
+
+Placement:
+- **Decode:** every dense projection, the experts (8 routed and the shared
+  one, through two gathers per layer), the LM head, and the MTP layer's
+  projections, experts and 32k draft LM head run as q4nx GEMVs on the NPU,
+  with the norms, residual adds and SwiGLU fused into them. The CPU runs the
+  token mixers (DeltaNet's conv, delta rule and gated norm with its fp32
+  alpha/beta projections; attention over the fp16 K/V cache), the router
+  (fp32 router and shared-expert gate, top-8, patching the gathers) and the
+  argmax.
+- **Prefill:** the dense projections run as bfp16 GEMMs on the NPU. The CPU
+  runs the mixers, the router and top-8, and the experts with their SwiGLU
+  (q4nx, read in place from the decoder's arenas, AVX-512 BF16). A prompt of
+  ~200 tokens or more touches all 256 experts of every layer, so the
+  experts are 90% of the weight bytes. The first token's LM head and the MTP
+  cache's two projections run on the NPU.
+- With `--experts npu` the expert FLOPs move to the NPU (95% of the FLOPs at
+  1,055 tokens), but that path is slower at every prompt length (above).
+
+#### Qwen3.6-35B-A3B: decode, per step (FLOPs / bytes read)
+
+| Op group | Runs on | Short (~128 context) | 1,024 context | 9,000 context | Short, MTP step |
+|---|---|---|---|---|---|
+| dense projections | NPU | 42.5% / 39.8% | 41.4% / 39.4% | 34.2% / 36.2% | 40.8% / 38.2% |
+| experts | NPU | 37.6% / 35.2% | 36.7% / 34.9% | 30.3% / 32.1% | 36.1% / 33.8% |
+| LM head | NPU | 16.9% / 15.8% | 16.5% / 15.7% | 13.6% / 14.4% | 16.2% / 15.2% |
+| router | CPU | 0.7% / 4.5% | 0.7% / 4.5% | 0.6% / 4.1% | 0.7% / 4.3% |
+| DeltaNet | CPU | 2.0% / 4.4% | 2.0% / 4.4% | 1.6% / 4.0% | 1.9% / 4.3% |
+| attention | CPU | 0.4% / 0.1% | 2.7% / 1.1% | 19.8% / 9.0% | 0.3% / 0.1% |
+| norms/activations | NPU | <0.1% / – | <0.1% / – | <0.1% / – | <0.1% / – |
+| MTP draft | NPU | – / – | – / – | – / – | 3.8% / 3.9% |
+| MTP draft | CPU | – / – | – / – | – / – | <0.1% / 0.1% |
+| sampling | CPU | <0.1% / 0.1% | <0.1% / 0.1% | <0.1% / <0.1% | <0.1% / 0.1% |
+| **NPU total** | | **96.9% / 90.8%** | **94.6% / 89.9%** | **78.1% / 82.7%** | **97.0% / 91.1%** |
+| Work per step | | 6.0 GFLOP / 1.86 GB | 6.2 GFLOP / 1.88 GB | 7.5 GFLOP / 2.04 GB | 12.5 GFLOP / 1.94 GB |
+
+#### Qwen3.6-35B-A3B: prefill, per prompt (FLOPs; weight bytes at 8,499 tokens)
+
+| Op group | Runs on | 35 tokens | 125 tokens | 1,055 tokens | 4,246 tokens | 8,499 tokens | Weight bytes |
+|---|---|---|---|---|---|---|---|
+| dense projections | NPU | 50.3% | 50.5% | 49.9% | 47.4% | 44.6% | 7.0% |
+| experts | CPU | 44.6% | 44.7% | 44.1% | 42.0% | 39.4% | 90.5% |
+| LM head | NPU | 0.6% | 0.2% | <0.1% | <0.1% | <0.1% | 1.4% |
+| router | CPU | 0.8% | 0.8% | 0.8% | 0.8% | 0.7% | 0.4% |
+| DeltaNet | CPU | 2.4% | 2.4% | 2.4% | 2.2% | 2.1% | 0.1% |
+| attention | CPU | 0.1% | 0.2% | 1.7% | 6.5% | 12.2% | – |
+| norms/activations | CPU | <0.1% | <0.1% | <0.1% | <0.1% | <0.1% | – |
+| MTP draft | NPU | 1.2% | 1.1% | 1.1% | 1.0% | 1.0% | 0.5% |
+| MTP draft | CPU | <0.1% | <0.1% | <0.1% | <0.1% | <0.1% | 0.1% |
+| sampling | CPU | <0.1% | <0.1% | <0.1% | <0.1% | <0.1% | <0.1% |
+| **NPU total** | | **52.1%** | **51.8%** | **51.0%** | **48.5%** | **45.5%** | **8.9%** |
+| Work per prompt | | 0.18 TFLOP | 0.63 TFLOP | 5.41 TFLOP | 22.89 TFLOP | 48.80 TFLOP | 20.65 GB |
+
+**FastFlowLM** (v1.0.10) keeps more than 99.9% of the FLOPs on the NPU in
+every mode, computed with the same shapes: at most 0.06% in prefill and
+0.004% in decode on the CPU.
+- **NPU:** its programs run the projections, the experts (q4nx with
+  dequantization on the NPU), the DeltaNet conv and delta rule, attention
+  and the LM head, and in decode also the router and top-8. The router
+  weights and the shared-expert gate go to the device
+  (`_send_router_w_and_share_exp_gate`), and the decode entry point
+  (`qwen3_6_moe_npu::Impl::forward`) makes no CPU compute calls.
+- **CPU:** it samples the next token, and in prefill only does top-8
+  (`cpu_func::_moe_gate`), SwiGLU, the expert weighting, the attention and
+  shared-expert gates, DeltaNet's gate activations and its gated norm.
+- **Source:** `libqwen3_6_moe_npu.so`'s symbols and call graph and the
+  xclbin names (`GateDeltaNet_prefill`, `conv`, `attn`, `layer`,
+  `dequant_mm`, `lm_head`), not FLM's docs, whose README says it runs "fully
+  on AMD Ryzen™ AI NPU — no GPU or CPU load". The CPU SwiGLU in prefill
+  matches FLM issue #710's binary analysis.
