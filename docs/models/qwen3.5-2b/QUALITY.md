@@ -118,8 +118,11 @@ blocks; [how it was chosen](../qwen3.6-35b-a3b/QUALITY.md#choosing-the-4-bit-val
 - 73/73 against its own weights on the CPU; 61/73 against HF (63/73 with
   the min/max fit), a difference of two near ties in 73 positions. On
   1,515 positions of held-out text against the GGUF as stored (the 35B's
-  quality test run on this model), KL with every requantized matrix in
-  q4nx is 0.0424 with the min/max fit (0.0336 without the LM head).
+  quality test's harness run on this model, same texts): with every matrix
+  in q4nx KL falls from 0.0424 to 0.0332 but top-1 agreement with the GGUF
+  goes from 91.29% to 90.89% (6 positions); without the LM head (the tied
+  Q6_K embedding) KL falls from 0.0336 to 0.0258 and top-1 rises from
+  93.14% to 93.47%.
 - The NPU decoder packs and uploads in 2.6 s instead of 1.3 s.
 
 ## Speculative decoding
