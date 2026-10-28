@@ -817,14 +817,11 @@ int NpuDecoder::Draft(const float* const* hidden, const int* tokens, int count,
   return m.draft_ids[static_cast<std::size_t>(best)];
 }
 
-std::vector<int> SpeculativeGenerate(NpuDecoder& model,
-                                     const std::vector<int>& prompt,
-                                     int max_tokens,
-                                     const std::vector<int>& stop, bool draft,
-                                     const std::function<bool(int)>& on_token,
-                                     SpeculativeStats* stats,
-                                     const PromptPrefill& prefill,
-                                     const SamplingParams& sampling) {
+std::vector<int> SpeculativeGenerate(
+    NpuDecoder& model, const std::vector<int>& prompt, int max_tokens,
+    const std::vector<int>& stop, bool draft,
+    const std::function<bool(int)>& on_token, SpeculativeStats* stats,
+    const PromptPrefill& prefill, const SamplingParams& sampling) {
   if (prompt.empty()) {
     throw std::invalid_argument("generate: empty prompt");
   }

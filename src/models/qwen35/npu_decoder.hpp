@@ -138,16 +138,13 @@ private:
 // rule. The output therefore follows the main model's distribution exactly;
 // greedy `sampling` (the default) gives its greedy output. The prompt runs
 // through `prefill` when given, the rest of it two tokens per pass. With
-// `draft` false, every step decodes one token (no MTP); `draft` needs can_draft(). `on_token` sees each
-// generated id (including a stop id) as it is produced; returning false ends
-// the generation after that id.
-std::vector<int> SpeculativeGenerate(NpuDecoder& model,
-                                     const std::vector<int>& prompt,
-                                     int max_tokens,
-                                     const std::vector<int>& stop, bool draft,
-                                     const std::function<bool(int)>& on_token,
-                                     SpeculativeStats* stats = nullptr,
-                                     const PromptPrefill& prefill = {},
-                                     const SamplingParams& sampling = {});
+// `draft` false, every step decodes one token (no MTP); `draft` needs
+// can_draft(). `on_token` sees each generated id (including a stop id) as it is
+// produced; returning false ends the generation after that id.
+std::vector<int> SpeculativeGenerate(
+    NpuDecoder& model, const std::vector<int>& prompt, int max_tokens,
+    const std::vector<int>& stop, bool draft,
+    const std::function<bool(int)>& on_token, SpeculativeStats* stats = nullptr,
+    const PromptPrefill& prefill = {}, const SamplingParams& sampling = {});
 
 }  // namespace gufo_npu::qwen35

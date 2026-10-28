@@ -525,14 +525,11 @@ double SecondsSince(std::chrono::steady_clock::time_point start) {
 
 }  // namespace
 
-std::vector<int> SpeculativeGenerate(NpuDecoder& model,
-                                     const std::vector<int>& prompt,
-                                     int max_tokens,
-                                     const std::vector<int>& stop, bool draft,
-                                     const std::function<bool(int)>& on_token,
-                                     SpeculativeStats* stats,
-                                     const PromptPrefill& prefill,
-                                     const SamplingParams& sampling) {
+std::vector<int> SpeculativeGenerate(
+    NpuDecoder& model, const std::vector<int>& prompt, int max_tokens,
+    const std::vector<int>& stop, bool draft,
+    const std::function<bool(int)>& on_token, SpeculativeStats* stats,
+    const PromptPrefill& prefill, const SamplingParams& sampling) {
   if (prompt.empty()) {
     throw std::invalid_argument("generate: empty prompt");
   }

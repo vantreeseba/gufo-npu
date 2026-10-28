@@ -51,7 +51,7 @@ struct GenerateResult {
 };
 
 class Engine {
- public:
+public:
   virtual ~Engine() = default;
 
   virtual const ModelInfo& info() const = 0;
@@ -65,10 +65,10 @@ class Engine {
 };
 
 struct EngineOptions {
-  std::string model_path;  // GGUF
-  std::string device = "npu";  // "npu" or "cpu" (the CPU reference)
+  std::string model_path;              // GGUF
+  std::string device = "npu";          // "npu" or "cpu" (the CPU reference)
   std::optional<std::string> kernels;  // kernel dir; default: installed
-  std::string model_id;  // ModelInfo::id; default: from the GGUF
+  std::string model_id;                // ModelInfo::id; default: from the GGUF
 };
 
 // Loads the GGUF's model on the device, picking the model package by

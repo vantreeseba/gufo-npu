@@ -6,8 +6,8 @@
 #include <vector>
 
 #include "core/gguf.hpp"
-#include "core/sampling.hpp"
 #include "core/q4nx.hpp"
+#include "core/sampling.hpp"
 #include "models/qwen35/config.hpp"
 #include "models/qwen35/decoder.hpp"
 #include "models/qwen35/generate.hpp"
@@ -113,13 +113,10 @@ private:
 // `draft` false, every step decodes one token (no MTP). `on_token` sees each
 // generated id (including a stop id) as it is produced; returning false ends
 // the generation after that id.
-std::vector<int> SpeculativeGenerate(NpuDecoder& model,
-                                     const std::vector<int>& prompt,
-                                     int max_tokens,
-                                     const std::vector<int>& stop, bool draft,
-                                     const std::function<bool(int)>& on_token,
-                                     SpeculativeStats* stats = nullptr,
-                                     const PromptPrefill& prefill = {},
-                                     const SamplingParams& sampling = {});
+std::vector<int> SpeculativeGenerate(
+    NpuDecoder& model, const std::vector<int>& prompt, int max_tokens,
+    const std::vector<int>& stop, bool draft,
+    const std::function<bool(int)>& on_token, SpeculativeStats* stats = nullptr,
+    const PromptPrefill& prefill = {}, const SamplingParams& sampling = {});
 
 }  // namespace gufo_npu::qwen35_4b
