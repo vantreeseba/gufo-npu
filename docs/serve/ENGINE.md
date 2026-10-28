@@ -26,21 +26,31 @@ reference reads, greedy and slow; it is there for tests).
 
 ## A request
 
-- **Prompt:** the whole token list, every time. The engine keeps no state
-  between requests yet; the prompt cache will reuse a previous request's
-  prefix (`GenerateResult::cached_prompt_tokens`).
+- **Prompt:** the whole token list, every time. Each NPU model keeps a
+  `qwen35::PromptCache` (`EngineOptions::prompt_cache` checkpoints, default
+  2, 0: off; `gufo-npu serve --prompt-cache N`): a request restores the
+  longest checkpoint its prompt starts with and processes only the rest
+  (`GenerateResult::cached_prompt_tokens`). A checkpoint is taken before the
+  prompt's last `<|im_start|>`, the history through the last user message,
+  which the next turn of a chat starts with (`prompt_cache.hpp`). The CPU
+  reference has no cache.
 - **Ends:** at a stop id (`kStop`, the id is reported), at `max_tokens` or the
   context limit (`kLength`), or when the token callback returns false or the
   request's cancel flag is set (`kCancelled`). Cancelling is checked after
   each generated token; a prompt being processed runs to its end first.
+- **Sampling:** `GenerateRequest::sampling` goes to the model's generate
+  loop (`Sampler`, `src/core/sampling.hpp`); temperature 0 is greedy. With
+  MTP drafts, sampling keeps the plain decoder's output distribution.
 - **Refused** (`std::invalid_argument`): an empty prompt, token ids outside the
-  vocabulary, `max_tokens` < 1, a prompt that fills the context limit, and,
-  until the sampler lands, any sampling setting other than greedy.
-- **Cancelling** unwinds out of the model's generate loop from the token
-  callback. Every decoder resolves its speculative pass before it reports
-  tokens, and the next request starts from a fresh state, so a cancelled
-  request leaves no trace (`serve_engine_test`: the request after a cancelled
-  one gives the same tokens).
+  vocabulary, `max_tokens` < 1, a prompt that fills the context limit, and
+  sampling settings out of range.
+- **Cancelling:** the engine's token callback returns false, and the generate
+  loop ends after that token. Every decoder resolves its speculative pass
+  before it reports tokens, and the next request starts from a fresh state
+  (or a checkpoint), so a cancelled request leaves no trace. Checkpoints are
+  taken while the prompt is processed, before any token is reported, so a
+  request cancelled or failing later leaves only checkpoints of fully
+  processed prompt prefixes (`serve_engine_test`).
 
 ## Context length
 
@@ -118,15 +128,7 @@ the weights; the kernel can reclaim them) and the device buffers:
 (GB here are GiB.) The 35B's ~19.9 GiB is ~21.3 GB: its decoder's device
 buffers and the prefill's resident bfp16 matrices.
 
-## Integration notes
+## The CLI
 
-- **Sampling:** `ModelEngine::Validate` refuses non-greedy settings; once
-  `SpeculativeGenerate` takes `SamplingParams`, pass `request.sampling`
-  through each package's run function (one call each in `engine.cpp`).
-- **Token callback:** `SpeculativeGenerate` takes `void(int)` today, so the
-  engine stops it by throwing from the callback. With a `bool(int)` callback
-  the `Stopped` exception goes away.
-- **Prompt cache:** wrap each package's `PrefillPrompt` and report the reused
-  count in `cached_prompt_tokens`.
-- The CLI's `generate` and `bench prefill` keep their own model selection: they
-  print per-package profiles the engine does not expose.
+`gufo-npu generate` and `bench prefill` keep their own model selection: they
+print per-package profiles the engine does not expose.

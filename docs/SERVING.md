@@ -34,6 +34,8 @@ docker run --rm --device /dev/accel/accel0 --ulimit memlock=-1:-1 \
 | `--model-id NAME` | from the GGUF | The model name `/v1/models` lists and replies carry. |
 | `--max-queue N` | `8` | Requests that may wait behind the running one; more get 429. |
 | `--api-key KEY` | none | When set, `/v1/*` needs `Authorization: Bearer KEY`. `/health` and `/metrics` stay open. |
+| `--context-length N` | 32,768 | Most prompt + generated tokens per request, up to the model's trained 262,144. Memory per token: [docs/serve/ENGINE.md](serve/ENGINE.md#context-length). |
+| `--prompt-cache N` | `2` | Checkpoints of earlier prompts kept for multi-turn reuse; `0` turns the cache off. |
 
 `SIGINT` or `SIGTERM` stops the server.
 
@@ -71,8 +73,8 @@ The reply:
 - `finish_reason` is `stop` (end of turn or a stop string), `length`
   (`max_tokens` or the context) or `tool_calls`.
 - `usage` has `prompt_tokens`, `completion_tokens`, `total_tokens` and
-  `prompt_tokens_details.cached_tokens` (prompt tokens reused from the
-  previous request's cache).
+  `prompt_tokens_details.cached_tokens` (prompt tokens restored from a
+  prompt-cache checkpoint).
 
 Streaming sends `chat.completion.chunk` events: first `{"role":
 "assistant", "content": ""}`, then `content`, `reasoning_content` and
@@ -117,9 +119,12 @@ Errors use the OpenAI shape, `{"error": {"message", "type", "param",
   `--max-queue` bounds the wait list.
 - A client that disconnects, while waiting or while its reply is generated,
   gives up its place or stops its generation at the next token.
-- The engine keeps the last request's state; a request whose prompt starts
-  with the previous conversation reuses it
-  (`usage.prompt_tokens_details.cached_tokens`).
+- The engine keeps checkpoints of earlier prompts (`--prompt-cache`, the
+  history through the last user message). The next turn of a chat restores
+  one and processes only the previous reply and the new message
+  (`usage.prompt_tokens_details.cached_tokens`). Least recently used
+  checkpoints go first, so `N` conversations can alternate without losing
+  their history.
 
 ## Not supported yet
 
