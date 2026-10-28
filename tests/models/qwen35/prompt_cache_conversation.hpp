@@ -46,6 +46,10 @@ struct Model {
   std::function<qwen35::PromptCacheModel()> cache_model;
   // The model's own PrefillPrompt hook (no cache).
   qwen35::PromptPrefill plain;
+  // The whole prompt through the decoder alone (the same tokens `plain`
+  // runs): the decode path's own distance from the prefill, which a short
+  // remainder through the decoder inherits.
+  qwen35::PromptPrefill decode_path;
   // Greedy MTP decoding with a prompt hook.
   std::function<std::vector<int>(const std::vector<int>& prompt, int max_tokens,
                                  const std::vector<int>& stop,
@@ -315,23 +319,33 @@ inline int Conversation(const Model& m, const gufo_npu::Tokenizer& tokenizer,
         qwen35::PromptCache steps(m.cache_model(), options);
         RunHook(m, steps.Hook(), prompt);
         const auto stepped = RunHook(m, steps.Hook(), shorter);
-        const Diff s = Compare(m, stepped, RunHook(m, m.plain, shorter));
+        const auto shorter_whole = RunHook(m, m.plain, shorter);
+        const Diff s = Compare(m, stepped, shorter_whole);
+        const Diff base_diff =
+            Compare(m, RunHook(m, m.decode_path, shorter), shorter_whole);
         std::vector<int> longer = shorter;
         longer.insert(longer.end(), prompt.begin() + base + 2, prompt.end());
         const auto continued = RunHook(m, steps.Hook(), longer);
         const Diff l = Compare(m, continued, RunHook(m, m.plain, longer));
-        const bool sok = s.shape && l.shape && s.hidden <= m.max_hidden_error &&
+        // The decoder's part may differ from the prefill as much as the
+        // decode path does on the same prompt (one row's hidden error is
+        // noisier than the prefill test's over every row).
+        const double hidden_limit =
+            std::max(m.max_hidden_error, 1.5 * base_diff.hidden);
+        const bool sok = s.shape && l.shape && base_diff.shape &&
+                         s.hidden <= hidden_limit &&
                          s.MaxState() <= m.max_state_error &&
                          l.hidden <= m.max_hidden_error &&
                          l.MaxState() <= m.max_state_error &&
                          steps.last_reused() == base + 2;
         std::printf(
             "%s  %s doc %d turn %d short remainder: decoder state vs one "
-            "prefill: hidden %.2e, states %.2e; its checkpoint (%d tokens) "
-            "continued: hidden %.2e, states %.2e\n",
+            "prefill: hidden %.2e, states %.2e (the whole prompt by the "
+            "decode path: hidden %.2e, states %.2e); its checkpoint (%d "
+            "tokens) continued: hidden %.2e, states %.2e\n",
             sok ? "ok  " : "FAIL", m.name.c_str(), doc_tokens, turn + 1,
-            s.hidden, s.MaxState(), steps.last_reused(), l.hidden,
-            l.MaxState());
+            s.hidden, s.MaxState(), base_diff.hidden, base_diff.MaxState(),
+            steps.last_reused(), l.hidden, l.MaxState());
         failures += sok ? 0 : 1;
       }
       previous = prompt;

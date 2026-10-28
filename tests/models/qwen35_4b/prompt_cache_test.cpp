@@ -3,6 +3,7 @@
 //   GUFO_NPU_QWEN35_4B_GGUF  UD-Q4_K_XL GGUF of Qwen3.5-4B
 // Exits 77 (skip) when it is unset or there is no NPU.
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -37,6 +38,22 @@ int main(int argc, char** argv) {
   m.hidden = npu.config().hidden;
   m.cache_model = [&] { return qwen35_4b::MakePromptCacheModel(npu, prefill); };
   m.plain = qwen35_4b::PrefillPrompt(prefill);
+  m.decode_path = [&](const std::vector<int>& p, qwen35::DecodeState& s,
+                      qwen35::DecodeState* mtp, float* hidden) {
+    const int k = static_cast<int>(p.size()) - 0;
+    const int h = npu.config().hidden;
+    qwen35::StepPrompt(
+        npu,
+        [&](const int* t, int n, qwen35::DecodeState& st) {
+          npu.Step(t, n, st);
+        },
+        h, p.data(), k, s, hidden, nullptr);
+    if (mtp != nullptr) {
+      const int pairs = std::min(k, static_cast<int>(p.size()) - 1);
+      qwen35::StepMtp(npu, h, hidden, p.data() + 1, pairs, 1, *mtp);
+    }
+    return k;
+  };
   m.generate = [&](const std::vector<int>& prompt, int max_tokens,
                    const std::vector<int>& stop,
                    const qwen35::PromptPrefill& hook,
