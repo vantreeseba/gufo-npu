@@ -37,14 +37,14 @@ using vec::RmsNorm;
 
 constexpr int kMaxChunk = static_cast<int>(gufo_npu::npu::kGemmMaxChunk);
 
-// The model the chunk plan is chosen with, measured on the 2B (BENCHMARKS.md,
-// "Prefill GEMM" and "Where the time goes"): the GEMMs' throughput at each
-// chunk size of gufo_npu::npu::kGemmChunks (a 256-row call runs at ~11 TFLOPS,
-// a 1,024-row one at ~17), and the CPU's time per token between them (~0.14 ms
-// at 1k tokens: mixers, norms, conversions).
-constexpr double kGemmTflops[] = {11.0, 14.5, 17.0};
+// The model the chunk plan is chosen with, measured on the 4B (BENCHMARKS.md,
+// "Chunk plan"): one pass of 7.13 GFLOP per token through the GEMMs at each
+// chunk size of gufo_npu::npu::kGemmChunks (11.4 TFLOPS at 256 rows, 14.0 at
+// 512, 16.1 at 1,024), and the CPU's time per token between them (0.28-0.29
+// ms at 512-1,024 tokens: mixers, norms, conversions; the 2B's is 0.14).
+constexpr double kGemmTflops[] = {11.4, 14.0, 16.1};
 static_assert(std::size(kGemmTflops) == std::size(gufo_npu::npu::kGemmChunks));
-constexpr double kCpuSecondsPerToken = 0.14e-3;
+constexpr double kCpuSecondsPerToken = 0.29e-3;
 
 // One pass of a prefill: `lanes` chunks of `m` GEMM rows over `tokens`
 // prompt tokens (the last chunk padded).
