@@ -5,13 +5,11 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "core/sampling.hpp"
-
-namespace gufo_npu {
-class Tokenizer;
-}
+#include "core/tokenizer.hpp"
 
 // The server's view of a loaded model: token ids in, token ids out. One
 // generation runs at a time; the server serializes requests. The engine owns
@@ -51,11 +49,23 @@ struct GenerateResult {
 };
 
 class Engine {
- public:
+public:
   virtual ~Engine() = default;
 
   virtual const ModelInfo& info() const = 0;
   virtual const Tokenizer& tokenizer() const = 0;
+
+  // Text and ids, through tokenizer() unless overridden (the server uses
+  // only these, so test fakes need no GGUF vocabulary).
+  virtual std::vector<int> Encode(std::string_view text) const {
+    return tokenizer().Encode(text);
+  }
+  virtual std::string TokenBytes(int id) const {
+    return tokenizer().TokenBytes(id);
+  }
+  virtual int FindToken(std::string_view token) const {  // -1 if absent
+    return tokenizer().Find(token);
+  }
 
   // Runs one generation. `on_token` sees each generated id as it is
   // produced (including a stop id); returning false ends the generation
@@ -65,10 +75,10 @@ class Engine {
 };
 
 struct EngineOptions {
-  std::string model_path;  // GGUF
-  std::string device = "npu";  // "npu" or "cpu" (the CPU reference)
+  std::string model_path;              // GGUF
+  std::string device = "npu";          // "npu" or "cpu" (the CPU reference)
   std::optional<std::string> kernels;  // kernel dir; default: installed
-  std::string model_id;  // ModelInfo::id; default: from the GGUF
+  std::string model_id;                // ModelInfo::id; default: from the GGUF
 };
 
 // Loads the GGUF's model on the device, picking the model package by

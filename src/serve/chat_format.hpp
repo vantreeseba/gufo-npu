@@ -1,18 +1,19 @@
 #pragma once
 
 #include <memory>
+#include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
-
-#include <nlohmann/json.hpp>
 
 // OpenAI chat messages to the model's prompt text, and the model's output
 // text back to OpenAI message parts (content, reasoning, tool calls).
 namespace gufo_npu::serve {
 
+// Ordered JSON: the template prints tool schemas and call arguments in the
+// order the client sent them (parse request bodies with ordered_json too).
 struct ChatPrompt {
-  nlohmann::json messages = nlohmann::json::array();  // OpenAI messages
-  nlohmann::json tools = nlohmann::json::array();     // OpenAI tools
+  nlohmann::ordered_json messages = nlohmann::ordered_json::array();
+  nlohmann::ordered_json tools = nlohmann::ordered_json::array();
   bool thinking = false;  // let the model reason in a think block first
 };
 
@@ -20,14 +21,14 @@ struct ChatPrompt {
 struct OutputPart {
   enum class Kind { kContent, kReasoning, kToolCall };
   Kind kind = Kind::kContent;
-  std::string text;        // kContent / kReasoning: text to append
-  std::string tool_id;     // kToolCall: "call_..." id
-  std::string tool_name;   // kToolCall
-  std::string arguments;   // kToolCall: JSON object text
+  std::string text;       // kContent / kReasoning: text to append
+  std::string tool_id;    // kToolCall: "call_..." id
+  std::string tool_name;  // kToolCall
+  std::string arguments;  // kToolCall: JSON object text
 };
 
 class OutputParser {
- public:
+public:
   virtual ~OutputParser() = default;
   // Feeds decoded text (whole UTF-8 characters) and returns the parts that
   // are complete. Text that may still turn out to be markup is held back.
@@ -37,9 +38,11 @@ class OutputParser {
 };
 
 class ChatFormat {
- public:
+public:
   virtual ~ChatFormat() = default;
-  // Throws std::invalid_argument for messages the model cannot take.
+  // The prompt text, ending with the assistant's generation prompt; a final
+  // assistant message is continued instead (prefill). Throws
+  // std::invalid_argument for messages the model cannot take.
   virtual std::string Render(const ChatPrompt& prompt) const = 0;
   virtual std::unique_ptr<OutputParser> NewParser(
       const ChatPrompt& prompt) const = 0;

@@ -39,6 +39,11 @@ find_package(ICU REQUIRED COMPONENTS uc i18n)
 add_library(nlohmann_json INTERFACE)
 target_include_directories(nlohmann_json SYSTEM INTERFACE
   "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
+add_library(cpp_httplib INTERFACE)
+target_include_directories(cpp_httplib SYSTEM INTERFACE
+  "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
+find_package(Threads REQUIRED)
+target_link_libraries(cpp_httplib INTERFACE Threads::Threads)
 
 # CPU-only core: no XRT, safe for hosted CI and unit tests.
 add_library(gufo_npu_core STATIC
@@ -115,9 +120,26 @@ endif()
 add_subdirectory(src/models/qwen35_4b)
 add_subdirectory(src/models/qwen36_35b_a3b)
 
+# OpenAI-compatible server (docs/SERVING.md): HTTP, OpenAI JSON, queue and
+# metrics over the Engine and ChatFormat interfaces. CPU-only.
+add_library(gufo_npu_serve STATIC
+  src/serve/metrics.cpp
+  src/serve/openai.cpp
+  src/serve/reply.cpp
+  src/serve/server.cpp
+  src/serve/text.cpp
+)
+target_link_libraries(gufo_npu_serve PUBLIC gufo_npu_core nlohmann_json
+                      PRIVATE cpp_httplib)
+# TEMPORARY (remove at integration): placeholders for LoadEngine and
+# NewQwen35ChatFormat until the engine and chat parts land.
+add_library(gufo_npu_serve_stubs STATIC src/serve/engine_stub.cpp
+                                        src/serve/chat_format_stub.cpp)
+target_link_libraries(gufo_npu_serve_stubs PUBLIC gufo_npu_serve)
+
 add_executable(gufo-npu src/cli/main.cpp)
 target_link_libraries(gufo-npu PRIVATE gufo_npu_qwen35_npu gufo_npu_qwen35_4b
-                      gufo_npu_qwen36_35b_a3b)
+                      gufo_npu_qwen36_35b_a3b gufo_npu_serve_stubs)
 install(TARGETS gufo-npu RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 if(BUILD_TESTING)
