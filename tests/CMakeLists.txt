@@ -68,8 +68,12 @@ add_executable(serve_chat_test serve/server_chat_test.cpp)
 target_link_libraries(serve_chat_test PRIVATE gufo_npu_serve
                       gufo_npu_serve_chat cpp_httplib)
 add_test(NAME serve_chat_test COMMAND serve_chat_test)
+# logprobs, n, logit_bias, parallel_tool_calls and /v1/completions.
+add_executable(serve_extras_test serve/server_extras_test.cpp)
+target_link_libraries(serve_extras_test PRIVATE gufo_npu_serve cpp_httplib)
+add_test(NAME serve_extras_test COMMAND serve_extras_test)
 set_tests_properties(serve_text_test serve_server_test serve_chat_test
-                     PROPERTIES LABELS serve TIMEOUT 120)
+                     serve_extras_test PROPERTIES LABELS serve TIMEOUT 120)
 
 add_executable(tokenizer_test core/tokenizer_test.cpp)
 target_link_libraries(tokenizer_test PRIVATE gufo_npu_core nlohmann_json)

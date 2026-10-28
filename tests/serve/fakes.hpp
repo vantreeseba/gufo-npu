@@ -4,6 +4,7 @@
 // no GGUF, no NPU.
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
@@ -18,6 +19,12 @@ namespace gufo_npu::serve::testing {
 
 inline constexpr int kStopId = 1000000;
 inline constexpr char kStopToken[] = "<|im_end|>";
+
+// The logprob FakeEngine reports for each token: 5 - ln(e^5 + 99) over its
+// 100-token vocab.
+inline double FakeLogprob() {
+  return 5.0 - std::log(std::exp(5.0) + 99.0);
+}
 
 // Replies with `pieces` (one token each), then the stop token unless
 // `stop_at_end` is false. Each token takes `token_delay`.
@@ -67,6 +74,8 @@ public:
       std::lock_guard lock(mutex_);
       last_ = request;
       last_.cancel = nullptr;
+      last_.sampling.observer = nullptr;
+      history_.push_back(last_);
       for (std::size_t i = 0; i < pieces_.size(); ++i) {
         ids.push_back(static_cast<int>(i));
       }
@@ -90,6 +99,13 @@ public:
       }
       if (delay.count() > 0) {
         std::this_thread::sleep_for(delay);
+      }
+      // A real engine's Sampler reports each pick with its logits; here the
+      // picked token leads by 5 nats over a flat rest (FakeLogprob).
+      if (request.sampling.observer != nullptr && id != kStopId) {
+        std::vector<float> logits(static_cast<std::size_t>(info_.vocab), 0.0f);
+        logits[static_cast<std::size_t>(id)] = 5.0f;
+        request.sampling.observer->Sampled(logits.data(), info_.vocab, id);
       }
       result.tokens.push_back(id);
       if (!on_token(id)) {
@@ -122,6 +138,10 @@ public:
     std::lock_guard lock(mutex_);
     return last_result_;
   }
+  std::vector<GenerateRequest> history() const {
+    std::lock_guard lock(mutex_);
+    return history_;
+  }
   bool running() const { return running_; }
   int generations() const { return generations_; }
 
@@ -133,6 +153,7 @@ private:
   bool stop_at_end_ = true;
   std::chrono::milliseconds delay_{};
   GenerateRequest last_;
+  std::vector<GenerateRequest> history_;
   GenerateResult last_result_;
   std::atomic<bool> running_{false};
   std::atomic<int> generations_{0};
