@@ -116,8 +116,8 @@ q4nx::Segment SegmentOf(const gguf::TensorInfo& t) {
 
 // The weights NpuDecoder multiplies (the same q4nx packing), row-major fp32.
 std::vector<float> Q4nxWeights(const std::vector<q4nx::Segment>& segments,
-                               std::size_t dim) {
-  const auto packed = q4nx::PackRows(segments, dim);
+                               std::size_t dim, q4nx::Fit fit) {
+  const auto packed = q4nx::PackRows(segments, dim, fit);
   auto w = q4nx::Unpack(packed);
   w.resize(packed.rows * dim);
   return w;
@@ -467,7 +467,7 @@ struct NpuPrefill::Impl {
     };
     auto gemm = [&](const std::vector<q4nx::Segment>& segments,
                     std::size_t dim) {
-      const auto w = Q4nxWeights(segments, dim);
+      const auto w = Q4nxWeights(segments, dim, kQ4nxFit);
       std::size_t rows = 0;
       for (const auto& s : segments) {
         rows += s.rows;
@@ -543,8 +543,9 @@ struct NpuPrefill::Impl {
       const std::string p = "blk." + std::to_string(cfg.layers) + ".";
       mtp = MakeLayer(file, cfg.layers, false);
       const auto& eh = file.Tensor(p + "nextn.eh_proj.weight");
-      const auto w = Q4nxWeights({SegmentOf(eh)},
-                                 static_cast<std::size_t>(eh.RowElements()));
+      const auto w =
+          Q4nxWeights({SegmentOf(eh)},
+                      static_cast<std::size_t>(eh.RowElements()), kQ4nxFit);
       eh_proj = std::make_unique<Bfp16Gemm>(
           runtime, w.data(), static_cast<std::size_t>(eh.Rows()),
           static_cast<std::size_t>(eh.RowElements()));

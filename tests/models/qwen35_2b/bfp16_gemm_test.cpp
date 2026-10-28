@@ -81,7 +81,8 @@ int Check(npu::GemmRuntime& rt, const Shape& s, std::mt19937& rng) {
   for (auto& v : w) {
     v = weight(rng);
   }
-  const auto packed = q4nx::PackFloat(w.data(), s.rows, s.dim);
+  const auto packed =
+      q4nx::PackFloat(w.data(), s.rows, s.dim, q4nx::Fit::kMinMax);
   auto q = q4nx::Unpack(packed);
   q.resize(s.rows * s.dim);  // drop the padding rows
   npu::Bfp16Gemm gemm(rt, q.data(), s.rows, s.dim);

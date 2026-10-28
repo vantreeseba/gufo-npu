@@ -46,13 +46,25 @@ struct Matrix {
 
 std::size_t PaddedRows(std::size_t rows);
 
+// How requantized weights get their 4-bit values (Q4_K always keeps its
+// codes). Each model names its fit; the measurements behind each choice are
+// in that model's EXPERIMENTS.md.
+enum class Fit {
+  // Per 32 in-features the group's minimum and range, the minimum rounded
+  // down onto dmin's grid and the step up onto d's, so every weight is within
+  // half a step.
+  kMinMax,
+  // Per 32 in-features the step and minimum with the lowest error, weighted
+  // towards larger weights (llama.cpp's Q4_K fit, make_qkx3_quants; the
+  // extremes may clip), rounded onto the block's grids.
+  kSearch,
+};
+
 // Packs a GGUF weight of `rows` x `dim` (row-major, ggml block types).
-// Q4_K keeps its codes; every other type is dequantized and requantized: per
-// 32 in-features the step and minimum with the lowest error (weighted towards
-// larger weights, as llama.cpp's Q4_K quantizer does; the extremes may clip),
-// rounded onto the block's d and dmin grids. Padding rows are zero.
+// Q4_K keeps its codes; every other type is dequantized and requantized with
+// `fit`. Padding rows are zero.
 Matrix Pack(gguf::GgmlType type, const std::uint8_t* data, std::size_t rows,
-            std::size_t dim);
+            std::size_t dim, Fit fit);
 // One GGUF weight in a fused matrix.
 struct Segment {
   gguf::GgmlType type;
@@ -63,7 +75,7 @@ struct Segment {
 // so projections that share an input run as one GEMV. Exact when every
 // segment is Q4_K.
 // `order`, when given, picks the stacked row for each packed row.
-Matrix PackRows(const std::vector<Segment>& segments, std::size_t dim,
+Matrix PackRows(const std::vector<Segment>& segments, std::size_t dim, Fit fit,
                 const std::vector<std::size_t>& order = {});
 
 // The packed-row order for a [gate (ffn rows) | up (ffn rows)] stack that the
@@ -72,7 +84,8 @@ Matrix PackRows(const std::vector<Segment>& segments, std::size_t dim,
 // then silu(gate) * up in gate-row order.
 std::vector<std::size_t> SwiGluOrder(std::size_t ffn);
 // Requantizes fp32 weights (row-major `rows` x `dim`).
-Matrix PackFloat(const float* weights, std::size_t rows, std::size_t dim);
+Matrix PackFloat(const float* weights, std::size_t rows, std::size_t dim,
+                 Fit fit);
 
 // The weights the NPU computes with, row-major padded_rows x dim.
 std::vector<float> Unpack(const Matrix& matrix);

@@ -4,6 +4,7 @@
 #include <string>
 
 #include "core/gguf.hpp"
+#include "core/q4nx.hpp"
 
 // Shape of a Qwen3.5 / Qwen3.6 text model, read from GGUF arch `qwen35`
 // (dense) or `qwen35moe`.
@@ -59,6 +60,14 @@ struct Config {
 
 // Throws std::runtime_error when required keys are missing or inconsistent.
 Config ReadConfig(const gguf::File& file);
+
+// The q4nx fit this package packs a model's requantized weights with: the
+// search fit for Qwen3.6-35B-A3B (the MoE), min/max for Qwen3.5-2B (the dense
+// model), where the search fit lowers KL but not top-1 on the matrices the NPU
+// runs (qwen3.5-2b/EXPERIMENTS.md, qwen3.6-35b-a3b/EXPERIMENTS.md).
+inline q4nx::Fit Q4nxFit(const Config& c) {
+  return c.IsMoe() ? q4nx::Fit::kSearch : q4nx::Fit::kMinMax;
+}
 
 // True when the GGUF declares MTP layers and holds the first one's nextn
 // tensors (only that one is used). Without them the main model still loads.

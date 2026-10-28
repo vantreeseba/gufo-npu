@@ -48,7 +48,8 @@ int CheckQ4KExact() {
   constexpr std::size_t kRows = 40;  // not a multiple of the 1024-row round
   constexpr std::size_t kDim = 512;
   const auto data = RandomQ4K(kRows, kDim, rng);
-  const auto packed = q4nx::Pack(GgmlType::kQ4_K, data.data(), kRows, kDim);
+  const auto packed =
+      q4nx::Pack(GgmlType::kQ4_K, data.data(), kRows, kDim, q4nx::Fit::kMinMax);
   if (!packed.exact || packed.padded_rows != q4nx::kOutPerRound) {
     return Fail("Q4_K pack: exact flag or padding");
   }
@@ -93,7 +94,12 @@ int CheckQ4KExact() {
   return 0;
 }
 
-int CheckRequant() {
+// Requantized N(0, 0.02) weights: every weight within half a step of a
+// min/max fit for kMinMax, within a whole step for kSearch (which may clip
+// a group's extremes for a lower error overall), and the relative RMS error
+// below `max_rel_rms`.
+int CheckRequant(q4nx::Fit fit, const char* name, float steps,
+                 double max_rel_rms) {
   std::mt19937 rng(11);
   std::normal_distribution<float> normal(0.0f, 0.02f);
   constexpr std::size_t kRows = 1024 + 96;
@@ -102,7 +108,7 @@ int CheckRequant() {
   for (auto& v : w) {
     v = normal(rng);
   }
-  const auto packed = q4nx::PackFloat(w.data(), kRows, kDim);
+  const auto packed = q4nx::PackFloat(w.data(), kRows, kDim, fit);
   if (packed.exact || packed.padded_rows != 2 * q4nx::kOutPerRound) {
     return Fail("requant: exact flag or padding");
   }
@@ -124,10 +130,9 @@ int CheckRequant() {
                                   src + (g + 1) * q4nx::kGroup);
         max_abs_min = std::fmax(max_abs_min, std::fabs(lo[g]));
       }
-      // A min/max fit would put every weight within half of its group's step,
-      // (hi - lo + dmin) / 15 rounded up by at most d. The packer trades the
-      // extremes for a lower error overall (it may clip a weight at either
-      // end), but no weight may be off by more than that whole step.
+      // A min/max fit's step: the group's minimum sits up to dmin below its
+      // own, so it needs (hi - lo + dmin) / 15, which its uint8 sub-scale
+      // rounds up by at most d.
       const float dmin = max_abs_min / 127.0f * kUp;
       float max_need = 0;
       for (std::size_t g = 0; g < kGroups; ++g) {
@@ -136,13 +141,14 @@ int CheckRequant() {
       const float d = max_need / 255.0f * kUp;
       for (std::size_t g = 0; g < kGroups; ++g) {
         const float bound =
-            ((hi[g] - lo[g] + dmin) / 15.0f + d) * 1.0001f + 1e-9f;
+            steps * ((hi[g] - lo[g] + dmin) / 15.0f + d) * 1.0001f + 1e-9f;
         for (std::size_t l = 0; l < q4nx::kGroup; ++l) {
           const std::size_t i =
               r * kDim + kb * q4nx::kKTile + g * q4nx::kGroup + l;
           const double e = u[i] - w[i];
           if (std::fabs(e) > bound) {
-            std::fprintf(stderr, "FAIL: requant [%zu]: %g vs %g (bound %g)\n",
+            std::fprintf(stderr,
+                         "FAIL: requant %s [%zu]: %g vs %g (bound %g)\n", name,
                          i, u[i], w[i], bound);
             return 1;
           }
@@ -152,15 +158,13 @@ int CheckRequant() {
       }
     }
   }
-  // The min/max fit gave 0.0787 on these weights.
-  constexpr double kMaxRelRms = 0.074;
   const double rel_rms = std::sqrt(err2 / ref2);
-  if (rel_rms > kMaxRelRms) {
-    std::fprintf(stderr, "FAIL: requant rel rms %.4f > %.4f\n", rel_rms,
-                 kMaxRelRms);
+  if (rel_rms > max_rel_rms) {
+    std::fprintf(stderr, "FAIL: requant %s rel rms %.4f > %.4f\n", name,
+                 rel_rms, max_rel_rms);
     return 1;
   }
-  std::printf("ok: requant within a step, rel rms %.4f (min/max fit 0.0787)\n",
+  std::printf("ok: requant %s within %.1f step, rel rms %.4f\n", name, steps,
               rel_rms);
   return 0;
 }
@@ -170,7 +174,8 @@ int CheckReference() {
   constexpr std::size_t kRows = 64;
   constexpr std::size_t kDim = 256;
   const auto data = RandomQ4K(kRows, kDim, rng);
-  const auto packed = q4nx::Pack(GgmlType::kQ4_K, data.data(), kRows, kDim);
+  const auto packed =
+      q4nx::Pack(GgmlType::kQ4_K, data.data(), kRows, kDim, q4nx::Fit::kMinMax);
   const auto u = q4nx::Unpack(packed);
   std::vector<float> x(kDim);
   for (std::size_t k = 0; k < kDim; ++k) {
@@ -212,9 +217,12 @@ int CheckPackRows() {
   }
   const auto* b_bytes = reinterpret_cast<const std::uint8_t*>(b.data());
   const auto fused = q4nx::PackRows(
-      {{GgmlType::kQ4_K, a.data(), 40}, {GgmlType::kBF16, b_bytes, 24}}, kDim);
-  const auto alone_a = q4nx::Pack(GgmlType::kQ4_K, a.data(), 40, kDim);
-  const auto alone_b = q4nx::Pack(GgmlType::kBF16, b_bytes, 24, kDim);
+      {{GgmlType::kQ4_K, a.data(), 40}, {GgmlType::kBF16, b_bytes, 24}}, kDim,
+      q4nx::Fit::kMinMax);
+  const auto alone_a =
+      q4nx::Pack(GgmlType::kQ4_K, a.data(), 40, kDim, q4nx::Fit::kMinMax);
+  const auto alone_b =
+      q4nx::Pack(GgmlType::kBF16, b_bytes, 24, kDim, q4nx::Fit::kMinMax);
   if (fused.rows != 64 || fused.exact) {
     return Fail("PackRows: rows or exact flag");
   }
@@ -236,7 +244,7 @@ int CheckPackRows() {
   }
   const auto ordered = q4nx::PackRows(
       {{GgmlType::kQ4_K, a.data(), 40}, {GgmlType::kBF16, b_bytes, 24}}, kDim,
-      [] {
+      q4nx::Fit::kMinMax, [] {
         std::vector<std::size_t> o(64);
         for (std::size_t i = 0; i < 64; ++i) {
           o[i] = 63 - i;
@@ -280,7 +288,8 @@ int CheckBf16() {
 int main() {
   int failures = CheckBf16();
   failures += CheckQ4KExact();
-  failures += CheckRequant();
+  failures += CheckRequant(q4nx::Fit::kMinMax, "min/max", 0.5f, 0.080);
+  failures += CheckRequant(q4nx::Fit::kSearch, "search", 1.0f, 0.074);
   failures += CheckReference();
   failures += CheckPackRows();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

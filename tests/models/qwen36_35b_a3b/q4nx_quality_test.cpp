@@ -562,8 +562,10 @@ QMat Build(const RowSource& src, const Method& m, const std::vector<float>* imp,
   return out;
 }
 
-// The library's own packer (q4nx::PackRows), read back from its blocks.
-QMat BuildLibrary(const std::vector<Part>& parts, std::size_t dim) {
+// The library's own packer (q4nx::PackRows with the model's fit,
+// qwen35::Q4nxFit), read back from its blocks.
+QMat BuildLibrary(const std::vector<Part>& parts, std::size_t dim,
+                  gufo_npu::q4nx::Fit fit) {
   namespace q4nx = gufo_npu::q4nx;
   std::vector<q4nx::Segment> segments;
   for (const auto& p : parts) {
@@ -571,7 +573,7 @@ QMat BuildLibrary(const std::vector<Part>& parts, std::size_t dim) {
                         p.t->data + p.first * quant::RowBytes(p.t->type, dim),
                         p.rows});
   }
-  const q4nx::Matrix packed = q4nx::PackRows(segments, dim);
+  const q4nx::Matrix packed = q4nx::PackRows(segments, dim, fit);
   QMat out;
   out.rows = packed.rows;
   out.dim = dim;
@@ -1017,7 +1019,7 @@ QMat BuildOne(BuildContext& bc, const RowSource& src, Key key, bool awq_ok,
     }
   }
   if (bc.m.library) {
-    return BuildLibrary(src.parts, src.dim);
+    return BuildLibrary(src.parts, src.dim, q35::Q4nxFit(bc.c));
   }
   return Build(src, bc.m, imp, nullptr);
 }

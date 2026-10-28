@@ -295,13 +295,58 @@ void FitGroup(const float* x, const float* w, float* step_out, float* min_out) {
   }
 }
 
-// Row m of a block from its kKTile fp32 weights. Each group's step and
-// minimum come from FitGroup, weighting each weight by av + |w| (llama.cpp's
-// Q4_K weighting: larger weights count more); d and dmin are set from the
-// largest of them, and each group then takes the sub-scale and sub-minimum
-// within one grid step of its fit, and the nearest codes, with the lowest
-// weighted error.
-void PackRowBlock(const float* w, std::uint8_t* block, std::size_t m) {
+// Fit::kMinMax: row m of a block from its kKTile fp32 weights. Per group a
+// min/max fit, with the minimum rounded down onto dmin's grid (int8) and the
+// step rounded up onto d's (uint8), so every weight is within the group's 16
+// levels.
+void PackRowBlockMinMax(const float* w, std::uint8_t* block, std::size_t m) {
+  float lo[kGroups];
+  float hi[kGroups];
+  float max_abs_min = 0;
+  for (std::size_t g = 0; g < kGroups; ++g) {
+    const auto [lo_it, hi_it] =
+        std::minmax_element(w + g * kGroup, w + (g + 1) * kGroup);
+    lo[g] = *lo_it;
+    hi[g] = *hi_it;
+    max_abs_min = std::max(max_abs_min, std::abs(lo[g]));
+  }
+  const std::uint16_t dmin_bits = Bf16AtLeast(max_abs_min / 127.0f);
+  const float dmin = quant::Bf16ToFloat(dmin_bits);
+  std::int8_t mn[kGroups];
+  float need[kGroups];  // the step each group needs from its minimum
+  float max_need = 0;
+  for (std::size_t g = 0; g < kGroups; ++g) {
+    const float q = dmin > 0 ? std::floor(lo[g] / dmin) : 0.0f;
+    mn[g] = static_cast<std::int8_t>(std::clamp(q, -127.0f, 127.0f));
+    need[g] = (hi[g] - dmin * static_cast<float>(mn[g])) / 15.0f;
+    max_need = std::max(max_need, need[g]);
+  }
+  const std::uint16_t d_bits = Bf16AtLeast(max_need / 255.0f);
+  const float d = quant::Bf16ToFloat(d_bits);
+  SetSuper(block, m, d_bits, dmin_bits);
+  for (std::size_t g = 0; g < kGroups; ++g) {
+    const float sc = d > 0 ? std::ceil(need[g] / d) : 0.0f;
+    SetSub(block, m, g, static_cast<std::uint8_t>(std::clamp(sc, 0.0f, 255.0f)),
+           mn[g]);
+    float step;
+    float min;
+    Params(block, m, g, &step, &min);
+    for (std::size_t l = 0; l < kGroup; ++l) {
+      float code =
+          step > 0 ? std::nearbyint((w[g * kGroup + l] - min) / step) : 0.0f;
+      code = std::clamp(code, 0.0f, 15.0f);
+      SetCode(block, m, g * kGroup + l, static_cast<std::uint8_t>(code));
+    }
+  }
+}
+
+// Fit::kSearch: row m of a block from its kKTile fp32 weights. Each group's
+// step and minimum come from FitGroup, weighting each weight by av + |w|
+// (llama.cpp's Q4_K weighting: larger weights count more); d and dmin are
+// set from the largest of them, and each group then takes the sub-scale and
+// sub-minimum within one grid step of its fit, and the nearest codes, with
+// the lowest weighted error.
+void PackRowBlockSearch(const float* w, std::uint8_t* block, std::size_t m) {
   float sum_x2 = 0;
   for (std::size_t k = 0; k < kKTile; ++k) {
     sum_x2 += w[k] * w[k];
@@ -364,7 +409,9 @@ void PackRowBlock(const float* w, std::uint8_t* block, std::size_t m) {
 // returns nullptr. Tiles run in parallel; the rows of a tile share code bytes,
 // so one thread packs a whole tile.
 template<typename RowFn>
-void PackTiles(Matrix& out, RowFn&& row_fn) {
+void PackTiles(Matrix& out, Fit fit, RowFn&& row_fn) {
+  const auto pack_row_block =
+      fit == Fit::kSearch ? PackRowBlockSearch : PackRowBlockMinMax;
   const std::size_t tiles = (out.rows + kMTile - 1) / kMTile;
   ParallelFor(tiles, [&](std::size_t begin, std::size_t end) {
     std::vector<float> row(out.dim);
@@ -381,7 +428,7 @@ void PackTiles(Matrix& out, RowFn&& row_fn) {
             PackQ4KSuper(q4k + kb * kQ4KBytes, block, m);
             continue;
           }
-          PackRowBlock(row.data() + kb * kKTile, block, m);
+          pack_row_block(row.data() + kb * kKTile, block, m);
         }
       }
     }
@@ -394,7 +441,7 @@ std::size_t PaddedRows(std::size_t rows) {
   return (rows + kOutPerRound - 1) / kOutPerRound * kOutPerRound;
 }
 
-Matrix PackRows(const std::vector<Segment>& segments, std::size_t dim,
+Matrix PackRows(const std::vector<Segment>& segments, std::size_t dim, Fit fit,
                 const std::vector<std::size_t>& order) {
   std::size_t rows = 0;
   bool exact = true;
@@ -414,18 +461,20 @@ Matrix PackRows(const std::vector<Segment>& segments, std::size_t dim,
   if (!order.empty() && order.size() != rows) {
     throw std::invalid_argument("q4nx: row order does not cover every row");
   }
-  PackTiles(out, [&](std::size_t packed, float* row) -> const std::uint8_t* {
-    const std::size_t r = order.empty() ? packed : order[packed];
-    const auto it = std::upper_bound(starts.begin(), starts.end(), r) - 1;
-    const auto& seg = segments[static_cast<std::size_t>(it - starts.begin())];
-    const std::uint8_t* src =
-        seg.data + (r - *it) * quant::RowBytes(seg.type, dim);
-    if (seg.type == gguf::GgmlType::kQ4_K) {
-      return src;
-    }
-    quant::Dequantize(seg.type, src, row, dim);
-    return nullptr;
-  });
+  PackTiles(
+      out, fit, [&](std::size_t packed, float* row) -> const std::uint8_t* {
+        const std::size_t r = order.empty() ? packed : order[packed];
+        const auto it = std::upper_bound(starts.begin(), starts.end(), r) - 1;
+        const auto& seg =
+            segments[static_cast<std::size_t>(it - starts.begin())];
+        const std::uint8_t* src =
+            seg.data + (r - *it) * quant::RowBytes(seg.type, dim);
+        if (seg.type == gguf::GgmlType::kQ4_K) {
+          return src;
+        }
+        quant::Dequantize(seg.type, src, row, dim);
+        return nullptr;
+      });
   return out;
 }
 
@@ -444,13 +493,14 @@ std::vector<std::size_t> SwiGluOrder(std::size_t ffn) {
 }
 
 Matrix Pack(gguf::GgmlType type, const std::uint8_t* data, std::size_t rows,
-            std::size_t dim) {
-  return PackRows({{type, data, rows}}, dim);
+            std::size_t dim, Fit fit) {
+  return PackRows({{type, data, rows}}, dim, fit);
 }
 
-Matrix PackFloat(const float* weights, std::size_t rows, std::size_t dim) {
+Matrix PackFloat(const float* weights, std::size_t rows, std::size_t dim,
+                 Fit fit) {
   Matrix out = Allocate(rows, dim);
-  PackTiles(out, [&](std::size_t r, float* row) -> const std::uint8_t* {
+  PackTiles(out, fit, [&](std::size_t r, float* row) -> const std::uint8_t* {
     std::memcpy(row, weights + r * dim, dim * sizeof(float));
     return nullptr;
   });

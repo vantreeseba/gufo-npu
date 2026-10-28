@@ -72,8 +72,8 @@ q4nx::Segment SegmentOf(const gguf::TensorInfo& t) {
   return {t.type, t.data, static_cast<std::size_t>(t.Rows())};
 }
 
-q4nx::Matrix PackOne(const gguf::TensorInfo& t) {
-  return q4nx::Pack(t.type, t.data, t.Rows(), t.RowElements());
+q4nx::Matrix PackOne(const gguf::TensorInfo& t, q4nx::Fit fit) {
+  return q4nx::Pack(t.type, t.data, t.Rows(), t.RowElements(), fit);
 }
 
 // A GEMV input region: token t's slot at t * kGemvSlot fp32 ([H | D] for a
@@ -141,6 +141,7 @@ struct NpuDecoder::Impl {
   std::vector<Gathers> gathers[kMaxTokens];
 
   Config config;
+  q4nx::Fit fit;  // Q4nxFit(config)
   Mixer mixer;
   npu::GemvRuntime runtime;
   // MoE routing: per token the router logits (experts, then the shared
@@ -191,19 +192,19 @@ struct NpuDecoder::Impl {
       in_w = q4nx::PackRows(
           {SegmentOf(t("attn_q.weight")), SegmentOf(t("attn_k.weight")),
            SegmentOf(t("attn_v.weight"))},
-          hidden);
+          hidden, fit);
       out_t = &t("attn_output.weight");
     } else {
       in_w = q4nx::PackRows(
           {SegmentOf(t("attn_qkv.weight")), SegmentOf(t("attn_gate.weight"))},
-          hidden);
+          hidden, fit);
       b.alpha = ToFloats(t("ssm_alpha.weight"));
       b.beta = ToFloats(t("ssm_beta.weight"));
       out_t = &t("ssm_out.weight");
     }
     b.in = std::make_unique<Q4nxGemv>(runtime, in_w, Prologue::kResNorm,
                                       Epilogue::kStore);
-    b.out = std::make_unique<Q4nxGemv>(runtime, PackOne(*out_t),
+    b.out = std::make_unique<Q4nxGemv>(runtime, PackOne(*out_t, fit),
                                        Prologue::kPlain, Epilogue::kStore);
     std::size_t ffn_y_bytes = 0;
     if (c.IsMoe()) {
@@ -214,11 +215,11 @@ struct NpuDecoder::Impl {
           runtime,
           q4nx::PackRows(
               {SegmentOf(t("ffn_gate.weight")), SegmentOf(t("ffn_up.weight"))},
-              hidden, q4nx::SwiGluOrder(c.ffn)),
+              hidden, fit, q4nx::SwiGluOrder(c.ffn)),
           Prologue::kResNorm, Epilogue::kSwiGlu);
-      b.down =
-          std::make_unique<Q4nxGemv>(runtime, PackOne(t("ffn_down.weight")),
-                                     Prologue::kAct, Epilogue::kStore);
+      b.down = std::make_unique<Q4nxGemv>(runtime,
+                                          PackOne(t("ffn_down.weight"), fit),
+                                          Prologue::kAct, Epilogue::kStore);
       ffn_y_bytes = b.ffn->y_bytes();
     }
     b.in_x = std::make_unique<Buffer>(runtime, npu::kGemvInputBytes);
@@ -261,14 +262,14 @@ struct NpuDecoder::Impl {
     for (std::size_t e = 0; e < static_cast<std::size_t>(c.experts); ++e) {
       put(e,
           q4nx::PackRows({RowsOf(gate, e * ef, ef), RowsOf(up, e * ef, ef)},
-                         hidden, order),
-          q4nx::PackRows({RowsOf(down, e * hidden, hidden)}, ef));
+                         hidden, fit, order),
+          q4nx::PackRows({RowsOf(down, e * hidden, hidden)}, ef, fit));
     }
     put(static_cast<std::size_t>(c.experts),
         q4nx::PackRows({SegmentOf(t("ffn_gate_shexp.weight")),
                         SegmentOf(t("ffn_up_shexp.weight"))},
-                       hidden, order),
-        PackOne(t("ffn_down_shexp.weight")));
+                       hidden, fit, order),
+        PackOne(t("ffn_down_shexp.weight"), fit));
     b.arena->ToDevice();
     b.post_norm = ToFloats(t("post_attention_norm.weight"));
     b.router = ToFloats(t("ffn_gate_inp.weight"));
@@ -336,6 +337,7 @@ struct NpuDecoder::Impl {
 
   Impl(const gguf::File& file, const std::filesystem::path& kernel_dir)
       : config(CheckShapes(ReadConfig(file))),
+        fit(Q4nxFit(config)),
         mixer(file),
         // The gathers rewrite their instruction streams per call. Dense
         // models keep the ELF flow, ~2% faster on Qwen3.5-2B decode.
@@ -371,7 +373,7 @@ struct NpuDecoder::Impl {
     const auto& head =
         c.tied_embeddings ? *embed : file.Tensor("output.weight");
     lm = std::make_unique<Q4nxGemv>(
-        runtime, q4nx::Pack(head.type, head.data, head.Rows(), hidden),
+        runtime, q4nx::Pack(head.type, head.data, head.Rows(), hidden, fit),
         Prologue::kResNorm, Epilogue::kStore);
     lm_x = std::make_unique<Buffer>(runtime, npu::kGemvInputBytes);
     lm_y = std::make_unique<Buffer>(runtime, lm->y_bytes());
@@ -407,7 +409,7 @@ struct NpuDecoder::Impl {
       hnorm = ToFloats(file.Tensor(p + "nextn.hnorm.weight"));
       mtp = MakeBlock(file, c.layers);
       eh_proj = std::make_unique<Q4nxGemv>(
-          runtime, PackOne(file.Tensor(p + "nextn.eh_proj.weight")),
+          runtime, PackOne(file.Tensor(p + "nextn.eh_proj.weight"), fit),
           Prologue::kPlain, Epilogue::kStore);
       eh_x = std::make_unique<Buffer>(runtime, npu::kGemvInputBytes);
       draft_ids = DraftVocab(c.vocab);
@@ -421,7 +423,7 @@ struct NpuDecoder::Impl {
              1});
       }
       draft_lm = std::make_unique<Q4nxGemv>(
-          runtime, q4nx::PackRows(draft_rows, hidden), Prologue::kResNorm,
+          runtime, q4nx::PackRows(draft_rows, hidden, fit), Prologue::kResNorm,
           Epilogue::kStore);
       mtp_lm_x = std::make_unique<Buffer>(runtime, npu::kGemvInputBytes);
       mtp_lm_y = std::make_unique<Buffer>(runtime, draft_lm->y_bytes());
