@@ -128,6 +128,16 @@ the weights; the kernel can reclaim them) and the device buffers:
 (GB here are GiB.) The 35B's ~19.9 GiB is ~21.3 GB: its decoder's device
 buffers and the prefill's resident bfp16 matrices.
 
+## Memory between requests
+
+Prompt buffers are sized by each request's length, and glibc keeps freed
+large buffers in its heaps, so a long-running server's anonymous memory
+would grow with each new mix of lengths. Before the fix it reached 8.8 GB
+after a 30-minute 35B soak, and 3.3 GB after 5 minutes on the 2B. After each
+request, once the heaps hold more than 1 GiB unused, `malloc_trim` hands
+their free pages back (`ReleaseFreeMemory`). The same soaks then stay at
+1.25 GB (35B, 15 min) and 0.68 GB (2B). See docs/SERVING.md, "Measured".
+
 ## The CLI
 
 `gufo-npu generate` and `bench prefill` keep their own model selection: they

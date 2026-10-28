@@ -126,6 +126,61 @@ Errors use the OpenAI shape, `{"error": {"message", "type", "param",
   checkpoints go first, so `N` conversations can alternate without losing
   their history.
 
+## Measured (2026-10-28)
+
+On the box, warm, greedy with MTP unless noted, the server driven by the
+official `openai` Python client (3.40).
+
+**End to end, all three models:** 18/18 checks each. They cover:
+- `/health`, `/v1/models` and `/metrics`.
+- Chat, streaming and not: the stream equals the non-streamed reply.
+- Thinking on (`reasoning_content`) and off.
+- A tool call, streamed and not, then a tool result and the final answer.
+- Seeded sampling: the same seed repeats and another differs.
+- A stop string.
+- Hanging up mid-stream: counted as 499, and the next request is served in
+  0.2–0.5 s.
+- Queue full: 429.
+- A second turn reusing 929 of 993 prompt tokens.
+
+**Server overhead:** HTTP adds nothing measurable. The first token arrives in
+the same time as `gufo-npu generate`'s prompt phase, and decode runs at the
+same tok/s (median of 3 after a warm-up; `--prompt-cache 0`):
+
+| Model | Short prompt (24 tokens): TTFT, decode | ~1k prompt (932 tokens): TTFT, decode | In process, ~1k |
+|---|---|---|---|
+| Qwen3.5-2B | 0.093 s, 53.4 tok/s | 0.293 s, 55.4 tok/s | 0.29 s, 55.3 tok/s |
+| Qwen3.5-4B | 0.204 s, 27.6 tok/s | 0.661 s, 25.6 tok/s | 0.79 s*, 26.0 tok/s |
+| Qwen3.6-35B-A3B | 0.255 s, 26.6 tok/s | 1.088 s, 25.7 tok/s | 1.11 s, 25.5 tok/s |
+
+\* `generate`'s prompt time for the 4B also counts work after the first
+token.
+
+**Second turn of a chat** (~1k tokens of history), time to the first token:
+
+| Model | Restored from a checkpoint | Without one |
+|---|---|---|
+| Qwen3.5-2B | 0.10 s | 0.29 s |
+| Qwen3.5-4B | 0.22 s | 0.67 s |
+| Qwen3.6-35B-A3B | 0.31 s | 1.13 s |
+
+**Soak** (mixed load: 2–4-turn conversations with 0.1k–4k
+tokens of history, 70% streamed, 30% sampled, 10% of streams hung up):
+
+| Model | Run | Requests | Errors | TTFT on a cache hit / miss | Decode | Anonymous memory |
+|---|---|---|---|---|---|---|
+| Qwen3.6-35B-A3B | 30 min | 513 | 0 | 0.33–0.35 s / 1.5–2.4 s | 25.1–25.3 tok/s in every 10 min | 0.7 → 8.8 GB* |
+| Qwen3.6-35B-A3B | 15 min, with the fix | 235 | 0 | 0.41–0.43 s / 2.0–2.7 s | 24.6–25.0 tok/s | 0.7 → 1.25 GB (peak 1.55) |
+| Qwen3.5-4B | 5 min | 79 | 0 | 0.26 s / 1.6–1.7 s | 25.5 tok/s | 0.45 → 5.9 GB* |
+| Qwen3.5-2B | 5 min, with the fix | 163 | 0 | 0.15 s / 0.65–0.76 s | 50.5–52.5 tok/s | 0.33 → 0.68 GB (peak 0.75) |
+
+\* Before the fix: glibc kept the prompt buffers of every new mix of
+lengths in its heaps. The engine now hands free heap pages back between
+requests once more than 1 GiB is unused (`ReleaseFreeMemory` in
+`src/serve/engine.cpp`). On a fixed second-turn prompt this costs nothing
+(2B: 0.104 s against 0.103 s). The runs' cache-hit times differ with their
+conversations' history lengths.
+
 ## Not supported yet
 
 - More than one model per process, or switching models per request.
