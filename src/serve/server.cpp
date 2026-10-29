@@ -8,18 +8,21 @@
 #include <climits>
 #include <cstdint>
 #include <ctime>
+#include <iomanip>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "serve/engine_pool.hpp"
+#include "serve/logging.hpp"
 #include "serve/logprobs.hpp"
 #include "serve/metrics.hpp"
 #include "serve/openai.hpp"
@@ -56,9 +59,47 @@ std::string Dump(const json& j) {
   return j.dump(-1, ' ', false, json::error_handler_t::replace);
 }
 
+// The log line of the request this thread is serving (httplib runs a
+// request's routing, handler, streamed body and logger on one thread).
+struct RequestLog {
+  const httplib::Request* req = nullptr;
+  std::string id;
+  std::string details;
+  std::string outcome = "completed";
+};
+
+RequestLog& CurrentLog() {
+  thread_local RequestLog log;
+  return log;
+}
+
+void AddDetail(const std::string& detail) {
+  auto& log = CurrentLog();
+  if (!log.details.empty()) {
+    log.details += ' ';
+  }
+  log.details += detail;
+}
+
+// Polled endpoints log at DEBUG, everything else at INFO.
+LogLevel RequestLevel(const httplib::Request& req) {
+  return req.method == "GET" &&
+                 (req.path == "/health" || req.path == "/metrics")
+             ? LogLevel::kDebug
+             : LogLevel::kInfo;
+}
+
 void SendError(httplib::Response& res, const ApiError& error) {
   res.status = error.status;
   res.set_content(Dump(ErrorJson(error)), "application/json");
+  std::string detail = "error_type=" + error.type;
+  if (!error.code.empty()) {
+    detail += " error_code=" + error.code;
+  }
+  if (!error.param.empty()) {
+    detail += " param=" + error.param;
+  }
+  AddDetail(detail);
 }
 
 json ToolCall(const OutputPart& part) {
@@ -90,6 +131,10 @@ struct Job {
   std::string model;
   std::int64_t created = 0;
   Clock::time_point arrived;
+  // For the request's log line.
+  int queue_depth = 0;  // requests waiting when it was admitted
+  std::optional<Clock::time_point> acquired;     // the engine became ours
+  std::optional<Clock::time_point> first_token;  // its first generated token
 };
 
 struct Outcome {
@@ -132,9 +177,26 @@ struct Server::Impl {
     Routes();
   }
 
+  // Opens the log line of a request this thread now serves.
+  static void StartLog(const httplib::Request& req) {
+    static std::atomic<std::uint64_t> next{0};
+    auto& log = CurrentLog();
+    log = RequestLog{};
+    log.req = &req;
+    log.id = "r" + std::to_string(next.fetch_add(1) + 1);
+    const LogLevel level = RequestLevel(req);
+    if (Logger::Enabled(level)) {
+      Logger::Log(level, "http",
+                  "request=" + log.id + " event=received method=" + req.method +
+                      " path=" + req.path +
+                      " body_bytes=" + std::to_string(req.body.size()));
+    }
+  }
+
   void Routes() {
     http.set_pre_routing_handler(
         [this](const httplib::Request& req, httplib::Response& res) {
+          StartLog(req);
           if (options.api_key.empty() || req.path.rfind("/v1/", 0) != 0 ||
               req.get_header_value("Authorization") ==
                   "Bearer " + options.api_key) {
@@ -143,6 +205,19 @@ struct Server::Impl {
           SendError(res, ApiError(401, "invalid_request_error",
                                   "invalid_api_key", "invalid API key"));
           return httplib::Server::HandlerResponse::Handled;
+        });
+    http.set_logger(
+        [](const httplib::Request& req, const httplib::Response& res) {
+          auto& log = CurrentLog();
+          if (log.req != &req) {  // refused before routing (malformed)
+            StartLog(req);
+          }
+          Logger::LogRequest(log.id, req.method, req.path, res.status,
+                             std::chrono::duration<double, std::milli>(
+                                 Clock::now() - req.start_time_)
+                                 .count(),
+                             log.details, log.outcome, RequestLevel(req));
+          log.req = nullptr;
         });
     http.set_error_handler([](const httplib::Request&, httplib::Response& res) {
       if (res.body.empty()) {
@@ -316,6 +391,7 @@ struct Server::Impl {
 
   // Admits `job` to the queue; false after sending 429.
   bool Admit(Job& job, httplib::Response& res, const char* id_prefix) {
+    job.queue_depth = scheduler.waiting();
     job.ticket = scheduler.Enter();
     if (!job.ticket) {
       metrics.Request(429);
@@ -429,6 +505,7 @@ struct Server::Impl {
       job.ticket.reset();
       return false;
     }
+    job.acquired = Clock::now();
     return true;
   }
 
@@ -464,6 +541,7 @@ struct Server::Impl {
       out.result = engine.Generate(gen, [&](int id) {
         if (first) {
           first = false;
+          job.first_token = Clock::now();
           metrics.TimeToFirstToken(Since(job.arrived));
         }
         if (hooks.gone()) {
@@ -498,6 +576,91 @@ struct Server::Impl {
       out.finish = "tool_calls";
     }
     return out;
+  }
+
+  // The request's generation keys for its log line, as gufo names them:
+  // tokens, finish, cache, queue, time to first token, prefill and decode
+  // rates, and MTP drafts, summed over the request's choices.
+  void LogGeneration(const Job& job, const std::vector<Outcome>& outs) const {
+    const bool chat = job.completion.prompts() == 0;
+    int prompt = 0;
+    for (const auto& gen : job.gens) {
+      prompt += static_cast<int>(gen.prompt.size());
+    }
+    int prefill = 0;
+    int cached = 0;
+    int generated = 0;
+    int steps = 0;
+    int accepted = 0;
+    double prefill_seconds = 0;
+    double decode_seconds = 0;
+    std::string finish;
+    for (const auto& out : outs) {
+      const auto& r = out.result;
+      prefill += std::max(0, r.prompt_tokens - r.cached_prompt_tokens);
+      cached += r.cached_prompt_tokens;
+      generated += static_cast<int>(r.tokens.size());
+      steps += r.steps;
+      accepted += r.accepted;
+      prefill_seconds += r.prefill_seconds;
+      decode_seconds += r.decode_seconds;
+      finish += finish.empty() ? "" : ",";
+      finish += !out.error.empty() ? "error"
+                : out.client_gone  ? "cancelled"
+                                   : out.finish;
+    }
+    const auto ms = [](Clock::time_point from, Clock::time_point to) {
+      return std::chrono::duration<double, std::milli>(to - from).count();
+    };
+    const bool draft = options.draft && job.engine->info().can_draft;
+    std::ostringstream o;
+    o << std::fixed << std::setprecision(1) << "model=" << job.model
+      << " kind=" << (chat ? "chat" : "completion") << " stream="
+      << ((chat ? job.chat.stream : job.completion.stream) ? 1 : 0)
+      << " n=" << (chat ? job.chat.n : job.completion.n)
+      << " prompt_tokens=" << prompt << " prefill_tokens=" << prefill
+      << " generated_tokens=" << generated
+      << " finish=" << (finish.empty() ? "none" : finish)
+      << " cache=" << (cached > 0 ? "hit" : "miss")
+      << " cached_tokens=" << cached << " queue_depth=" << job.queue_depth
+      << " queue_ms=" << ms(job.arrived, job.acquired.value_or(Clock::now()))
+      << " ttft_ms="
+      << (job.first_token ? ms(job.arrived, *job.first_token) : 0.0)
+      << " prefill_tps="
+      << (prefill_seconds > 0 ? prefill / prefill_seconds : 0.0)
+      << " decode_tps="
+      << (decode_seconds > 0 ? generated / decode_seconds : 0.0)
+      << " draft=" << (draft ? "mtp" : "none");
+    if (draft) {
+      o << " decode_steps=" << steps << " draft_accepted=" << accepted
+        << " acceptance_pct=" << (steps > 0 ? 100.0 * accepted / steps : 0.0);
+    }
+    if (chat) {
+      if (job.chat.format == ChatRequest::Format::kJsonSchema) {
+        o << " response_format=json_schema";
+      } else if (job.chat.format == ChatRequest::Format::kJsonObject) {
+        o << " response_format=json_object";
+      }
+      if (!job.chat.prompt.tools.empty()) {
+        o << " tools=" << job.chat.prompt.tools.size();
+      }
+      if (job.chat.tool_required) {
+        o << " tool_choice="
+          << (job.chat.tool_name.empty() ? "required" : "function");
+      }
+      if (job.chat.logprobs) {
+        o << " logprobs=" << job.chat.top_logprobs;
+      }
+    } else if (job.completion.logprobs) {
+      o << " logprobs=" << *job.completion.logprobs;
+    }
+    for (const auto& out : outs) {
+      if (!out.error.empty()) {
+        o << " reason=" << out.error;
+        break;
+      }
+    }
+    AddDetail(o.str());
   }
 
   // Usage over all choices: each prompt counted once, completions summed.
@@ -643,11 +806,14 @@ struct Server::Impl {
       outs.push_back(std::move(out));
     }
     job.ticket.reset();
+    LogGeneration(job, outs);
     if (!error.empty()) {
       metrics.Request(500);
+      CurrentLog().outcome = "stream_error";
       write(Dump(ErrorJson(ApiError(500, "server_error", "", error))));
     } else if (client_gone) {
       metrics.Request(kClientClosed);
+      CurrentLog().outcome = "disconnected";
     } else {
       if (job.chat.include_usage) {
         write(Dump({{"id", job.id},
@@ -726,6 +892,7 @@ struct Server::Impl {
     }
     job.ticket.reset();
     metrics.RequestDuration(Since(job.arrived));
+    LogGeneration(job, outs);
     if (!error.empty()) {
       metrics.Request(500);
       SendError(res, ApiError(500, "server_error", "", error));
@@ -733,6 +900,7 @@ struct Server::Impl {
     }
     if (client_gone) {
       metrics.Request(kClientClosed);
+      CurrentLog().outcome = "disconnected";
       res.status = kClientClosed;
       return;
     }
@@ -937,9 +1105,11 @@ struct Server::Impl {
     }
     job.ticket.reset();
     metrics.RequestDuration(Since(job.arrived));
+    LogGeneration(job, outs);
     if (!error.empty()) {
       metrics.Request(500);
       if (sink != nullptr) {
+        CurrentLog().outcome = "stream_error";
         write(Dump(ErrorJson(ApiError(500, "server_error", "", error))));
       } else {
         SendError(*res, ApiError(500, "server_error", "", error));
@@ -948,6 +1118,7 @@ struct Server::Impl {
     }
     if (client_gone) {
       metrics.Request(kClientClosed);
+      CurrentLog().outcome = "disconnected";
       if (res != nullptr) {
         res->status = kClientClosed;
       }

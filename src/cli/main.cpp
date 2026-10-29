@@ -40,6 +40,7 @@
 #include "npu/gemv.hpp"
 #include "serve/chat_format.hpp"
 #include "serve/engine.hpp"
+#include "serve/logging.hpp"
 #include "serve/server.hpp"
 
 namespace {
@@ -86,7 +87,7 @@ constexpr char kUsage[] =
     "        [--device npu|cpu] [--kernels DIR] [--model-id NAME]\n"
     "        [--max-queue N] [--api-key KEY] [--context-length N]\n"
     "        [--prompt-cache N] [--preload ID] [--unload-after SECONDS]\n"
-    "        [--draft mtp|none]\n"
+    "        [--draft mtp|none] [--log-level error|warn|info|debug]\n"
     "                           OpenAI-compatible server (docs/SERVING.md),\n"
     "                           by default on 127.0.0.1:8080; --prompt-cache\n"
     "                           keeps N checkpoints of earlier prompts for\n"
@@ -94,7 +95,10 @@ constexpr char kUsage[] =
     "                           --model: requests pick one by id, one loaded\n"
     "                           at a time (--preload: the first, default the\n"
     "                           first --model); --unload-after frees an idle\n"
-    "                           model's memory (default 0: never)\n"
+    "                           model's memory (default 0: never);\n"
+    "                           --log-level sets what goes to stderr\n"
+    "                           (default info; debug adds /health and\n"
+    "                           /metrics polls)\n"
     "  version                  print the version\n";
 
 void PrintChecks(const std::vector<Check>& checks) {
@@ -1012,10 +1016,18 @@ int Serve(const std::vector<std::string_view>& args) {
   serve::EnginePoolOptions pool_options;
   std::vector<std::string> model_paths;
   std::optional<std::string> kernels;
+  serve::LogLevel log_level = serve::LogLevel::kInfo;
   for (std::size_t i = 0; i < args.size(); ++i) {
     const bool has_value = i + 1 < args.size();
     if (args[i] == "--model" && has_value) {
       model_paths.emplace_back(args[++i]);
+    } else if (args[i] == "--log-level" && has_value) {
+      const auto level = serve::LogLevelFromName(args[++i]);
+      if (!level) {
+        std::cerr << kUsage;
+        return 2;
+      }
+      log_level = *level;
     } else if (args[i] == "--preload" && has_value) {
       pool_options.preload = std::string(args[++i]);
     } else if (args[i] == "--unload-after" && has_value) {
@@ -1065,6 +1077,20 @@ int Serve(const std::vector<std::string_view>& args) {
   if (engine_options.device == "npu") {
     engine_options.kernels = KernelDir(kernels).string();
   }
+  serve::Logger::SetLevel(log_level);
+  serve::Logger::Info(
+      "server",
+      "event=options version=" + std::string(gufo_npu::build_info::kVersion) +
+          " host=" + server_options.host +
+          " port=" + std::to_string(server_options.port) +
+          " models=" + std::to_string(model_paths.size()) +
+          " device=" + engine_options.device +
+          " max_queue=" + std::to_string(server_options.max_queue) +
+          " draft=" + (server_options.draft ? "mtp" : "none") +
+          " prompt_cache=" + std::to_string(engine_options.prompt_cache) +
+          " context_length=" + std::to_string(engine_options.context_length) +
+          " api_key=" + (server_options.api_key.empty() ? "unset" : "set") +
+          " log_level=" + std::string(serve::LogLevelName(log_level)));
 
   // SIGINT/SIGTERM stop the server: blocked in every thread (set before any
   // starts) and taken by one waiter.
@@ -1094,38 +1120,50 @@ int Serve(const std::vector<std::string_view>& args) {
           std::move(models), serve::ProbeEngine, serve::LoadEngine,
           pool_options);
       pool->Preload();
-      std::fprintf(stderr, "[loaded %s in %.1f s; serving",
-                   pool->status().loaded.value_or("").c_str(),
-                   std::chrono::duration<double>(
-                       std::chrono::steady_clock::now() - load_start)
-                       .count());
+      std::string ids;
       for (const auto* model : pool->engines()) {
-        std::fprintf(stderr, " %s", model->info().id.c_str());
+        ids += (ids.empty() ? "" : ",") + model->info().id;
       }
-      std::fprintf(stderr, "]\n");
+      serve::Logger::Info("server", "event=models loaded=" +
+                                        pool->status().loaded.value_or("") +
+                                        " available=" + ids);
       server = std::make_unique<serve::Server>(*pool, *format, server_options);
     } else {
       engine_options.model_path = model_paths.front();
+      serve::Logger::Info(
+          "loader", "event=load_started artifact=" + engine_options.model_path +
+                        " " + serve::Logger::MemoryStatus());
       engine = serve::LoadEngine(engine_options);
-      std::fprintf(stderr, "[loaded %s in %.1f s]\n", engine->info().id.c_str(),
-                   std::chrono::duration<double>(
-                       std::chrono::steady_clock::now() - load_start)
-                       .count());
+      char elapsed[32];
+      std::snprintf(elapsed, sizeof elapsed, "%.1f",
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - load_start)
+                        .count());
+      serve::Logger::Info("loader",
+                          "event=load_completed model=" + engine->info().id +
+                              " elapsed_ms=" + elapsed + " " +
+                              serve::Logger::MemoryStatus());
       server =
           std::make_unique<serve::Server>(*engine, *format, server_options);
     }
     port = server->Bind();
   } catch (const std::exception& e) {
-    std::fprintf(stderr, "serve: %s\n", e.what());
+    serve::Logger::Error("server", std::string("event=start_failed reason=") +
+                                       e.what() + " " +
+                                       serve::Logger::MemoryStatus());
     return 1;
   }
   std::thread waiter([&] {
     int signal = 0;
     sigwait(&signals, &signal);
+    serve::Logger::Info("server",
+                        std::string("event=shutdown_requested signal=") +
+                            (signal == SIGINT ? "SIGINT" : "SIGTERM"));
     server->Stop();
   });
-  std::fprintf(stderr, "[serving http://%s:%d/v1]\n",
-               server_options.host.c_str(), port);
+  serve::Logger::Info("server", "event=listening url=http://" +
+                                    server_options.host + ":" +
+                                    std::to_string(port) + "/v1");
   server->Run();
   kill(getpid(), SIGTERM);  // wakes the waiter if Run ended on its own
   waiter.join();

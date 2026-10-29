@@ -137,6 +137,7 @@ add_subdirectory(src/serve)
 # metrics over the Engine and ChatFormat interfaces. CPU-only.
 add_library(gufo_npu_serve STATIC
   src/serve/engine_pool.cpp
+  src/serve/logging.cpp
   src/serve/metrics.cpp
   src/serve/openai.cpp
   src/serve/reply.cpp

@@ -6,8 +6,8 @@ it instead.
 
 ```sh
 gufo-npu serve --model Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
-# [loaded MODEL-ID in ... s]
-# [serving http://127.0.0.1:8080/v1]
+# ... [INFO] [loader] event=load_completed model=qwen3.6-35b-a3b elapsed_ms=19012.4 ...
+# ... [INFO] [server] event=listening url=http://127.0.0.1:8080/v1
 
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
@@ -49,6 +49,7 @@ needs the host's XRT (see the Dockerfile).
 | `--draft mtp\|none` | `mtp` | MTP speculative decoding (when the GGUF has the MTP layer). Output is the same either way; `none` is for comparisons. |
 | `--preload ID` | the first `--model` | The model loaded at start. |
 | `--unload-after SECONDS` | `0` (never) | Unload a model that has been idle this long, freeing its device and pinned memory; the next request loads it again. |
+| `--log-level LEVEL` | `info` | What goes to stderr: `error`, `warn`, `info` or `debug` ([Logs](#logs)). |
 
 `SIGINT` or `SIGTERM` stops the server.
 
@@ -236,6 +237,63 @@ gufo-npu serve --model 2b.gguf --model 4b.gguf --model 35b.gguf \
 [docs/examples/docker-compose.yml](examples/docker-compose.yml) runs all
 three models from one container (and has one service per model as the
 alternative).
+
+## Logs
+
+The server logs to stderr in [gufo](https://github.com/gufo-org/gufo)'s
+format, so the two servers' logs read alike: one line per event,
+
+```
+YYYY-MM-DD HH:MM:SS [LEVEL] [component] key=value ...
+```
+
+coloured when stderr is a terminal (set `NO_COLOR` to turn colour off).
+`--log-level` sets the threshold (default `info`). gufo's `-v` shorthand for
+`debug` is left out: gufo-npu keeps one option per behavior.
+
+Every request gets an id (`r1`, `r2`, ...) and two lines: `event=received`
+when it arrives, and `event=completed` after its reply is written (for a
+stream, after its last event), with the time from arrival and the process's
+memory. Chat and completion requests add their generation keys. The level
+follows the outcome: 5xx and a failed stream are `ERROR`, 4xx and a client
+that hung up are `WARN`, the rest `INFO`; polls of `/health` and `/metrics`
+log at `DEBUG` only.
+
+```
+2026-10-29 14:02:11 [INFO] [http] request=r7 event=received method=POST path=/v1/chat/completions body_bytes=412
+2026-10-29 14:02:14 [INFO] [http] request=r7 event=completed method=POST path=/v1/chat/completions status=200 duration_ms=2873.4 outcome=completed model=qwen3.6-35b-a3b kind=chat stream=1 n=1 prompt_tokens=1046 prefill_tokens=117 generated_tokens=64 finish=stop cache=hit cached_tokens=929 queue_depth=0 queue_ms=0.4 ttft_ms=312.8 prefill_tps=374.0 decode_tps=25.9 draft=mtp decode_steps=37 draft_accepted=27 acceptance_pct=73.0 rss_mib=2240 host_available_mib=38112
+2026-10-29 14:02:20 [WARN] [http] request=r8 event=completed method=POST path=/v1/chat/completions status=200 duration_ms=1520.2 outcome=disconnected model=qwen3.6-35b-a3b kind=chat stream=1 n=1 ... finish=cancelled ...
+2026-10-29 14:02:31 [WARN] [http] request=r9 event=completed method=POST path=/v1/chat/completions status=400 duration_ms=0.9 outcome=completed error_type=invalid_request_error error_code=context_length_exceeded param=messages rss_mib=2240 host_available_mib=38110
+```
+
+Generation keys (summed over a request's choices):
+
+| Key | Meaning |
+|---|---|
+| `model`, `kind`, `stream`, `n` | The model, `chat` or `completion`, whether streamed, and the choices. |
+| `prompt_tokens` | Prompt tokens (each prompt once). |
+| `prefill_tokens` | Prompt tokens processed, after the prompt cache's reuse. |
+| `generated_tokens` | Tokens generated, the stop token included. |
+| `finish` | Each choice's finish: `stop`, `length`, `tool_calls`, `cancelled` or `error`. |
+| `cache`, `cached_tokens` | Whether the prompt cache was hit, and the tokens it restored. |
+| `queue_depth`, `queue_ms` | Requests waiting when this one was admitted, and its wait for the engine (from arrival). |
+| `ttft_ms` | Arrival to the first generated token, queue included. |
+| `prefill_tps` | `prefill_tokens` over the time to each choice's first token. |
+| `decode_tps` | `generated_tokens` over the decode time. |
+| `draft` | `mtp` or `none`; with `mtp`, `decode_steps` (verify passes), `draft_accepted` and `acceptance_pct`. |
+| `response_format`, `tools`, `tool_choice`, `logprobs` | Present when the request used them. |
+| `reason` | An engine failure's message. |
+
+Other events:
+
+| Component | Events |
+|---|---|
+| `server` | `options` (the settings, `api_key=set` or `unset`), `models` (several models: the loaded one and all ids), `listening`, `shutdown_requested`, `start_failed`. |
+| `loader` | `load_started`, `load_completed` (with `elapsed_ms`), `load_failed`, and with several models `switch` (from, to), `unload_completed` and `idle_unload`. Each with the memory status. |
+
+Never logged: the API key, prompt and reply text, and request bodies
+(only their size). The model's GGUF path appears in `load_started` with a
+single model.
 
 ## Errors
 

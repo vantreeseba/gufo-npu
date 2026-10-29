@@ -2,8 +2,12 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <iomanip>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
+
+#include "serve/logging.hpp"
 
 namespace gufo_npu::serve {
 namespace {
@@ -12,6 +16,12 @@ using Clock = std::chrono::steady_clock;
 
 double Since(Clock::time_point start) {
   return std::chrono::duration<double>(Clock::now() - start).count();
+}
+
+std::string Millis(double seconds) {
+  std::ostringstream out;
+  out << std::fixed << std::setprecision(1) << seconds * 1000.0;
+  return out.str();
 }
 
 }  // namespace
@@ -154,6 +164,11 @@ GenerateResult EnginePool::Generate(std::size_t index,
                                     const std::function<bool(int)>& on_token) {
   const std::lock_guard lock(device_mutex_);
   if (loaded_ != index) {
+    if (loaded_) {
+      Logger::Info("loader",
+                   "event=switch from=" + slots_[*loaded_].probe->info().id +
+                       " to=" + slots_[index].probe->info().id);
+    }
     UnloadLocked();
     LoadLocked(index);
   }
@@ -170,16 +185,30 @@ void EnginePool::LoadLocked(std::size_t index) {
     const std::lock_guard lock(status_mutex_);
     status_.loading = id;
   }
+  Logger::Info("loader",
+               "event=load_started model=" + id + " " + Logger::MemoryStatus());
   const auto start = Clock::now();
   try {
     engine_ = load_(slots_[index].options);
+  } catch (const std::exception& e) {
+    Logger::Error("loader", "event=load_failed model=" + id + " elapsed_ms=" +
+                                Millis(Since(start)) + " reason=" + e.what() +
+                                " " + Logger::MemoryStatus());
+    const std::lock_guard lock(status_mutex_);
+    status_.loading.reset();
+    throw;
   } catch (...) {
+    Logger::Error("loader", "event=load_failed model=" + id +
+                                " elapsed_ms=" + Millis(Since(start)) + " " +
+                                Logger::MemoryStatus());
     const std::lock_guard lock(status_mutex_);
     status_.loading.reset();
     throw;
   }
   loaded_ = index;
   const double seconds = Since(start);
+  Logger::Info("loader", "event=load_completed model=" + id + " elapsed_ms=" +
+                             Millis(seconds) + " " + Logger::MemoryStatus());
   const std::lock_guard lock(status_mutex_);
   status_.loading.reset();
   status_.loaded = id;
@@ -195,6 +224,10 @@ void EnginePool::UnloadLocked() {
   engine_.reset();  // releases the model's device buffers and pinned memory
   const double seconds = Since(start);
   const std::size_t index = *loaded_;
+  Logger::Info(
+      "loader",
+      "event=unload_completed model=" + slots_[index].probe->info().id +
+          " elapsed_ms=" + Millis(seconds) + " " + Logger::MemoryStatus());
   loaded_.reset();
   const std::lock_guard lock(status_mutex_);
   status_.loaded.reset();
@@ -217,6 +250,9 @@ void EnginePool::IdleLoop() {
     // A generation holds the device; try again later rather than wait.
     std::unique_lock device(device_mutex_, std::try_to_lock);
     if (device.owns_lock() && engine_ && Clock::now() - last_used_ >= idle) {
+      Logger::Info("loader", "event=idle_unload model=" +
+                                 slots_[*loaded_].probe->info().id +
+                                 " idle_ms=" + Millis(Since(last_used_)));
       UnloadLocked();
     }
   }
