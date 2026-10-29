@@ -385,6 +385,104 @@ void SchemaWalks(const std::string& label, const json& schema, bool strict,
                             " random generations parse and validate");
 }
 
+// The nesting a value reaches.
+int Nesting(const json& v) {
+  int deepest = 0;
+  if (v.is_object() || v.is_array()) {
+    for (const auto& child : v) {
+      deepest = std::max(deepest, Nesting(child));
+    }
+    return deepest + 1;
+  }
+  return 0;
+}
+
+// A recursive schema whose every node needs an array: a walk that keeps
+// opening objects and arrays must still be able to finish once it reaches
+// the nesting limit (it used to open a node it could not complete).
+void DeepNesting() {
+  const json tree = {{"$defs",
+                      {{"node",
+                        {{"type", "object"},
+                         {"properties",
+                          {{"name", {{"type", "string"}, {"maxLength", 4}}},
+                           {"reports",
+                            {{"type", "array"},
+                             {"items", {{"$ref", "#/$defs/node"}}},
+                             {"maxItems", 2}}}}},
+                         {"required", {"name", "reports"}},
+                         {"additionalProperties", false}}}}},
+                     {"$ref", "#/$defs/node"}};
+  const ordered_json ordered = ordered_json::parse(tree.dump());
+  auto c = NewGrammarConstraint(JsonSchemaGrammar(ordered, true), ToyIndex(),
+                                {toy().end}, false);
+  const Toy& t = toy();
+  const int vocab = static_cast<int>(t.bytes.size());
+  std::mt19937 rng(11);
+  int deepest = 0;
+  bool ok = true;
+  for (int walk = 0; walk < 20 && ok; ++walk) {
+    c->Reset();
+    std::string text;
+    std::vector<std::uint8_t> mask;
+    bool ended = false;
+    for (int step = 0; step < 6000 && !ended; ++step) {
+      c->Allowed(vocab, mask);
+      std::vector<double> weights(mask.size(), 0.0);
+      double total = 0;
+      for (std::size_t i = 0; i < mask.size(); ++i) {
+        if (mask[i] == 0) {
+          continue;
+        }
+        const std::string& b = t.bytes[i];
+        const char last = b.empty() ? 0 : b.back();
+        // Open as deep as allowed first, then close.
+        double w = 1.0;
+        if (step < 600) {
+          w = last == '{' || last == '[' ? 1000.0 : last == ']' ? 0.01 : 1.0;
+        } else if (static_cast<int>(i) == t.end) {
+          w = 200.0;
+        } else if (last == '"' || last == '}' || last == ']') {
+          w = 25.0;
+        } else if (last == ',' || last == '{' || last == '[') {
+          w = 0.01;
+        }
+        weights[i] = w;
+        total += w;
+      }
+      if (total == 0) {
+        Check(false,
+              "deep nesting: no token allowed after \"" +
+                  text.substr(text.size() > 300 ? text.size() - 300 : 0) +
+                  "\"");
+        ok = false;
+        break;
+      }
+      std::discrete_distribution<int> pick(weights.begin(), weights.end());
+      const int id = pick(rng);
+      if (id == t.end) {
+        ended = true;
+        break;
+      }
+      c->Advance(id);
+      text += t.bytes[static_cast<std::size_t>(id)];
+    }
+    if (!ok) {
+      break;
+    }
+    const json v = json::parse(text, nullptr, false);
+    if (!ended || v.is_discarded() || !Validate(v, tree, tree)) {
+      Check(false, "deep nesting: invalid or unfinished output");
+      ok = false;
+      break;
+    }
+    deepest = std::max(deepest, Nesting(v));
+  }
+  Check(ok && deepest >= 24,
+        "deep nesting: 20 walks that nest to the limit finish valid (deepest " +
+            std::to_string(deepest) + " levels)");
+}
+
 void Schemas() {
   SchemaWalks("strict object",
               {{"type", "object"},
@@ -674,13 +772,15 @@ void Errors() {
               "b");
         }),
         "error: forced function not in tools");
-  // A schema that refers to itself only cannot loop.
-  auto self =
-      NewGrammarConstraint(JsonSchemaGrammar(ordered_json{{"$ref", "#"}}, true),
-                           ToyIndex(), {toy().end}, false);
-  std::vector<std::uint8_t> mask;
-  self->Allowed(static_cast<int>(toy().bytes.size()), mask);
-  Check(true, "self-referencing schema: a mask without looping");
+  // A schema that only refers to itself has no value: refused, not looped.
+  Check(refused([] { JsonSchemaGrammar(ordered_json{{"$ref", "#"}}, true); }),
+        "error: a schema with no finite value (only a self reference)");
+  Check(refused([] {
+          JsonSchemaGrammar(ordered_json::parse(R"({"type": "object",
+              "properties": {"next": {"$ref": "#"}}, "required": ["next"]})"),
+                            true);
+        }),
+        "error: a schema whose required recursion never ends");
 }
 
 // The Sampler applies the constraint: greedy takes the best allowed token,
@@ -1187,6 +1287,7 @@ int main(int argc, char** argv) {
     return failures > 0 ? 1 : 0;
   }
   Schemas();
+  DeepNesting();
   Specifics();
   ToolCalls();
   Errors();

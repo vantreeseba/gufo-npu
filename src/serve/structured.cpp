@@ -28,6 +28,7 @@ struct Mask {
   std::uint64_t w[2] = {0, 0};
 
   void Set(int i) { w[i >> 6] |= std::uint64_t{1} << (i & 63); }
+  void Clear(int i) { w[i >> 6] &= ~(std::uint64_t{1} << (i & 63)); }
   bool Test(int i) const { return (w[i >> 6] >> (i & 63)) & 1; }
   bool Empty() const { return w[0] == 0 && w[1] == 0; }
   bool SubsetOf(const Mask& o) const {
@@ -162,6 +163,11 @@ public:
   };
 
   std::vector<Node> nodes;
+  // Per node: the stack frames a value of it needs beyond its own to be
+  // completed (kInfinite: none can be). The matcher opens an object, an
+  // array, a key or an item only when that many frames still fit, so every
+  // value it starts can be finished within kMaxDepth.
+  std::vector<int> need;
   int root = -1;  // JSON grammars
   bool tool = false;
   std::vector<Function> functions;
@@ -492,6 +498,62 @@ int ParameterNode(Grammar& g, const Json& schema) {
   return compiler.Compile(schema);
 }
 
+constexpr int kInfinite = INT_MAX / 4;
+
+// Grammar::need, by iterating to a fixed point (recursive schemas).
+void ComputeNeeds(Grammar& g) {
+  g.need.assign(g.nodes.size(), kInfinite);
+  for (bool changed = true; changed;) {
+    changed = false;
+    for (std::size_t i = 0; i < g.nodes.size(); ++i) {
+      const Node& n = g.nodes[i];
+      auto of = [&](int node) {
+        return node < 0 ? 0 : g.need[static_cast<std::size_t>(node)];
+      };
+      int v = kInfinite;
+      switch (n.kind) {
+        case Kind::kNever:
+          break;
+        case Kind::kAnyOf:
+          for (const int alt : n.alts) {
+            v = std::min(v, of(alt));
+          }
+          break;
+        case Kind::kObject:
+          v = 0;
+          for (std::size_t k = 0; k < n.props.size(); ++k) {
+            if (n.required.Test(static_cast<int>(k))) {
+              v = std::max(v, std::min(kInfinite, 1 + of(n.props[k])));
+            }
+          }
+          break;
+        case Kind::kArray:
+          v = n.min_items > 0 ? std::min(kInfinite, 1 + of(n.items)) : 0;
+          break;
+        default:  // strings, numbers, literals replace their value frame
+          v = 0;
+          break;
+      }
+      if (v < g.need[i]) {
+        g.need[i] = v;
+        changed = true;
+      }
+    }
+  }
+}
+
+// Checks that the root can be completed (the root frame and the value's).
+void CheckRoot(const Grammar& g) {
+  const int need = g.need[static_cast<std::size_t>(g.root)];
+  if (need >= kInfinite) {
+    throw GrammarError("schema: no finite JSON value matches it");
+  }
+  if (2 + need > kMaxDepth) {
+    throw GrammarError("schema: its smallest value nests deeper than " +
+                       std::to_string(kMaxDepth) + " levels");
+  }
+}
+
 }  // namespace
 
 std::shared_ptr<const Grammar> JsonObjectGrammar() {
@@ -501,6 +563,7 @@ std::shared_ptr<const Grammar> JsonObjectGrammar() {
   object.kind = Kind::kObject;
   object.additional = any;
   g->root = g->Add(std::move(object));
+  ComputeNeeds(*g);
   return g;
 }
 
@@ -509,6 +572,8 @@ std::shared_ptr<const Grammar> JsonSchemaGrammar(const Json& schema,
   auto g = std::make_shared<Grammar>();
   SchemaCompiler compiler(*g, schema, strict);
   g->root = compiler.Compile(schema);
+  ComputeNeeds(*g);
+  CheckRoot(*g);
   return g;
 }
 
@@ -583,6 +648,7 @@ std::shared_ptr<const Grammar> ToolCallGrammar(const Json& tools,
                          "\", which is not in tools");
     }
   }
+  ComputeNeeds(*g);
   return g;
 }
 
@@ -867,6 +933,12 @@ private:
   }
 
   const Node& N(int i) const { return g_.nodes[static_cast<std::size_t>(i)]; }
+  // Whether a value of node `i` started in a frame `above` frames over the
+  // current top can still be completed within kMaxDepth.
+  bool Fits(const Stack& s, int i, int above) const {
+    return i < 0 ||
+           s.depth + above + g_.need[static_cast<std::size_t>(i)] <= kMaxDepth;
+  }
 
   Stack& Slot(int i) {
     if (static_cast<int>(work_.size()) <= i) {
@@ -970,7 +1042,7 @@ private:
       case Kind::kAnyOf:
         return R::kFork;
       case Kind::kObject:
-        if (c != '{') {
+        if (c != '{' || !Fits(s, f.node, 0)) {
           return R::kReject;
         }
         next.kind = kObject;
@@ -979,7 +1051,7 @@ private:
         f = next;
         return R::kAccept;
       case Kind::kArray:
-        if (c != '[') {
+        if (c != '[' || !Fits(s, f.node, 0)) {
           return R::kReject;
         }
         next.kind = kArray;
@@ -1023,8 +1095,16 @@ private:
       return R::kReject;
     }
     const Node& n = N(f.node);
+    // Keys not seen yet whose value still fits; other keys only when an
+    // additional value fits (f.c).
     f.m2 = Mask::First(static_cast<int>(n.names.size())).Minus(f.m1);
-    if (f.m2.Empty() && n.additional < 0) {
+    for (std::size_t i = 0; i < n.names.size(); ++i) {
+      if (f.m2.Test(static_cast<int>(i)) && !Fits(s, n.props[i], 1)) {
+        f.m2.Clear(static_cast<int>(i));
+      }
+    }
+    f.c = n.additional >= 0 && Fits(s, n.additional, 1) ? 1 : 0;
+    if (f.m2.Empty() && f.c == 0) {
       return R::kReject;
     }
     f.phase = kObjKey;
@@ -1049,7 +1129,7 @@ private:
         next.Set(idx);
       }
     }
-    if (next.Empty() && n.additional < 0) {
+    if (next.Empty() && f.c == 0) {
       return R::kReject;
     }
     f.m2 = next;
@@ -1107,7 +1187,7 @@ private:
               f.b = static_cast<int>(i);
             }
           }
-          if (f.b < 0 && n.additional < 0) {
+          if (f.b < 0 && f.c == 0) {
             return R::kReject;
           }
           f.phase = kObjColon;
@@ -1137,10 +1217,11 @@ private:
           return Ws(s);
         }
         if (c == ',') {
-          const bool more = n.additional >= 0 ||
-                            !Mask::First(static_cast<int>(n.names.size()))
-                                 .Minus(f.m1)
-                                 .Empty();
+          // Another key only when one can still be completed.
+          bool more = n.additional >= 0 && Fits(s, n.additional, 1);
+          for (std::size_t i = 0; !more && i < n.names.size(); ++i) {
+            more = !f.m1.Test(static_cast<int>(i)) && Fits(s, n.props[i], 1);
+          }
           if (!more) {
             return R::kReject;
           }
@@ -1173,7 +1254,7 @@ private:
           --s.depth;
           return R::kAccept;
         }
-        if (n.max_items <= 0) {
+        if (n.max_items <= 0 || !Fits(s, n.items, 1)) {
           return R::kReject;
         }
         f.a = 1;
@@ -1183,7 +1264,7 @@ private:
         if (IsWs(c)) {
           return Ws(s);
         }
-        if (c == ',' && f.a < n.max_items) {
+        if (c == ',' && f.a < n.max_items && Fits(s, n.items, 1)) {
           f.phase = kArrNext;
           return R::kAccept;
         }
