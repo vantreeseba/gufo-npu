@@ -75,8 +75,12 @@ add_test(NAME serve_engine_pool_test COMMAND serve_engine_pool_test)
 add_executable(serve_extras_test serve/server_extras_test.cpp)
 target_link_libraries(serve_extras_test PRIVATE gufo_npu_serve cpp_httplib)
 add_test(NAME serve_extras_test COMMAND serve_extras_test)
+# Request, generation and model-load log lines in gufo's format.
+add_executable(serve_logging_test serve/logging_test.cpp)
+target_link_libraries(serve_logging_test PRIVATE gufo_npu_serve cpp_httplib)
+add_test(NAME serve_logging_test COMMAND serve_logging_test)
 set_tests_properties(serve_text_test serve_server_test serve_chat_test
-                     serve_extras_test serve_engine_pool_test
+                     serve_extras_test serve_engine_pool_test serve_logging_test
                      PROPERTIES LABELS serve TIMEOUT 120)
 # Structured outputs: grammar masks against token-by-token simulation,
 # constrained generations validated against their schema, forced tool calls,
