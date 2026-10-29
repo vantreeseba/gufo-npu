@@ -136,10 +136,12 @@ add_subdirectory(src/serve)
 # OpenAI-compatible server (docs/SERVING.md): HTTP, OpenAI JSON, queue and
 # metrics over the Engine and ChatFormat interfaces. CPU-only.
 add_library(gufo_npu_serve STATIC
+  src/serve/engine_pool.cpp
   src/serve/metrics.cpp
   src/serve/openai.cpp
   src/serve/reply.cpp
   src/serve/server.cpp
+  src/serve/structured.cpp
   src/serve/text.cpp
 )
 target_link_libraries(gufo_npu_serve PUBLIC gufo_npu_core nlohmann_json

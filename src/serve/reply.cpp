@@ -15,7 +15,7 @@ ReplyStream::ReplyStream(const Engine& engine, std::vector<int> stop_ids,
       emit_(std::move(emit)) {}
 
 bool ReplyStream::OnToken(int id) {
-  if (failed_ || stops_.stopped()) {
+  if (failed_ || stops_.stopped() || tool_limit_hit_) {
     return false;
   }
   if (std::find(stop_ids_.begin(), stop_ids_.end(), id) != stop_ids_.end()) {
@@ -25,11 +25,11 @@ bool ReplyStream::OnToken(int id) {
   if (!text.empty()) {
     Send(parser_->Feed(text));
   }
-  return !failed_ && !stops_.stopped();
+  return !failed_ && !stops_.stopped() && !tool_limit_hit_;
 }
 
 void ReplyStream::Finish() {
-  if (failed_) {
+  if (failed_ || tool_limit_hit_) {
     return;
   }
   std::string text;
@@ -48,14 +48,29 @@ void ReplyStream::Send(std::vector<OutputPart>&& parts) {
   if (parts.empty() || failed_) {
     return;
   }
-  for (const auto& part : parts) {
-    if (part.kind == OutputPart::Kind::kToolCall) {
-      ++tool_calls_;
+  for (std::size_t i = 0; i < parts.size(); ++i) {
+    if (parts[i].kind != OutputPart::Kind::kToolCall) {
+      continue;
+    }
+    ++tool_calls_;
+    if (max_tool_calls_ > 0 && tool_calls_ >= max_tool_calls_) {
+      tool_limit_hit_ = true;
+      parts.resize(i + 1);
+      break;
     }
   }
   if (!emit_(std::move(parts))) {
     failed_ = true;
   }
+}
+
+std::vector<OutputPart> PlainTextParser::Feed(const std::string& text) {
+  if (text.empty()) {
+    return {};
+  }
+  OutputPart part;
+  part.text = text;
+  return {std::move(part)};
 }
 
 }  // namespace gufo_npu::serve

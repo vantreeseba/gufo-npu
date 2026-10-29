@@ -29,7 +29,12 @@ public:
   // After the generation: hands over what was held back.
   void Finish();
 
+  // Ends the generation after `n` tool calls (parallel_tool_calls: false
+  // is 1); anything after the last is dropped. 0: no limit.
+  void set_max_tool_calls(int n) { max_tool_calls_ = n; }
+
   bool stop_string_hit() const { return stops_.stopped(); }
+  bool tool_limit_hit() const { return tool_limit_hit_; }
   bool delivery_failed() const { return failed_; }
   int tool_calls() const { return tool_calls_; }
 
@@ -44,6 +49,15 @@ private:
   Emit emit_;
   bool failed_ = false;
   int tool_calls_ = 0;
+  int max_tool_calls_ = 0;
+  bool tool_limit_hit_ = false;
+};
+
+// Everything is content: the parser for /v1/completions' raw text.
+class PlainTextParser : public OutputParser {
+public:
+  std::vector<OutputPart> Feed(const std::string& text) override;
+  std::vector<OutputPart> Finish() override { return {}; }
 };
 
 }  // namespace gufo_npu::serve

@@ -13,6 +13,7 @@
 namespace {
 
 using gufo_npu::serve::ApiError;
+using gufo_npu::serve::ChatRequest;
 using gufo_npu::serve::ParseChatRequest;
 using gufo_npu::serve::Scheduler;
 using gufo_npu::serve::StopMatcher;
@@ -170,7 +171,7 @@ void Requests() {
   Check(Rejects(json::object(), "messages"), "reject: no messages");
   Check(Rejects({{"messages", json::array()}}, "messages"),
         "reject: empty messages");
-  Check(Rejects({{"messages", messages}, {"n", 2}}, "n"), "reject: n=2");
+  Check(Rejects({{"messages", messages}, {"n", 9}}, "n"), "reject: n=9");
   Check(Rejects({{"messages", messages}, {"temperature", 3}}, "temperature"),
         "reject: temperature 3");
   Check(Rejects({{"messages", messages}, {"top_p", 0}}, "top_p"),
@@ -181,19 +182,62 @@ void Requests() {
         "reject: max_tokens string");
   Check(Rejects({{"messages", messages}, {"stop", 5}}, "stop"),
         "reject: stop number");
+  {
+    const auto r = ParseChatRequest({{"messages", messages},
+                                     {"tools", tools},
+                                     {"tool_choice", "required"}});
+    Check(r.tool_required && r.tool_name.empty() && r.prompt.tools.size() == 1,
+          "parse: tool_choice required");
+    const auto named = ParseChatRequest(
+        {{"messages", messages},
+         {"tools", tools},
+         {"tool_choice",
+          {{"type", "function"}, {"function", {{"name", "get"}}}}}});
+    Check(named.tool_required && named.tool_name == "get",
+          "parse: tool_choice names a function");
+  }
+  Check(Rejects({{"messages", messages}, {"tool_choice", "required"}},
+                "tool_choice"),
+        "reject: tool_choice required without tools");
   Check(Rejects({{"messages", messages},
                  {"tools", tools},
-                 {"tool_choice", "required"}},
+                 {"tool_choice",
+                  {{"type", "function"}, {"function", {{"name", "other"}}}}}},
                 "tool_choice"),
-        "reject: tool_choice required");
+        "reject: tool_choice names an unknown function");
+  Check(Rejects({{"messages", messages},
+                 {"tools", tools},
+                 {"tool_choice", "sometimes"}},
+                "tool_choice"),
+        "reject: tool_choice sometimes");
   Check(Rejects({{"messages", messages}, {"tools", json::array({1})}}, "tools"),
         "reject: bad tool");
-  Check(Rejects({{"messages", messages}, {"logprobs", true}}, "logprobs"),
-        "reject: logprobs");
+  Check(Rejects({{"messages", messages}, {"top_logprobs", 3}}, "top_logprobs"),
+        "reject: top_logprobs without logprobs");
+  Check(ParseChatRequest({{"messages", messages},
+                          {"response_format", {{"type", "json_object"}}}})
+                .format == ChatRequest::Format::kJsonObject,
+        "parse: json_object");
+  {
+    const auto r = ParseChatRequest({{"messages", messages},
+                                     {"response_format",
+                                      {{"type", "json_schema"},
+                                       {"json_schema",
+                                        {{"name", "x"},
+                                         {"strict", true},
+                                         {"schema", {{"type", "object"}}}}}}}});
+    Check(r.format == ChatRequest::Format::kJsonSchema && r.json_strict &&
+              r.json_schema == json{{"type", "object"}},
+          "parse: json_schema");
+  }
   Check(Rejects({{"messages", messages},
-                 {"response_format", {{"type", "json_object"}}}},
+                 {"response_format", {{"type", "json_schema"}}}},
                 "response_format"),
-        "reject: json mode");
+        "reject: json_schema without a schema");
+  Check(
+      Rejects({{"messages", messages}, {"response_format", {{"type", "xml"}}}},
+              "response_format"),
+      "reject: response_format xml");
   Check(Rejects({{"messages", messages}, {"reasoning_effort", "max"}},
                 "reasoning_effort"),
         "reject: reasoning_effort max");

@@ -299,16 +299,21 @@ void ToolsAndReasoning(FakeEngine& engine, FakeFormat& format) {
   Check(Joined(events, "reasoning_content") == "hmm" &&
             Joined(events, "content") == "Let me ",
         "tools: stream text");
-  bool saw_call = false;
+  // OpenAI's fragment shape: id and name first, then the arguments.
+  std::vector<json> fragments;
   for (const auto& e : events) {
     if (e.is_object() && !e["choices"].empty() &&
         e["choices"][0]["delta"].contains("tool_calls")) {
-      const auto& call = e["choices"][0]["delta"]["tool_calls"][0];
-      saw_call = call["index"] == 0 && call["function"]["name"] == "get" &&
-                 call["function"]["arguments"] == "{\"a\":1}";
+      fragments.push_back(e["choices"][0]["delta"]["tool_calls"][0]);
     }
   }
-  Check(saw_call, "tools: stream tool_calls delta");
+  Check(fragments.size() == 2 && fragments[0]["index"] == 0 &&
+            fragments[0]["id"].get<std::string>().rfind("call_", 0) == 0 &&
+            fragments[0]["function"]["name"] == "get" &&
+            fragments[0]["function"]["arguments"] == "" &&
+            fragments[1]["index"] == 0 && !fragments[1].contains("id") &&
+            fragments[1]["function"]["arguments"] == "{\"a\":1}",
+        "tools: stream tool_calls fragments");
   Check(events.size() >= 3 &&
             events[events.size() - 2]["choices"][0]["finish_reason"] ==
                 "tool_calls",
@@ -344,8 +349,8 @@ void Errors(FakeEngine& engine, FakeFormat& format) {
             json::parse(bad->body)["error"]["type"] == "invalid_request_error",
         "errors: bad JSON");
   Check(Post(s, {{"model", "m"}}).status == 400, "errors: no messages");
-  Check(Post(s, {{"messages", Messages()}, {"n", 2}}).status == 400,
-        "errors: n=2");
+  Check(Post(s, {{"messages", Messages()}, {"n", 9}}).status == 400,
+        "errors: n=9");
   const auto role = Post(
       s, {{"messages", json::array({{{"role", "bad"}, {"content", "x"}}})}});
   Check(role.status == 400 && role.body["error"]["param"] == "messages",

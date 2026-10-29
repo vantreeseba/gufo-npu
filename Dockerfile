@@ -64,6 +64,7 @@ COPY . .
 RUN cmake --preset release \
  && cmake --build --preset release --parallel "${BUILD_JOBS}" \
  && ctest --preset cpu \
+ && build/release/tests/serve_structured_test --bench \
  && cmake --install build/release --prefix /opt/gufo-npu
 
 FROM xrt AS runtime

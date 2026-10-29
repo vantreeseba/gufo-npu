@@ -82,14 +82,19 @@ constexpr char kUsage[] =
     "                           with MTP speculation (same output\n"
     "                           distribution, fewer passes); temperature 0 is\n"
     "                           greedy\n"
-    "  serve --model GGUF [--host ADDR] [--port N] [--device npu|cpu]\n"
-    "        [--kernels DIR] [--model-id NAME] [--max-queue N] [--api-key "
-    "KEY]\n"
-    "        [--context-length N] [--prompt-cache N]\n"
+    "  serve --model GGUF [--model GGUF ...] [--host ADDR] [--port N]\n"
+    "        [--device npu|cpu] [--kernels DIR] [--model-id NAME]\n"
+    "        [--max-queue N] [--api-key KEY] [--context-length N]\n"
+    "        [--prompt-cache N] [--preload ID] [--unload-after SECONDS]\n"
+    "        [--draft mtp|none]\n"
     "                           OpenAI-compatible server (docs/SERVING.md),\n"
     "                           by default on 127.0.0.1:8080; --prompt-cache\n"
     "                           keeps N checkpoints of earlier prompts for\n"
-    "                           multi-turn reuse (default 2, 0: off)\n"
+    "                           multi-turn reuse (default 2, 0: off). Several\n"
+    "                           --model: requests pick one by id, one loaded\n"
+    "                           at a time (--preload: the first, default the\n"
+    "                           first --model); --unload-after frees an idle\n"
+    "                           model's memory (default 0: never)\n"
     "  version                  print the version\n";
 
 void PrintChecks(const std::vector<Check>& checks) {
@@ -1004,11 +1009,18 @@ int Serve(const std::vector<std::string_view>& args) {
   namespace serve = gufo_npu::serve;
   serve::EngineOptions engine_options;
   serve::ServerOptions server_options;
+  serve::EnginePoolOptions pool_options;
+  std::vector<std::string> model_paths;
   std::optional<std::string> kernels;
   for (std::size_t i = 0; i < args.size(); ++i) {
     const bool has_value = i + 1 < args.size();
     if (args[i] == "--model" && has_value) {
-      engine_options.model_path = std::string(args[++i]);
+      model_paths.emplace_back(args[++i]);
+    } else if (args[i] == "--preload" && has_value) {
+      pool_options.preload = std::string(args[++i]);
+    } else if (args[i] == "--unload-after" && has_value) {
+      pool_options.unload_after_seconds =
+          std::atof(std::string(args[++i]).c_str());
     } else if (args[i] == "--host" && has_value) {
       server_options.host = std::string(args[++i]);
     } else if (args[i] == "--port" && has_value) {
@@ -1027,12 +1039,22 @@ int Serve(const std::vector<std::string_view>& args) {
       engine_options.prompt_cache = std::atoi(std::string(args[++i]).c_str());
     } else if (args[i] == "--api-key" && has_value) {
       server_options.api_key = std::string(args[++i]);
+    } else if (args[i] == "--draft" && has_value) {
+      const std::string_view draft = args[++i];
+      if (draft != "mtp" && draft != "none") {
+        std::cerr << kUsage;
+        return 2;
+      }
+      server_options.draft = draft == "mtp";
     } else {
       std::cerr << kUsage;
       return 2;
     }
   }
-  if (engine_options.model_path.empty() ||
+  // Ids come from each GGUF; --model-id names a lone model only.
+  if (model_paths.empty() ||
+      (model_paths.size() > 1 && !engine_options.model_id.empty()) ||
+      pool_options.unload_after_seconds < 0 ||
       (engine_options.device != "npu" && engine_options.device != "cpu") ||
       server_options.port <= 0 || server_options.port > 65535 ||
       server_options.max_queue < 0 || engine_options.context_length < 0 ||
@@ -1053,18 +1075,45 @@ int Serve(const std::vector<std::string_view>& args) {
   pthread_sigmask(SIG_BLOCK, &signals, nullptr);
 
   std::unique_ptr<serve::Engine> engine;
+  std::unique_ptr<serve::EnginePool> pool;
   std::unique_ptr<serve::ChatFormat> format;
   std::unique_ptr<serve::Server> server;
   int port = 0;
   try {
     const auto load_start = std::chrono::steady_clock::now();
-    engine = serve::LoadEngine(engine_options);
     format = serve::NewQwen35ChatFormat();
-    std::fprintf(stderr, "[loaded %s in %.1f s]\n", engine->info().id.c_str(),
-                 std::chrono::duration<double>(
-                     std::chrono::steady_clock::now() - load_start)
-                     .count());
-    server = std::make_unique<serve::Server>(*engine, *format, server_options);
+    // A pool when several models share the NPU, or when an idle model
+    // should give its memory back.
+    if (model_paths.size() > 1 || pool_options.unload_after_seconds > 0) {
+      std::vector<serve::EngineOptions> models;
+      for (const auto& path : model_paths) {
+        models.push_back(engine_options);
+        models.back().model_path = path;
+      }
+      pool = std::make_unique<serve::EnginePool>(
+          std::move(models), serve::ProbeEngine, serve::LoadEngine,
+          pool_options);
+      pool->Preload();
+      std::fprintf(stderr, "[loaded %s in %.1f s; serving",
+                   pool->status().loaded.value_or("").c_str(),
+                   std::chrono::duration<double>(
+                       std::chrono::steady_clock::now() - load_start)
+                       .count());
+      for (const auto* model : pool->engines()) {
+        std::fprintf(stderr, " %s", model->info().id.c_str());
+      }
+      std::fprintf(stderr, "]\n");
+      server = std::make_unique<serve::Server>(*pool, *format, server_options);
+    } else {
+      engine_options.model_path = model_paths.front();
+      engine = serve::LoadEngine(engine_options);
+      std::fprintf(stderr, "[loaded %s in %.1f s]\n", engine->info().id.c_str(),
+                   std::chrono::duration<double>(
+                       std::chrono::steady_clock::now() - load_start)
+                       .count());
+      server =
+          std::make_unique<serve::Server>(*engine, *format, server_options);
+    }
     port = server->Bind();
   } catch (const std::exception& e) {
     std::fprintf(stderr, "serve: %s\n", e.what());
