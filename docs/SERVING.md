@@ -179,6 +179,11 @@ off by `max_tokens` (`finish_reason: "length"`).
   numbers to 24 digits and a two-digit exponent, and nesting to 32 levels,
   so a constrained reply cannot run on in whitespace or digits. Strings,
   keys and raw parameter text are valid UTF-8.
+- **Nesting:** an object, array, key or array item is only started when
+  the smallest value it needs still fits within the 32 levels (recursive
+  schemas whose nodes require a child array, for example), so a reply can
+  always be finished. A schema with no finite value, or whose smallest value
+  nests deeper than that, is refused with a 400.
 
 ### `GET /v1/models`, `GET /v1/models/{id}`
 
@@ -314,6 +319,81 @@ Before buffer reuse, the same traffic grew without bound: the 35B reached
 `docker run` line above. It reports healthy 15 s after start and passes all
 18 checks.
 
+## Measured: OpenAI-compatibility features (2026-10-29)
+
+On the box, warm, the CI image of this branch, MTP on unless noted
+(`tools/serve/serve_quality.py`, `serve_speed.py`, `serve_bench.py`).
+
+**Greedy output unchanged** on all three models, and unchanged again with
+`logprobs: true` (md5 of the reply, as `gufo-npu generate | md5sum`):
+2B `a49f1c4c` / `fdb595fb` / `8edbce90`, 4B `f99190db` / `a965fad4` /
+`fbd339e4`, 35B `2c9f87d3` / `9430fd17` / `1de5ad9f`.
+
+**Logprobs:** at temperature 0 every chosen token is `top_logprobs[0]` with
+the same value, and the tokens join to the reply (2B, 4B, 35B). With MTP on
+and with `--draft none` the per-token logprobs are identical (difference 0
+on all three reference prompts, 2B and 35B).
+
+**Structured outputs:** every reply that ended parsed and validated against
+its schema, on both models, thinking off and on. Every invalid reply was cut
+by `max_tokens` (800, or 3,000 with thinking):
+
+| Case | 2B valid (cut) | 35B valid (cut) |
+|---|---|---|
+| `json_object` | 47/50 (3) | 20/20 |
+| strict schema: nested object, enum, array, optional field | 49/50 (1) | 20/20 |
+| strict schema: array of objects (recipe) | 39/50 (11) | 19/20 (1) |
+| strict schema: recursive `$ref` (org chart) | 29/50 (21) | 38/50 (12), 15/20 (5) |
+| strict schema: enum classification | 50/50 | 20/20 |
+| `tool_choice: "required"` | 50/50 | 20/20 |
+| `tool_choice` named function | 50/50 | 20/20 |
+| nested object, thinking on | 31/50 (19) | 10/10 |
+| `tool_choice: "required"`, thinking on | 50/50 | 10/10 |
+
+- The cut replies are the model running on, not the constraint: the 2B
+  repeats nodes in the recursive org chart and lists ingredients without
+  end, and thinks past 3,000 tokens. Bound them in the schema (`maxItems`,
+  `maxLength`) or raise `max_tokens`.
+- The model does not see the schema: the server only constrains tokens, so
+  enum choices and field contents follow the prompt alone (the 35B
+  sometimes picks `"scientist"` for "a designer"). Describe the fields in the
+  prompt for better answers.
+- A forced call with a quoted, multi-line string argument: 4B 20/20 valid
+  (14 with quotes and newlines in the argument), 35B 20/20 (19), 2B 50/50.
+- The first build of the recursive case failed 12/50 2B requests with a 500
+  ("the constraint allows no token"): the grammar let the model open a node
+  it could not finish within the nesting limit. Fixed; see "Structured
+  outputs".
+
+**Other checks:** `logit_bias` −100 changes the greedy first token, +100
+forces one; `parallel_tool_calls: false` returns one call where the default
+returns four; `/v1/completions` with a string or token-id prompt, `echo`,
+`stream`, legacy `logprobs` and `n=2`. Several models: 2B → 35B → 2B, each
+answering correctly, in 0.2 s, 18.2 s (a load) and 5.3 s.
+
+**Speed:** decode tok/s and engine time to the first token per mode, median
+of 3 after a warm-up, `--prompt-cache 0`, 128 tokens at most. Every mode runs
+within noise of plain; only `tool_choice: "required"` adds to the first
+token (the forced call's markup comes first: +0.06 s 2B, +0.14 s 4B,
++0.33 s 35B):
+
+| Model, prompt | Plain, T=0 | json_schema | tool_choice required | logprobs | n=3 | Plain, T=0.7 |
+|---|---|---|---|---|---|---|
+| 2B, short | 0.085 s, 50.6 tok/s (52%) | 0.086 s, 52.2 | 0.143 s, 53.4 | 0.086 s, 49.8 | 0.085 s, 50.8 | 0.084 s, 52.3 |
+| 2B, ~1k | 0.278 s, 51.9 (59%) | 0.276 s, 57.7 | 0.384 s, 53.7 | 0.279 s, 51.2 | 0.277 s, 52.1 | 0.279 s, 50.3 |
+| 4B, short | 0.185 s, 26.8 (61%) | 0.186 s, 26.8 | 0.326 s, 27.2 | 0.187 s, 26.5 | 0.185 s, 26.8 | 0.186 s, 26.0 |
+| 4B, ~1k | 0.633 s, 27.9 (72%) | 0.635 s, 26.1 | 0.889 s, 26.7 | 0.631 s, 27.5 | 0.633 s, 27.9 | 0.633 s, 26.3 |
+| 35B, short | 0.223 s, 26.4 (67%) | 0.224 s, 26.8 | 0.555 s, 27.3 | 0.226 s, 26.0 | 0.224 s, 26.4 | 0.227 s, 26.1 |
+| 35B, ~1k | 1.021 s, 26.0 (73%) | 1.026 s, 27.0 | 1.344 s, 24.6 | 1.035 s, 25.7 | 1.029 s, 26.0 | 1.021 s, 25.6 |
+
+In brackets: MTP drafts accepted. At temperature 0.7 the other modes match
+temperature 0 within 1–3 tok/s. Against main (`serve_bench.py`, the same
+method as the "Measured" table above): 2B 0.282 s / 55.9 tok/s at ~1k
+(main 0.284 s / 55.3), 4B 0.642 s / 25.8 (0.643 s / 25.8), 35B 1.031 s /
+25.9 (1.046 s / 26.2). The first constrained request builds the
+vocabulary index: 0.1–0.3 s more than the next one (2B 1.87 against
+1.73 s, 4B 2.89 / 2.61 s, 35B 3.41 / 3.33 s).
+
 ## Testing a server
 
 `tools/serve/` drives a running server through the official `openai` Python
@@ -336,6 +416,18 @@ client (`pip install openai httpx`). Each takes `--base-url` (default
   short and a ~1k-token prompt. Start the server with `--prompt-cache 0`.
   With `--gufo-npu BIN --model GGUF` it also times `gufo-npu generate` on
   the same prompts (`--skip-http` times only that).
+- `serve_quality.py --checks ...`: greedy reply hashes (with and without
+  logprobs), structured outputs (`--cases` per case, `--thinking-cases`,
+  `--only`), logprobs consistency (`--compare A.json B.json` diffs two runs,
+  e.g. `--draft mtp` against `--draft none`), `logit_bias`,
+  `parallel_tool_calls`, `/v1/completions` (`functional`, with
+  `--tokenizer tokenizer.json` and `pip install tokenizers`), a forced tool
+  call (`tool`) and model switching (`switch --switch ID,ID`). Needs
+  `pip install jsonschema`.
+- `serve_speed.py`: per request mode (plain, json_schema, tool_choice
+  required, logprobs, n=3) at temperature 0 and 0.7, the engine's time to
+  the first token, decode tok/s and MTP acceptance from `/metrics`. Start
+  the server with `--prompt-cache 0`.
 - `serve_soak.py --minutes N`: mixed multi-turn traffic (streamed, sampled
   and hung-up requests). It prints time to the first token and decode tok/s
   per `--window` seconds. With `--server-pid` (on the server's machine) it
