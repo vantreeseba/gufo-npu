@@ -24,6 +24,43 @@ straight from the decoder's q4nx arenas (1.25 s to the first token at ~1k
 tokens). Speeds in [BENCHMARKS.md](BENCHMARKS.md). See
 [the plan](../../PLAN.md).
 
+## How a token runs
+
+Orange runs on the NPU, blue on the CPU.
+
+**Decode, one layer** (1 or 2 tokens per pass):
+
+```mermaid
+flowchart LR
+  inp["Norm + input<br/>projection"]:::npu --> mix["Token mixer: Gated DeltaNet (30 layers)<br/>or gated attention (10 layers)"]:::cpu
+  mix --> out["Output projection<br/>(submission 1)"]:::npu
+  out --> route["Router: 256 scores in fp32,<br/>pick the top 8"]:::cpu
+  route --> patch["Point the expert gathers<br/>at the 8 chosen experts"]:::cpu
+  patch --> sub
+  subgraph sub ["Submission 2"]
+    gu["Gate + up of 8 experts + shared,<br/>SwiGLU x router weights"]:::npu --> dn["Down of all of them"]:::npu --> nxt["Residual + norm,<br/>next layer's input projection"]:::npu
+  end
+  classDef npu fill:#ffa94d,stroke:#d9480f,color:#000
+  classDef cpu fill:#74c0fc,stroke:#1864ab,color:#000
+```
+
+*Qwen3.6-35B-A3B: 40 layers, hidden 2,048, GQA 16 query / 2 KV heads (head dim 256), DeltaNet 16 key / 32 value heads, 256 experts (FFN 512) with 8 active plus 1 shared. Each layer's experts sit in one device arena; the host rewrites the gathers' read offsets in the instruction stream after routing, so only the chosen experts are read. Two submissions per layer, 81 per token; a 2-token pass reads the union of both tokens' experts once.*
+
+**Prompt pass** (prompts of 6 tokens or more, up to 16,384 tokens per pass):
+
+```mermaid
+flowchart LR
+  pr["Whole prompt,<br/>layer by layer"] --> dense["Input and output projections:<br/>bfp16 GEMMs (converted once at load)"]:::npu
+  dense --> mixp["DeltaNet + attention,<br/>batched"]:::cpu
+  mixp --> rt["Router per token,<br/>on the thread pool"]:::cpu
+  rt --> ex["Experts + shared expert: AVX-512 BF16,<br/>read straight from the decoder's q4nx arenas"]:::cpu
+  ex --> dense
+  classDef npu fill:#ffa94d,stroke:#d9480f,color:#000
+  classDef cpu fill:#74c0fc,stroke:#1864ab,color:#000
+```
+
+*The experts run on the CPU because it reads memory about twice as fast as the NPU and a prompt touches all 256 experts per layer; this beats the NPU expert kernels at every prompt length. About half the prompt pass's FLOPs run on the NPU (51% at ~1k tokens).*
+
 ## The GGUF (`Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`)
 
 Unsloth's `Qwen3.6-35B-A3B-MTP-GGUF`, UD-Q4_K_XL: 22.85 GB, 753 tensors,
