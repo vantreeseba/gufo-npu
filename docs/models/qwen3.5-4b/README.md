@@ -53,6 +53,42 @@ By bytes: Q4_K 1.23 GB, Q6_K 1.00 GB, Q5_K 0.45 GB, Q8_0 0.28 GB. The NPU
 path packs every matrix into q4nx (4.625 bits per weight): Q4_K code for code,
 the rest requantized.
 
+## How a token runs
+
+Orange runs on the NPU, blue on the CPU.
+
+**Decode, one layer** (1 or 2 tokens per pass):
+
+```mermaid
+flowchart LR
+  inp["Norm + input projection"]:::npu --> mix["Token mixer:<br/>Gated DeltaNet (24 layers)<br/>or gated attention (8 layers)"]:::cpu
+  mix --> sub
+  subgraph sub ["One chained NPU submission"]
+    out["Output projection"]:::npu --> ffn["Residual + norm,<br/>gate + up, SwiGLU"]:::npu --> down["Down projection"]:::npu --> nxt["Residual + norm,<br/>next layer's input projection"]:::npu
+  end
+  nxt -.-> mix
+  lm["LM head"]:::npu --> pick["Sample / check the MTP draft"]:::cpu
+  classDef npu fill:#ffa94d,stroke:#d9480f,color:#000
+  classDef cpu fill:#74c0fc,stroke:#1864ab,color:#000
+```
+
+*Qwen3.5-4B: 32 layers, hidden 2,560, FFN 9,216, GQA 16 query / 4 KV heads (head dim 256), DeltaNet 16 key / 32 value heads; its own NPU programs (`qwen35_4b_decode`, `qwen35_4b_prefill`). Every weight matrix is a q4nx GEMV on the NPU; the CPU runs only the mixers (and DeltaNet's small alpha/beta rows), so a token is about 33 NPU submissions (33.5 measured).*
+
+**Prompt pass** (prompts of 7 tokens or more):
+
+```mermaid
+flowchart LR
+  chunk["Prompt chunk<br/>(lanes of 256, 512<br/>or 1,024 tokens)"] --> proj["Projections as<br/>bfp16 GEMMs"]:::npu
+  proj --> mixp["Norms, residuals, SwiGLU,<br/>DeltaNet + attention, batched"]:::cpu
+  mixp --> proj
+  mixp --> state["Decoder state filled<br/>(K/V, DeltaNet, MTP cache)"]
+  state --> first["First token: LM head<br/>on the last row"]:::npu
+  classDef npu fill:#ffa94d,stroke:#d9480f,color:#000
+  classDef cpu fill:#74c0fc,stroke:#1864ab,color:#000
+```
+
+*With two chunks in flight, one chunk's GEMMs on the NPU overlap the CPU mixing the other.*
+
 ## Bytes per decoded token (q4nx)
 
 | Part | Rows x dim | MB per token |

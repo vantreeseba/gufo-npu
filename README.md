@@ -76,6 +76,47 @@ The NPU's share of the FLOPs (and of the bytes read, in decode). These are **com
 - The 4B runs on its own NPU programs (decode GEMV and prefill GEMM built with its geometry), so its kernels cannot change the 2B's.
 - The model's MTP head drafts tokens that a 2-token pass verifies, with the same output as plain greedy.
 
+How a request runs (orange on the NPU, blue on the CPU):
+
+```mermaid
+flowchart TB
+  req(["Chat request"]) --> tok["Chat template + tokenizer"]:::cpu
+  tok --> pc["Prompt cache: restore the longest saved prefix"]:::cpu
+  pc --> pp
+  subgraph pp ["Prompt pass: the whole prompt, layer by layer"]
+    gemm["Weight matrices as bfp16 GEMMs"]:::npu
+    mixp["DeltaNet + attention, batched<br/>(35B: experts too)"]:::cpu
+  end
+  pp --> dl
+  subgraph dl ["Decode loop: 1 or 2 tokens per pass"]
+    gemv["Every weight matrix: q4nx GEMVs,<br/>chained into a few submissions"]:::npu
+    mixd["DeltaNet + attention step<br/>(35B: expert router)"]:::cpu
+    mtp["MTP head drafts the next token"]:::npu
+    samp["Sample; keep or drop the draft"]:::cpu
+  end
+  dl --> out(["Detokenize, stream to the client"])
+  classDef npu fill:#ffa94d,stroke:#d9480f,color:#000
+  classDef cpu fill:#74c0fc,stroke:#1864ab,color:#000
+```
+
+*The CPU does the small, state-heavy work (mixers, routing, sampling); the NPU streams the weights. Prompts under 6–7 tokens go straight to the decode loop.*
+
+How one decode GEMV uses the NPU array (`kernels/designs/q4nx_gemv.py`):
+
+```mermaid
+flowchart TB
+  ddr[("DDR: weights in q4nx,<br/>4.625 bits per weight")] --> shim["8 shim DMAs, one per column,<br/>each streams its own weight slice"]:::npu
+  tokin[("Token(s) + norm weight")] --> bc["Broadcast to every core"]:::npu
+  shim --> mem["Memtiles split each column's<br/>slice across its 4 cores"]:::npu
+  mem --> cores["4 x 8 = 32 compute cores: unpack q4nx to bf16,<br/>dot with 1 or 2 tokens, 32 output rows each per round"]:::npu
+  bc --> cores
+  cores --> stages["Fused stages: RMS norm + residual in,<br/>SwiGLU out"]:::npu
+  stages --> back[("Outputs joined per column, back to DDR,<br/>straight into the next GEMV's input")]
+  classDef npu fill:#ffa94d,stroke:#d9480f,color:#000
+```
+
+*Why it's fast: decode is bound by memory reads, so fewer bits per weight (4.625) means more tokens per second; a 2-token pass reads the weights once for both tokens, so MTP drafts are nearly free; norms, residuals and SwiGLU ride along inside the GEMVs, so a dense layer is one chained NPU submission; and the CPU work reads memory at the same time as the NPU (~170 GB/s together, against ~56 GB/s for the NPU alone).*
+
 | Phase | Scope | State |
 |---|---|---|
 | 0 | Repo, CI, pinned toolchain, smoke kernel | done |
