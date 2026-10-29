@@ -1,0 +1,180 @@
+#include "serve/logging.hpp"
+
+#include <unistd.h>
+
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <ctime>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <mutex>
+#include <sstream>
+#include <string>
+
+namespace gufo_npu::serve {
+namespace {
+
+std::mutex& LogMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::atomic<LogLevel>& LevelStorage() {
+  static std::atomic<LogLevel> level{LogLevel::kInfo};
+  return level;
+}
+
+// Control bytes escaped, long input cut: a line stays one line.
+std::string SafeLine(std::string_view input, std::size_t limit = 8192) {
+  std::string output;
+  for (const unsigned char c : input.substr(0, limit)) {
+    if (c < 0x20 || c == 0x7f) {
+      static constexpr char kHex[] = "0123456789abcdef";
+      output += "\\x";
+      output += kHex[c >> 4];
+      output += kHex[c & 15];
+    } else {
+      output += static_cast<char>(c);
+    }
+  }
+  if (input.size() > limit) {
+    output += "...";
+  }
+  return output;
+}
+
+std::string CurrentTimestamp() {
+  const auto seconds =
+      std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+  std::tm calendar{};
+  localtime_r(&seconds, &calendar);
+  std::array<char, 32> buffer{};
+  const auto written = std::strftime(buffer.data(), buffer.size(),
+                                     "%Y-%m-%d %H:%M:%S", &calendar);
+  return {buffer.data(), written};
+}
+
+std::size_t ReadMemoryKiB(const char* path, std::string_view field) {
+  std::ifstream input(path);
+  for (std::string line; std::getline(input, line);) {
+    if (line.rfind(field, 0) == 0) {
+      std::istringstream value(line.substr(field.size()));
+      std::size_t kib = 0;
+      if (value >> kib) {
+        return kib;
+      }
+    }
+  }
+  return 0;
+}
+
+}  // namespace
+
+std::optional<LogLevel> LogLevelFromName(std::string_view name) {
+  if (name == "debug") {
+    return LogLevel::kDebug;
+  }
+  if (name == "info") {
+    return LogLevel::kInfo;
+  }
+  if (name == "warn") {
+    return LogLevel::kWarn;
+  }
+  if (name == "error") {
+    return LogLevel::kError;
+  }
+  return std::nullopt;
+}
+
+std::string_view LogLevelName(LogLevel level) {
+  switch (level) {
+    case LogLevel::kDebug:
+      return "debug";
+    case LogLevel::kInfo:
+      return "info";
+    case LogLevel::kWarn:
+      return "warn";
+    case LogLevel::kError:
+      return "error";
+  }
+  return "info";
+}
+
+void Logger::SetLevel(LogLevel level) {
+  LevelStorage().store(level, std::memory_order_relaxed);
+}
+
+LogLevel Logger::Level() {
+  return LevelStorage().load(std::memory_order_relaxed);
+}
+
+bool Logger::Enabled(LogLevel level) {
+  return level >= Level();
+}
+
+void Logger::Log(LogLevel level, std::string_view component,
+                 std::string_view message) {
+  if (!Enabled(level)) {
+    return;
+  }
+  static const bool color =
+      std::getenv("NO_COLOR") == nullptr && isatty(STDERR_FILENO) == 1;
+  const char* tag = level == LogLevel::kError   ? "ERROR"
+                    : level == LogLevel::kWarn  ? "WARN"
+                    : level == LogLevel::kDebug ? "DEBUG"
+                                                : "INFO";
+  const char* tint = level == LogLevel::kError   ? "\033[31m"
+                     : level == LogLevel::kWarn  ? "\033[33m"
+                     : level == LogLevel::kDebug ? "\033[2;36m"
+                                                 : "\033[32m";
+  std::ostringstream output;
+  output << CurrentTimestamp() << ' ';
+  if (color) {
+    output << tint;
+  }
+  output << '[' << tag << ']';
+  if (color) {
+    output << "\033[0m";
+  }
+  output << " [" << SafeLine(component, 64) << "] " << SafeLine(message)
+         << '\n';
+  const std::lock_guard lock(LogMutex());
+  std::clog << output.str() << std::flush;
+}
+
+std::string Logger::MemoryStatus() {
+  std::ostringstream output;
+  output << "rss_mib=" << ReadMemoryKiB("/proc/self/status", "VmRSS:") / 1024
+         << " host_available_mib="
+         << ReadMemoryKiB("/proc/meminfo", "MemAvailable:") / 1024;
+  return output.str();
+}
+
+void Logger::LogRequest(std::string_view id, std::string_view method,
+                        std::string_view path, int status_code,
+                        double duration_ms, std::string_view details,
+                        std::string_view outcome, LogLevel success_level) {
+  const LogLevel level =
+      status_code >= 500 || outcome == "stream_error"   ? LogLevel::kError
+      : status_code >= 400 || outcome == "disconnected" ? LogLevel::kWarn
+                                                        : success_level;
+  // A dropped line does not pay for MemoryStatus()'s two /proc reads.
+  if (!Enabled(level)) {
+    return;
+  }
+  std::ostringstream message;
+  message << "request=" << id << " event=completed method=" << method
+          << " path=" << path << " status=" << status_code
+          << " duration_ms=" << std::fixed << std::setprecision(1)
+          << duration_ms << " outcome=" << outcome;
+  if (!details.empty()) {
+    message << ' ' << details;
+  }
+  message << ' ' << MemoryStatus();
+  Log(level, "http", message.str());
+}
+
+}  // namespace gufo_npu::serve
