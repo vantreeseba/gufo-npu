@@ -11,12 +11,14 @@ Text only for now: the model's vision tower (images, video) is not run.
 
 ## Weights
 
-[`Qwen/Qwen3-VL-Embedding-2B`](https://huggingface.co/Qwen/Qwen3-VL-Embedding-2B)
-(Apache-2.0), converted to a BF16 GGUF with llama.cpp's
-`convert_hf_to_gguf.py --outtype bf16`, which writes the text model as arch
-`qwen3vl` (the vision tower goes to a separate mmproj file, not needed
-here). F16, F32 and quantized GGUFs load too; every matrix is rounded to
-bfp16 at load either way.
+Tested with [`mradermacher/Qwen3-VL-Embedding-2B-GGUF`](https://huggingface.co/mradermacher/Qwen3-VL-Embedding-2B-GGUF),
+`Qwen3-VL-Embedding-2B.f16.gguf` (3,447,351,456 bytes): llama.cpp's
+conversion of [`Qwen/Qwen3-VL-Embedding-2B`](https://huggingface.co/Qwen/Qwen3-VL-Embedding-2B)
+(Apache-2.0), the text model as arch `qwen3vl` (the vision tower is the
+repo's separate mmproj file, not needed here). The original weights are
+BF16; F16 holds them with no measurable loss (QUALITY.md: the CPU reference
+on this file matches HF to cosine 1.000000). BF16, F32 and quantized GGUFs
+load too; every matrix is rounded to bfp16 at load either way.
 
 ## Architecture (from the HF config)
 

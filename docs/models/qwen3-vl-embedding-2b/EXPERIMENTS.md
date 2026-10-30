@@ -13,6 +13,10 @@
 
 ## Candidates
 
+- **Faster CPU attention** (measured 2026-10-30: 42% of the time at 512
+  tokens, 72% at 2,048). Port the prefills' blocked kernels (keys widened
+  in registers, 4 query heads per key load, AVX-512) to 2 query heads per KV
+  head, or move attention to the NPU.
 - Skip the last layer's output projection and FFN for every row but each
   input's last (~2.5% of the GEMM work).
 - Overlap the end of one projection with the start of the next (today the

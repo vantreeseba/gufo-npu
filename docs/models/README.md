@@ -5,7 +5,7 @@
 | [Qwen3.5-2B](qwen3.5-2b/README.md) | MVP; fast side tasks | Unsloth GGUF (UD-Q4_K_XL) | NPU decode with MTP, NPU prefill |
 | [Qwen3.5-4B](qwen3.5-4b/README.md) | dense, bigger sibling of the 2B; its own NPU programs | Unsloth GGUF (UD-Q4_K_XL) | NPU decode with MTP, NPU prefill |
 | [Qwen3.6-35B-A3B](qwen3.6-35b-a3b/README.md) | second pass (MoE) | Unsloth GGUF (UD-Q4_K_XL) | CPU reference and decoder, NPU decode |
-| [Qwen3-VL-Embedding-2B](qwen3-vl-embedding-2b/README.md) | text embeddings for search (`/v1/embeddings`) | BF16 GGUF converted with llama.cpp | CPU reference, NPU GEMMs; first NPU run pending |
+| [Qwen3-VL-Embedding-2B](qwen3-vl-embedding-2b/README.md) | text embeddings for search (`/v1/embeddings`) | mradermacher F16 GGUF | NPU GEMMs, matches HF (cosine ≥ 0.998); ~3.3k tok/s batched |
 
 Each model folder holds:
 
