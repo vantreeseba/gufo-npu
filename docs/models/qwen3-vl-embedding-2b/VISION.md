@@ -174,13 +174,19 @@ stage 2.
 | patch embed + 4 mergers | 0.37 T | 0.02-0.03 s |
 | text GEMMs (2.82 GFLOP x 1830) | 5.16 T | 0.29-0.47 s |
 | **GEMMs total** | **9.9 T** | **0.55-0.90 s** |
-| ViT attention (4 n^2 d x 24, 19.9 G exps) | 5.10 T | CPU: ~5-25 s (0.2-1 TFLOPS fp32) |
-| text attention (causal, 28 layers) | 0.38 T | CPU: ~0.4-2 s |
+| ViT attention (4 n^2 d x 24, 19.9 G exps) | 5.10 T | CPU today: ~12 s |
+| text attention (causal, 28 layers) | 0.38 T | CPU today: ~0.9 s |
+
+CPU attention rate: BENCHMARKS.md (2026-10-30) has 8 x 2,048-token inputs
+at 1,297 tok/s with 72% in CPU attention, i.e. 3.85 TFLOP in ~9.1 s,
+~0.42 TFLOPS effective with the current per-key loop. A blocked AVX-512
+kernel (EXPERIMENTS.md's next step) may gain a few times; still several
+seconds per page against ~0.7 s of NPU GEMMs.
 
 The ViT attention is O(n^2) and larger than all the GEMMs together at page
 size: 0.10 T at 1024 patches, 1.6 T at 4096, 5.1 T at 7200, 26 T at 16384.
 With the GEMMs on the NPU and attention on the CPU a page would take
-roughly 6-25 s, almost all of it CPU attention. NPU attention (or a smaller
+roughly 14 s, ~90% of it CPU attention. NPU attention (or a smaller
 `max_pixels`; quality cost unmeasured) is what makes images practical.
 Memory: the ViT keeps 7200 x 4096 fp32 (118 MB) of activations at most.
 
