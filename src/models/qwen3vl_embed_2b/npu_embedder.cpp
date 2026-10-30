@@ -14,7 +14,7 @@
 #include "core/quant.hpp"
 #include "core/simd.hpp"
 #include "core/vec.hpp"
-#include "models/qwen3vl_embed_2b/npu/gemm.hpp"
+#include "models/qwen3vl_embed_2b/npu/embed_gemm.hpp"
 #include "models/qwen3vl_embed_2b/ops.hpp"
 #include "npu/gemm.hpp"
 

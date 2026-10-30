@@ -1,4 +1,4 @@
-#include "models/qwen3vl_embed_2b/npu/gemm.hpp"
+#include "npu/gemm.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -11,7 +11,7 @@
 #include "core/bfp16.hpp"
 #include "core/parallel.hpp"
 #include "core/quant.hpp"
-#include "npu/gemm.hpp"
+#include "models/qwen3vl_embed_2b/npu/embed_gemm.hpp"
 
 // Qwen3-VL-Embedding-2B's GEMM program on the NPU at every compiled shape,
 // against a double-precision CPU reference: bf16 weights (as the model's

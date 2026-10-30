@@ -1,6 +1,6 @@
 """Qwen3-VL-Embedding-2B's GEMM shapes (embed_gemm.py): pure data, no IRON
 imports, so kernels/build.py --list-outputs can read OUTPUTS at configure
-time. Must match src/models/qwen3vl_embed_2b/npu/gemm.hpp.
+time. Must match src/models/qwen3vl_embed_2b/npu/embed_gemm.hpp.
 """
 
 HIDDEN = 2048

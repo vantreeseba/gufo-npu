@@ -7,7 +7,7 @@
 #include "models/qwen3vl_embed_2b/embedder.hpp"
 
 // Qwen3-VL-Embedding-2B on the NPU. Every matrix product is a bfp16 GEMM on
-// the model's own GEMM program (npu/gemm.hpp); the CPU runs the norms,
+// the model's own GEMM program (npu/embed_gemm.hpp); the CPU runs the norms,
 // residual adds, SwiGLU, attention and pooling (ops.hpp).
 //
 // Inputs are packed back to back into one batch of rows (up to
