@@ -150,7 +150,7 @@ K % 512 == 0 and N % 64 == 0, chunks of M = 256/512/1024 rows, no bias.
 
 | Product | M (page) | K | N | Tiles? |
 |---|---|---|---|---|
-| patch embed (W0+W1) | 7200 | 768 | 1024 | no: pad K to 1024 with zeros, or run K = 1536 unsummed (11-23 GFLOP, or CPU) |
+| patch embed (W0+W1) | 7200 | 768 | 1024 | not as is: pad K to 1024 with zeros (or run K = 1536 unsummed); 11-15 GFLOP |
 | ViT qkv | 7200 | 1024 | 3072 | yes |
 | ViT attn proj | 7200 | 1024 | 1024 | yes |
 | ViT fc1 | 7200 | 1024 | 4096 | yes |
@@ -160,11 +160,31 @@ K % 512 == 0 and N % 64 == 0, chunks of M = 256/512/1024 rows, no bias.
 
 Six new (K, N) shapes in the xclbin: (1024, 3072), (1024, 1024),
 (1024, 4096), (4096, 1024), (4096, 4096), (4096, 2048); a patch embed
-padded to K = 1024 reuses (1024, 1024). Every linear here has a bias: add it on the
-CPU while widening C from bf16 (one add per output, ~1% of a layer's CPU
-time), or later as a GEMM epilogue. LayerNorm, GELU (tanh and erf), RoPE,
-the position-embedding resample and the residual adds stay on the CPU in
-stage 2.
+padded to K = 1024 reuses (1024, 1024). Every linear here has a bias.
+
+### Where each piece runs
+
+Target: Strix Halo only (Zen 5 with AVX-512, the XDNA2 NPU; never the
+iGPU). The NPU takes the work; a piece runs on the CPU only where it is
+measurably and clearly faster there, and the measurement goes in
+EXPERIMENTS.md.
+
+| Piece | Where | Why |
+|---|---|---|
+| decode, smart_resize, Pillow resize, patchify | CPU | irregular byte work, once per image, ~10 M pixel ops |
+| position-embedding resample | CPU, cached per grid size | a gather of 4 rows per patch; constant for a grid |
+| 2D RoPE / MRoPE tables | CPU, cached per grid | cos/sin tables, constant for a grid |
+| all linears (patch embed, qkv, proj, fc1, fc2, mergers) | NPU GEMM | 98% of the FLOPs outside attention |
+| bias adds | NPU, GEMM epilogue | interim: CPU add while widening C, until the epilogue exists |
+| LayerNorm, GELU (tanh, erf), residual adds | NPU, fused into the GEMM's input or output side | elementwise over 7200 x 4096 per layer; on the CPU they would cost more than the NPU GEMMs they sit between |
+| ViT attention (full, head 64) | NPU | 5.1 TFLOP per page, more than all GEMMs |
+| text attention (causal, MRoPE) | NPU, with the text path | shared with text inputs |
+| pooling, L2 norm | CPU | one 2048-vector per input |
+
+Elementwise ops start on the CPU (AVX-512) in stage 2 only to get
+correctness first; each one moves to the NPU unless the measured CPU time
+is clearly lower than the NPU's for the same work, including the bf16
+round trip.
 
 ## Cost of a page (1280 x 1440: 7200 patches, 1800 + ~30 tokens)
 
@@ -192,22 +212,25 @@ Memory: the ViT keeps 7200 x 4096 fp32 (118 MB) of activations at most.
 
 ## Plan
 
-1. **CPU reference** (`vision.hpp/.cpp`, done here): mmproj loading,
+1. **CPU reference** (`vision.hpp/.cpp`, done): mmproj loading,
    smart_resize + Pillow bicubic + patchify on raw RGB8 (no image decoder),
    the ViT and mergers in fp32, MRoPE positions and the DeepStack hook in
-   `Reference::EmbedImage`. Checks: `qwen3vl_embed_2b_vision_test`
-   (model-free: smart_resize, resize, patch order, positions, position
-   interpolation) and the oracle's image cases (`--images`), cosine with
-   HF's fp32 embedding.
-2. **NPU GEMMs**: add the ViT and merger shapes to `embed_gemm_variants.py`
-   (same xclbin, so one hardware context), a `NpuVision` mirroring
-   `npu_embedder.cpp` (bias adds on the CPU), MRoPE + DeepStack in the NPU
-   embedder; teacher-forced checks against stage 1 (cosine > 0.99 per
-   case), op tests for each new shape.
+   `Reference::EmbedImage`. The test oracle, not a runtime path. Checks:
+   `qwen3vl_embed_2b_vision_test` (model-free) and
+   `qwen3vl_embed_2b_vision_oracle_test` against HF fp32 (QUALITY.md).
+2. **NPU GEMMs**: the ViT and merger shapes in `embed_gemm_variants.py`
+   (same xclbin, one hardware context), an `NpuVision` mirroring
+   `npu_embedder.cpp`, MRoPE + DeepStack in the NPU embedder; elementwise
+   ops on the CPU for now. Checks: op tests per new shape (relative error
+   < 1e-2), cosine to the stage-1 reference per case, per-phase timings.
 3. **NPU attention**: a bidirectional flash-attention kernel (head 64,
-   fp32/bf16 softmax on the core) for the ViT, then for the text's causal
-   attention; measure against the CPU path per phase.
-4. API: `/v1/embeddings` and `gufo-npu embed` take an image (decoded by
+   online softmax on the core) for the ViT, then the text's causal
+   attention with MRoPE-rotated q/k. This is the stage that decides the
+   page time (CPU attention would be ~90% of it).
+4. **Fusion**: bias + GELU epilogues and LayerNorm on the NPU, in
+   runlists, so a ViT layer is a handful of commands; each move is kept
+   only when the timing says so.
+5. API: `/v1/embeddings` and `gufo-npu embed` take an image (decoded by
    the caller or a small decoder behind the CLI; the library takes RGB8).
 
 ## Open questions and risks
