@@ -1,4 +1,5 @@
-# HF transformers oracle for the CPU reference (tools/reference/qwen35_oracle.py).
+# HF transformers oracles: the CPU reference (tools/reference/qwen35_oracle.py)
+# and Qwen3-VL-Embedding-2B (qwen3vl_embedding_oracle.py).
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.13.0+cpu
 transformers==5.21.0

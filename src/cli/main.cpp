@@ -36,6 +36,10 @@
 #include "models/qwen35_4b/npu_decoder.hpp"
 #include "models/qwen35_4b/npu_prefill.hpp"
 #include "models/qwen36_35b_a3b/npu_prefill.hpp"
+#include "models/qwen3vl_embed_2b/input.hpp"
+#include "models/qwen3vl_embed_2b/npu_embedder.hpp"
+#include "models/qwen3vl_embed_2b/ops.hpp"
+#include "models/qwen3vl_embed_2b/reference.hpp"
 #include "npu/device.hpp"
 #include "npu/gemv.hpp"
 #include "serve/chat_format.hpp"
@@ -72,6 +76,20 @@ constexpr char kUsage[] =
     "                           the decoder alone; --experts picks where\n"
     "                           Qwen3.6-35B-A3B's prefill runs its experts\n"
     "                           (default cpu)\n"
+    "  bench embed --model GGUF [--tokens 128,512,2048] [--batch N] [--runs "
+    "N]\n"
+    "              [--kernels DIR]\n"
+    "                           embedding throughput on the NPU per input\n"
+    "                           length, warm: --batch inputs (default 8) of\n"
+    "                           each length per call, --runs timed calls\n"
+    "                           (default 5) after 2 warm-up calls\n"
+    "  embed --model GGUF [--text TEXT ...] [--instruction TEXT]\n"
+    "        [--dimensions N] [--similarity] [--device npu|cpu] [--kernels "
+    "DIR]\n"
+    "                           embeddings of the texts (one per --text, else\n"
+    "                           one per non-empty stdin line) as JSON lines;\n"
+    "                           --similarity prints their cosine matrix\n"
+    "                           instead; cpu is the reference (default npu)\n"
     "  generate --model GGUF --prompt TEXT [--system TEXT] [--max-tokens N]\n"
     "           [--think] [--device cpu|npu] [--draft mtp|none] [--kernels "
     "DIR]\n"
@@ -1009,6 +1027,228 @@ int Generate(const std::vector<std::string_view>& args) {
 
 }  // namespace
 
+// ---- Embeddings (Qwen3-VL-Embedding-2B) ----
+
+std::unique_ptr<gufo_npu::qwen3vl_embed_2b::Embedder> LoadEmbedder(
+    const gufo_npu::gguf::File& file, const std::string& device,
+    const std::optional<std::string>& kernels) {
+  namespace e = gufo_npu::qwen3vl_embed_2b;
+  if (device == "cpu") {
+    return std::make_unique<e::Reference>(file);
+  }
+  return std::make_unique<e::NpuEmbedder>(file, KernelDir(kernels));
+}
+
+int Embed(const std::vector<std::string_view>& args) {
+  namespace e = gufo_npu::qwen3vl_embed_2b;
+  std::string model;
+  std::vector<std::string> texts;
+  std::string instruction;
+  int dimensions = 0;
+  bool similarity = false;
+  std::string device = "npu";
+  std::optional<std::string> kernels;
+  try {
+    for (std::size_t i = 0; i < args.size(); ++i) {
+      const bool has_value = i + 1 < args.size();
+      if (args[i] == "--model" && has_value) {
+        model = std::string(args[++i]);
+      } else if (args[i] == "--text" && has_value) {
+        texts.emplace_back(args[++i]);
+      } else if (args[i] == "--instruction" && has_value) {
+        instruction = std::string(args[++i]);
+      } else if (args[i] == "--dimensions" && has_value) {
+        dimensions = std::stoi(std::string(args[++i]));
+      } else if (args[i] == "--similarity") {
+        similarity = true;
+      } else if (args[i] == "--device" && has_value) {
+        device = std::string(args[++i]);
+      } else if (args[i] == "--kernels" && has_value) {
+        kernels = std::string(args[++i]);
+      } else {
+        std::cerr << kUsage;
+        return 2;
+      }
+    }
+  } catch (const std::logic_error&) {
+    std::cerr << kUsage;
+    return 2;
+  }
+  if (model.empty() || (device != "cpu" && device != "npu") ||
+      (dimensions != 0 && dimensions < e::kMinDimensions)) {
+    std::cerr << kUsage;
+    return 2;
+  }
+  if (texts.empty()) {
+    for (std::string line; std::getline(std::cin, line);) {
+      if (!line.empty()) {
+        texts.push_back(line);
+      }
+    }
+  }
+  if (texts.empty()) {
+    std::cerr << "embed: no texts (--text, or lines on stdin)\n";
+    return 2;
+  }
+  try {
+    const auto file = gufo_npu::gguf::File::Open(model);
+    const gufo_npu::Tokenizer tokenizer(*file);
+    const auto embedder = LoadEmbedder(*file, device, kernels);
+    std::vector<std::vector<int>> inputs;
+    for (const auto& text : texts) {
+      inputs.push_back(e::InputIds(tokenizer, text, instruction));
+    }
+    const auto start = std::chrono::steady_clock::now();
+    auto vectors = embedder->Embed(inputs);
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+            .count();
+    long tokens = 0;
+    for (std::size_t i = 0; i < vectors.size(); ++i) {
+      e::Truncate(vectors[i], dimensions);
+      tokens += static_cast<long>(inputs[i].size());
+    }
+    if (similarity) {
+      for (const auto& a : vectors) {
+        for (std::size_t j = 0; j < vectors.size(); ++j) {
+          double dot = 0;
+          for (std::size_t k = 0; k < a.size(); ++k) {
+            dot += static_cast<double>(a[k]) * vectors[j][k];
+          }
+          std::printf("%s%.4f", j == 0 ? "" : " ", dot);
+        }
+        std::printf("\n");
+      }
+    } else {
+      for (std::size_t i = 0; i < vectors.size(); ++i) {
+        std::printf("{\"index\":%zu,\"tokens\":%zu,\"embedding\":[", i,
+                    inputs[i].size());
+        for (std::size_t k = 0; k < vectors[i].size(); ++k) {
+          std::printf("%s%.8g", k == 0 ? "" : ",", vectors[i][k]);
+        }
+        std::printf("]}\n");
+      }
+    }
+    std::fprintf(stderr,
+                 "embed: %zu inputs, %ld tokens in %.3f s (%.0f tok/s, %s)\n",
+                 vectors.size(), tokens, seconds,
+                 seconds > 0 ? tokens / seconds : 0.0, device.c_str());
+  } catch (const std::exception& ex) {
+    std::cerr << "embed: " << ex.what() << "\n";
+    return 1;
+  }
+  return 0;
+}
+
+int BenchEmbed(const std::vector<std::string_view>& args) {
+  namespace e = gufo_npu::qwen3vl_embed_2b;
+  std::string model;
+  std::vector<int> lengths = {128, 512, 2048};
+  int batch = 8;
+  int runs = 5;
+  std::optional<std::string> kernels;
+  try {
+    for (std::size_t i = 0; i < args.size(); ++i) {
+      const bool has_value = i + 1 < args.size();
+      if (args[i] == "--model" && has_value) {
+        model = std::string(args[++i]);
+      } else if (args[i] == "--tokens" && has_value) {
+        lengths.clear();
+        std::string list(args[++i]);
+        for (std::size_t at = 0; at <= list.size();) {
+          const auto comma = std::min(list.find(',', at), list.size());
+          lengths.push_back(std::stoi(list.substr(at, comma - at)));
+          at = comma + 1;
+        }
+      } else if (args[i] == "--batch" && has_value) {
+        batch = std::stoi(std::string(args[++i]));
+      } else if (args[i] == "--runs" && has_value) {
+        runs = std::stoi(std::string(args[++i]));
+      } else if (args[i] == "--kernels" && has_value) {
+        kernels = std::string(args[++i]);
+      } else {
+        std::cerr << kUsage;
+        return 2;
+      }
+    }
+  } catch (const std::logic_error&) {
+    std::cerr << kUsage;
+    return 2;
+  }
+  if (model.empty() || batch < 1 || runs < 1) {
+    std::cerr << kUsage;
+    return 2;
+  }
+  try {
+    const auto file = gufo_npu::gguf::File::Open(model);
+    const gufo_npu::Tokenizer tokenizer(*file);
+    e::NpuEmbedder embedder(*file, KernelDir(kernels));
+    // Content tokens: an English passage's ids, cycled and shifted per input
+    // so no two inputs are the same.
+    const auto words = tokenizer.Encode(
+        "The archive keeps receipts, letters and notes; each is searched by "
+        "meaning and by exact words, and the passage that matched is shown. ");
+    const int overhead =
+        static_cast<int>(
+            e::InputIdsFromTokens(tokenizer, {words[0]}, "").size()) -
+        1;
+    std::printf("%8s %6s %10s %10s %8s %8s %8s %8s\n", "tokens", "batch",
+                "tok/s", "best", "gemm", "sync", "attn", "other");
+    int salt = 0;
+    for (const int length : lengths) {
+      const int content = std::max(1, length - overhead);
+      auto make = [&] {
+        std::vector<std::vector<int>> inputs;
+        for (int b = 0; b < batch; ++b) {
+          std::vector<int> ids(static_cast<std::size_t>(content));
+          for (int t = 0; t < content; ++t) {
+            ids[t] = words[static_cast<std::size_t>(t + salt) % words.size()];
+          }
+          ++salt;
+          inputs.push_back(e::InputIdsFromTokens(tokenizer, ids, ""));
+        }
+        return inputs;
+      };
+      for (int w = 0; w < 2; ++w) {
+        embedder.Embed(make());
+      }
+      const auto before = embedder.profile();
+      double total = 0;
+      double best = 0;
+      long tokens = 0;
+      for (int r = 0; r < runs; ++r) {
+        const auto inputs = make();
+        long n = 0;
+        for (const auto& ids : inputs) {
+          n += static_cast<long>(ids.size());
+        }
+        const auto start = std::chrono::steady_clock::now();
+        embedder.Embed(inputs);
+        const double s = std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - start)
+                             .count();
+        total += s;
+        tokens += n;
+        best = std::max(best, n / s);
+      }
+      const auto& after = embedder.profile();
+      const auto share = [&](double a, double b) {
+        return 100.0 * (a - b) / std::max(total, 1e-9);
+      };
+      std::printf("%8d %6d %10.0f %10.0f %7.0f%% %7.0f%% %7.0f%% %7.0f%%\n",
+                  length, batch, tokens / total, best,
+                  share(after.gemm_seconds, before.gemm_seconds),
+                  share(after.sync_seconds, before.sync_seconds),
+                  share(after.attention_seconds, before.attention_seconds),
+                  share(after.other_seconds, before.other_seconds));
+    }
+  } catch (const std::exception& ex) {
+    std::cerr << "bench embed: " << ex.what() << "\n";
+    return 1;
+  }
+  return 0;
+}
+
 int Serve(const std::vector<std::string_view>& args) {
   namespace serve = gufo_npu::serve;
   serve::EngineOptions engine_options;
@@ -1207,6 +1447,12 @@ int main(int argc, char** argv) {
   }
   if (args[0] == "bench" && !rest.empty() && rest[0] == "mtp") {
     return BenchMtp({rest.begin() + 1, rest.end()});
+  }
+  if (args[0] == "bench" && !rest.empty() && rest[0] == "embed") {
+    return BenchEmbed({rest.begin() + 1, rest.end()});
+  }
+  if (args[0] == "embed") {
+    return Embed(rest);
   }
   std::cerr << "unknown command: " << args[0] << "\n" << kUsage;
   return 2;

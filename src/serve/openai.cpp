@@ -415,4 +415,91 @@ CompletionRequest ParseCompletionRequest(const json& body) {
   return req;
 }
 
+EmbeddingsRequest ParseEmbeddingsRequest(const json& body) {
+  if (!body.is_object()) {
+    throw InvalidRequest("the request body must be a JSON object");
+  }
+  EmbeddingsRequest req;
+  const auto bad_input = [] {
+    return InvalidRequest(
+        "input must be a non-empty string, an array of them, an array of "
+        "token ids or an array of such arrays",
+        "input");
+  };
+  const auto token_ids = [&](const json& arr) {
+    std::vector<int> ids;
+    for (const auto& t : arr) {
+      if (!t.is_number_integer() || t.get<std::int64_t>() < 0 ||
+          t.get<std::int64_t>() > std::numeric_limits<int>::max()) {
+        throw bad_input();
+      }
+      ids.push_back(t.get<int>());
+    }
+    if (ids.empty()) {
+      throw bad_input();
+    }
+    return ids;
+  };
+  const auto text = [&](const json& s) {
+    if (!s.is_string() || s.get<std::string>().empty()) {
+      throw bad_input();
+    }
+    return EmbeddingInput{s.get<std::string>(), std::nullopt};
+  };
+  const json* input = Field(body, "input");
+  if (input == nullptr) {
+    throw InvalidRequest("input is required", "input");
+  }
+  if (input->is_string()) {
+    req.inputs.push_back(text(*input));
+  } else if (input->is_array() && !input->empty()) {
+    const json& first = input->front();
+    if (first.is_string()) {
+      for (const auto& s : *input) {
+        req.inputs.push_back(text(s));
+      }
+    } else if (first.is_number_integer()) {
+      req.inputs.push_back({"", token_ids(*input)});
+    } else if (first.is_array()) {
+      for (const auto& p : *input) {
+        if (!p.is_array()) {
+          throw bad_input();
+        }
+        req.inputs.push_back({"", token_ids(p)});
+      }
+    } else {
+      throw bad_input();
+    }
+  } else {
+    throw bad_input();
+  }
+  if (req.inputs.size() > static_cast<std::size_t>(kMaxEmbeddingInputs)) {
+    throw InvalidRequest("at most " + std::to_string(kMaxEmbeddingInputs) +
+                             " inputs per request",
+                         "input");
+  }
+  if (const json* format = Field(body, "encoding_format")) {
+    if (!format->is_string() || (format->get<std::string>() != "float" &&
+                                 format->get<std::string>() != "base64")) {
+      throw InvalidRequest("encoding_format must be \"float\" or \"base64\"",
+                           "encoding_format");
+    }
+    req.base64 = format->get<std::string>() == "base64";
+  }
+  if (const auto dims =
+          Integer(body, "dimensions", 1, std::numeric_limits<int>::max())) {
+    req.dimensions = static_cast<int>(*dims);
+  }
+  if (const json* instruction = Field(body, "instruction")) {
+    if (!instruction->is_string()) {
+      throw InvalidRequest("instruction must be a string", "instruction");
+    }
+    req.instruction = instruction->get<std::string>();
+  }
+  if (const json* user = Field(body, "user"); user && !user->is_string()) {
+    throw InvalidRequest("user must be a string", "user");
+  }
+  return req;
+}
+
 }  // namespace gufo_npu::serve

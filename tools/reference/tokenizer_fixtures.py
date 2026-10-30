@@ -3,6 +3,8 @@
 
   python -I tokenizer_fixtures.py --model /models/Qwen3.5-2B-hf \
       --out tests/fixtures/tokenizer/qwen35.jsonl
+  python -I tokenizer_fixtures.py --model /models/Qwen3-VL-Embedding-2B \
+      --out tests/fixtures/tokenizer/qwen3vl.jsonl
 """
 
 import argparse

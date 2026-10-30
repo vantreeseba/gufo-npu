@@ -10,9 +10,10 @@
 
 #include "core/gguf.hpp"
 
-// Byte-level BPE tokenizer (GGUF `tokenizer.ggml.model = gpt2`) for Qwen3.5:
-// added tokens are split out first, then NFC normalisation, the Qwen3.5
-// pre-tokenizer regex, and BPE over each piece. Matches HF `tokenizers`.
+// Byte-level BPE tokenizer (GGUF `tokenizer.ggml.model = gpt2`) for Qwen3.5
+// and Qwen2/Qwen3 vocabularies: added tokens are split out first, then NFC
+// normalisation, the GGUF's pre-tokenizer regex (`tokenizer.ggml.pre`
+// "qwen35" or "qwen2"), and BPE over each piece. Matches HF `tokenizers`.
 namespace gufo_npu {
 
 class Tokenizer {

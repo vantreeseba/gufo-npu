@@ -8,9 +8,10 @@
 
 #include "core/sampling.hpp"
 #include "serve/chat_format.hpp"
+#include "serve/engine.hpp"
 
-// The OpenAI chat completions request as the server takes it, and the
-// OpenAI error shape.
+// The OpenAI chat completions, completions and embeddings requests as the
+// server takes them, and the OpenAI error shape.
 namespace gufo_npu::serve {
 
 // A request the server refuses, sent as
@@ -83,6 +84,19 @@ struct CompletionRequest {
   }
 };
 
+// Most inputs per /v1/embeddings request (OpenAI's limit).
+inline constexpr int kMaxEmbeddingInputs = 2048;
+
+// A /v1/embeddings request.
+struct EmbeddingsRequest {
+  std::vector<EmbeddingInput> inputs;
+  bool base64 = false;            // encoding_format "base64": float32 LE
+  std::optional<int> dimensions;  // checked against the model by the server
+  // Extension: the task the model embeds for (e.g. "Retrieve documents
+  // relevant to the query"); empty: the model's default.
+  std::string instruction;
+};
+
 // Reads a /v1/chat/completions body, parsed as ordered JSON so messages
 // and tools keep the client's key order. Throws ApiError for anything the
 // server does not support or that is out of range.
@@ -90,5 +104,8 @@ ChatRequest ParseChatRequest(const nlohmann::ordered_json& body);
 
 // Reads a /v1/completions body. Throws ApiError as ParseChatRequest does.
 CompletionRequest ParseCompletionRequest(const nlohmann::ordered_json& body);
+
+// Reads a /v1/embeddings body. Throws ApiError as ParseChatRequest does.
+EmbeddingsRequest ParseEmbeddingsRequest(const nlohmann::ordered_json& body);
 
 }  // namespace gufo_npu::serve

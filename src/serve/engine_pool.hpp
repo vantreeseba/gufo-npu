@@ -16,14 +16,15 @@
 // Several models behind one server, one of them on the NPU at a time.
 //
 // Each model has a proxy Engine that clients' requests resolve to by id. The
-// proxy answers info() and the text methods from a probe (the model's GGUF
-// metadata and tokenizer, no weights), so requests are tokenized and
-// checked before the model loads. Its Generate makes that model the loaded
-// one: the current engine is destroyed first (its device buffers and pinned
-// memory released), then the requested one is loaded, so at most one model's
-// weights are resident. The server already runs one generation at a time, so
-// a switch happens inside a request's turn and waiting requests stay in
-// arrival order (docs/SERVING.md, "Several models").
+// proxy answers info() and the text methods (EmbeddingIds too) from a probe
+// (the model's GGUF metadata and tokenizer, no weights), so requests are
+// tokenized and checked before the model loads. Its Generate (or Embed, for
+// an embedding model) makes that model the loaded one: the current engine is
+// destroyed first (its device buffers and pinned memory released), then the
+// requested one is loaded, so at most one model's weights are resident. The
+// server already runs one generation at a time, so a switch happens inside a
+// request's turn and waiting requests stay in arrival order (docs/SERVING.md,
+// "Several models").
 namespace gufo_npu::serve {
 
 using EngineFactory =
@@ -84,6 +85,11 @@ private:
 
   GenerateResult Generate(std::size_t index, const GenerateRequest& request,
                           const std::function<bool(int)>& on_token);
+  std::vector<std::vector<float>> Embed(
+      std::size_t index, const std::vector<std::vector<int>>& inputs);
+  // Under device_mutex_: makes model `index` the loaded one, logging a
+  // switch from another.
+  void SwitchLocked(std::size_t index);
   // Under device_mutex_: makes model `index` the loaded one.
   void LoadLocked(std::size_t index);
   // Under device_mutex_: destroys the loaded engine, if any.

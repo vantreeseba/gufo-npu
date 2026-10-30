@@ -6,7 +6,10 @@
 #include <atomic>
 #include <chrono>
 #include <climits>
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <ctime>
 #include <iomanip>
 #include <map>
@@ -113,6 +116,57 @@ json Bytes(const std::string& text) {
   json out = json::array();
   for (const unsigned char c : text) {
     out.push_back(static_cast<int>(c));
+  }
+  return out;
+}
+
+// The first `dimensions` values of a unit vector, back to unit length (the
+// Matryoshka cut embedding models are trained for).
+void Truncate(std::vector<float>& v, int dimensions) {
+  if (dimensions <= 0 || static_cast<std::size_t>(dimensions) >= v.size()) {
+    return;
+  }
+  v.resize(static_cast<std::size_t>(dimensions));
+  double norm = 0;
+  for (const float x : v) {
+    norm += static_cast<double>(x) * x;
+  }
+  if (norm > 0) {
+    const auto inv = static_cast<float>(1.0 / std::sqrt(norm));
+    for (float& x : v) {
+      x *= inv;
+    }
+  }
+}
+
+// The vector as little-endian float32 bytes in base64 (encoding_format
+// "base64").
+std::string Base64(const std::vector<float>& v) {
+  static constexpr char kAlphabet[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::vector<unsigned char> bytes(v.size() * sizeof(float));
+  std::memcpy(bytes.data(), v.data(), bytes.size());  // x86-64: little-endian
+  std::string out;
+  out.reserve((bytes.size() + 2) / 3 * 4);
+  std::size_t i = 0;
+  for (; i + 3 <= bytes.size(); i += 3) {
+    const unsigned n = (static_cast<unsigned>(bytes[i]) << 16) |
+                       (static_cast<unsigned>(bytes[i + 1]) << 8) |
+                       bytes[i + 2];
+    out += kAlphabet[(n >> 18) & 63];
+    out += kAlphabet[(n >> 12) & 63];
+    out += kAlphabet[(n >> 6) & 63];
+    out += kAlphabet[n & 63];
+  }
+  if (i < bytes.size()) {
+    unsigned n = static_cast<unsigned>(bytes[i]) << 16;
+    if (i + 1 < bytes.size()) {
+      n |= static_cast<unsigned>(bytes[i + 1]) << 8;
+    }
+    out += kAlphabet[(n >> 18) & 63];
+    out += kAlphabet[(n >> 12) & 63];
+    out += i + 1 < bytes.size() ? kAlphabet[(n >> 6) & 63] : '=';
+    out += '=';
   }
   return out;
 }
@@ -287,6 +341,10 @@ struct Server::Impl {
               [this](const httplib::Request& req, httplib::Response& res) {
                 Completions(req, res);
               });
+    http.Post("/v1/embeddings",
+              [this](const httplib::Request& req, httplib::Response& res) {
+                Embeddings(req, res);
+              });
   }
 
   json Model(const Engine& engine) const {
@@ -336,6 +394,15 @@ struct Server::Impl {
                      "model");
     }
     return *engine;
+  }
+
+  // Chat and completions need a model that generates text.
+  static void RequireGenerator(const Engine& engine) {
+    if (engine.info().embedding_length > 0) {
+      throw InvalidRequest("the model " + engine.info().id +
+                               " makes embeddings; use /v1/embeddings",
+                           "model");
+    }
   }
 
   std::vector<int> StopIds(const Engine& engine) const {
@@ -413,6 +480,7 @@ struct Server::Impl {
       job->chat = ParseChatRequest(body);
       job->engine = &RequestedEngine(body);
       Engine& engine = *job->engine;
+      RequireGenerator(engine);
       CheckBias(engine, job->chat.sampling);
       std::string text;
       try {
@@ -914,6 +982,115 @@ struct Server::Impl {
     res.set_content(Dump(body), "application/json");
   }
 
+  // ---- /v1/embeddings ----
+
+  void Embeddings(const httplib::Request& req, httplib::Response& res) {
+    Job job;
+    job.arrived = Clock::now();
+    EmbeddingsRequest request;
+    std::vector<std::vector<int>> inputs;
+    int tokens = 0;
+    try {
+      const auto body = ParseBody(req);
+      request = ParseEmbeddingsRequest(body);
+      job.engine = &RequestedEngine(body);
+      const ModelInfo& info = job.engine->info();
+      if (info.embedding_length <= 0) {
+        throw InvalidRequest("the model " + info.id +
+                                 " does not make embeddings; use an embedding "
+                                 "model such as Qwen3-VL-Embedding-2B",
+                             "model");
+      }
+      if (request.dimensions &&
+          (*request.dimensions < info.embedding_min_dimensions ||
+           *request.dimensions > info.embedding_length)) {
+        throw InvalidRequest(
+            "dimensions must be between " +
+                std::to_string(info.embedding_min_dimensions) + " and " +
+                std::to_string(info.embedding_length) + " for this model",
+            "dimensions");
+      }
+      for (const auto& input : request.inputs) {
+        if (input.tokens) {
+          for (const int id : *input.tokens) {
+            if (id >= info.vocab) {
+              throw InvalidRequest("input token id " + std::to_string(id) +
+                                       " is outside the vocabulary",
+                                   "input");
+            }
+          }
+        }
+        auto ids = job.engine->EmbeddingIds(input, request.instruction);
+        if (static_cast<int>(ids.size()) > info.context_length) {
+          throw ApiError(400, "invalid_request_error",
+                         "context_length_exceeded",
+                         "an input has " + std::to_string(ids.size()) +
+                             " tokens; this model's limit is " +
+                             std::to_string(info.context_length) + " tokens",
+                         "input");
+        }
+        tokens += static_cast<int>(ids.size());
+        inputs.push_back(std::move(ids));
+      }
+    } catch (const ApiError& e) {
+      metrics.Request(e.status);
+      SendError(res, e);
+      return;
+    }
+    if (!Admit(job, res, "emb-")) {
+      return;
+    }
+    const auto gone = [&req] { return req.is_connection_closed(); };
+    if (!Acquire(job, gone)) {
+      metrics.Request(kClientClosed);
+      CurrentLog().outcome = "disconnected";
+      res.status = kClientClosed;
+      return;
+    }
+    std::vector<std::vector<float>> vectors;
+    std::string error;
+    const auto start = Clock::now();
+    try {
+      vectors = job.engine->Embed(inputs);
+    } catch (const std::exception& e) {
+      error = e.what();
+    }
+    const double seconds = Since(start);
+    job.ticket.reset();
+    metrics.RequestDuration(Since(job.arrived));
+    char rate[32];
+    std::snprintf(rate, sizeof rate, "%.1f",
+                  seconds > 0 ? tokens / seconds : 0.0);
+    AddDetail(
+        "model=" + job.model + " inputs=" + std::to_string(inputs.size()) +
+        " tokens=" + std::to_string(tokens) +
+        " embed_ms=" + std::to_string(static_cast<long>(seconds * 1000.0)) +
+        " embed_tok_s=" + rate);
+    if (!error.empty()) {
+      metrics.Request(500);
+      SendError(res, ApiError(500, "server_error", "", error));
+      return;
+    }
+    json data = json::array();
+    for (std::size_t i = 0; i < vectors.size(); ++i) {
+      auto& v = vectors[i];
+      if (request.dimensions) {
+        Truncate(v, *request.dimensions);
+      }
+      data.push_back(
+          {{"object", "embedding"},
+           {"index", i},
+           {"embedding", request.base64 ? json(Base64(v)) : json(v)}});
+    }
+    const json body = {
+        {"object", "list"},
+        {"data", std::move(data)},
+        {"model", job.model},
+        {"usage", {{"prompt_tokens", tokens}, {"total_tokens", tokens}}}};
+    metrics.Request(200);
+    res.set_content(Dump(body), "application/json");
+  }
+
   // ---- /v1/completions (legacy) ----
 
   // The prompt's text for echo: its tokens' bytes as whole characters.
@@ -934,6 +1111,7 @@ struct Server::Impl {
       job->completion = ParseCompletionRequest(body);
       job->engine = &RequestedEngine(body);
       Engine& engine = *job->engine;
+      RequireGenerator(engine);
       auto& c = job->completion;
       CheckBias(engine, c.sampling);
       for (std::size_t p = 0; p < c.prompts(); ++p) {

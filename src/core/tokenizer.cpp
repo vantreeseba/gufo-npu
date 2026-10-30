@@ -15,6 +15,10 @@ namespace {
 // HF tokenizer.json pre_tokenizer for Qwen3.5 (Split, Isolated).
 constexpr char kQwen35Pattern[] =
     R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
+// The same for Qwen2 / Qwen3 vocabularies (GGUF pre "qwen2"), such as
+// Qwen3-VL-Embedding's: letters without combining marks.
+constexpr char kQwen2Pattern[] =
+    R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
 
 // GGUF token types that are matched literally before BPE.
 constexpr int kTypeControl = 3;
@@ -91,7 +95,12 @@ Tokenizer::Tokenizer(const gguf::File& file)
         "tokenizer: only byte-level BPE (gpt2) is supported");
   }
   const auto pre = file.GetString("tokenizer.ggml.pre");
-  if (pre != "qwen35") {
+  const char* pattern = nullptr;
+  if (pre == "qwen35") {
+    pattern = kQwen35Pattern;
+  } else if (pre == "qwen2") {
+    pattern = kQwen2Pattern;
+  } else {
     throw std::runtime_error("tokenizer: unsupported pre-tokenizer " + pre);
   }
   tokens_ = file.GetStrings("tokenizer.ggml.tokens");
@@ -152,7 +161,7 @@ Tokenizer::Tokenizer(const gguf::File& file)
   UErrorCode status = U_ZERO_ERROR;
   UParseError parse_error{};
   regex_->pattern.reset(icu::RegexPattern::compile(
-      icu::UnicodeString::fromUTF8(kQwen35Pattern), 0, parse_error, status));
+      icu::UnicodeString::fromUTF8(pattern), 0, parse_error, status));
   regex_->nfc = icu::Normalizer2::getNFCInstance(status);
   if (U_FAILURE(status) || !regex_->pattern) {
     throw std::runtime_error(std::string("tokenizer: ICU setup failed: ") +

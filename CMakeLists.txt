@@ -130,6 +130,7 @@ endif()
 # Per-model packages: their own NPU programs and host wiring.
 add_subdirectory(src/models/qwen35_4b)
 add_subdirectory(src/models/qwen36_35b_a3b)
+add_subdirectory(src/models/qwen3vl_embed_2b)
 # The OpenAI-compatible server's model side (src/serve).
 add_subdirectory(src/serve)
 
@@ -150,7 +151,8 @@ target_link_libraries(gufo_npu_serve PUBLIC gufo_npu_core nlohmann_json
 
 add_executable(gufo-npu src/cli/main.cpp)
 target_link_libraries(gufo-npu PRIVATE gufo_npu_qwen35_npu gufo_npu_qwen35_4b
-                      gufo_npu_qwen36_35b_a3b gufo_npu_serve
+                      gufo_npu_qwen36_35b_a3b gufo_npu_qwen3vl_embed_2b_npu
+                      gufo_npu_serve
                       gufo_npu_serve_chat gufo_npu_serve_engine)
 install(TARGETS gufo-npu RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
