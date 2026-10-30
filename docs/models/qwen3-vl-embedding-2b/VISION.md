@@ -194,19 +194,18 @@ round trip.
 | patch embed + 4 mergers | 0.37 T | 0.02-0.03 s |
 | text GEMMs (2.82 GFLOP x 1830) | 5.16 T | 0.29-0.47 s |
 | **GEMMs total** | **9.9 T** | **0.55-0.90 s** |
-| ViT attention (4 n^2 d x 24, 19.9 G exps) | 5.10 T | CPU today: ~12 s |
-| text attention (causal, 28 layers) | 0.38 T | CPU today: ~0.9 s |
+| ViT attention (4 n^2 d x 24, 19.9 G exps) | 5.10 T | CPU (AVX-512) estimate: ~2.9 s |
+| text attention (causal, 28 layers) | 0.38 T | CPU (AVX-512) estimate: ~0.2 s |
 
-CPU attention rate: BENCHMARKS.md (2026-10-30) has 8 x 2,048-token inputs
-at 1,297 tok/s with 72% in CPU attention, i.e. 3.85 TFLOP in ~9.1 s,
-~0.42 TFLOPS effective with the current per-key loop. A blocked AVX-512
-kernel (EXPERIMENTS.md's next step) may gain a few times; still several
-seconds per page against ~0.7 s of NPU GEMMs.
+CPU attention rate: BENCHMARKS.md (AVX-512 attention, 2026-10-30) has
+8 x 2,048-token inputs at 3,037 tok/s with 40% in CPU attention, i.e.
+3.85 TFLOP in ~2.2 s, ~1.8 TFLOPS effective at head 128. The ViT's head 64
+and bidirectional softmax may run differently; unmeasured.
 
 The ViT attention is O(n^2) and larger than all the GEMMs together at page
 size: 0.10 T at 1024 patches, 1.6 T at 4096, 5.1 T at 7200, 26 T at 16384.
 With the GEMMs on the NPU and attention on the CPU a page would take
-roughly 14 s, ~90% of it CPU attention. NPU attention (or a smaller
+roughly 4 s, ~80% of it CPU attention. NPU attention (or a smaller
 `max_pixels`; quality cost unmeasured) is what makes images practical.
 Memory: the ViT keeps 7200 x 4096 fp32 (118 MB) of activations at most.
 
@@ -226,7 +225,7 @@ Memory: the ViT keeps 7200 x 4096 fp32 (118 MB) of activations at most.
 3. **NPU attention**: a bidirectional flash-attention kernel (head 64,
    online softmax on the core) for the ViT, then the text's causal
    attention with MRoPE-rotated q/k. This is the stage that decides the
-   page time (CPU attention would be ~90% of it).
+   page time (CPU attention would be ~80% of it, even with AVX-512).
 4. **Fusion**: bias + GELU epilogues and LayerNorm on the NPU, in
    runlists, so a ViT layer is a handful of commands; each move is kept
    only when the timing says so.
@@ -235,9 +234,11 @@ Memory: the ViT keeps 7200 x 4096 fp32 (118 MB) of activations at most.
 
 ## Open questions and risks
 
-- **Resize parity**: Pillow's fixed-point bicubic is reproduced, but only
-  unchanged-size images are checked against HF so far. JPEG decoding
-  differences (libjpeg versions, EXIF rotation) are outside the library.
+- **Resize parity**: Pillow's fixed-point bicubic is reproduced (fixtures
+  in `vision_test`; one resized card end to end at cosine 1.000000, see
+  QUALITY.md), but only small cards so far, no page-sized image. JPEG
+  decoding differences (libjpeg versions, EXIF rotation) are outside the
+  library.
 - **bfp16 for the ViT**: 8-bit mantissas with shared block exponents on
   LayerNorm outputs and GELU inputs; untested. The tower's 24 layers and
   the DeepStack injection may amplify error more than the text path does.
