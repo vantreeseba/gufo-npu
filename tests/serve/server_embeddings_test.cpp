@@ -256,7 +256,8 @@ void TestOptions(const Running& server, const FakeEmbedder& engine) {
                   {{"input", "hi"}, {"encoding_format", "base64"}});
   Check(r && r->status == 200, "base64: 200");
   if (r && r->status == 200) {
-    const auto& e = json::parse(r->body)["data"][0]["embedding"];
+    const auto body = json::parse(r->body);
+    const auto& e = body["data"][0]["embedding"];
     Check(e.is_string() &&
               Near(FromBase64(e.get<std::string>()), FakeEmbedder::Vector(4)),
           "base64 decodes to the float vector");
