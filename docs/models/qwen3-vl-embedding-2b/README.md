@@ -7,7 +7,9 @@ with its shapes); nothing is shared with the Qwen3.5 family. See
 [benchmarks](BENCHMARKS.md), [quality](QUALITY.md) and
 [experiments](EXPERIMENTS.md).
 
-Text only for now: the model's vision tower (images, video) is not run.
+Text only on the NPU and in the server for now. Images have a CPU fp32
+reference (`vision.hpp`, `Reference::EmbedImage`); the forward pass, costs
+and plan are in [VISION.md](VISION.md). Video is not run.
 
 ## Weights
 
@@ -89,11 +91,15 @@ curl -s localhost:8081/v1/embeddings -H 'Content-Type: application/json' \
 | Test | Label | Needs |
 |---|---|---|
 | `qwen3vl_embed_2b_ops_test` | `qwen3vl_embed_2b` | nothing (hosted CI): template, instruction rule, packing, attention against a direct softmax, pooling, Matryoshka |
+| `qwen3vl_embed_2b_vision_test` | `qwen3vl_embed_2b` | nothing (hosted CI): smart_resize, Pillow's bicubic (fixtures), patch order, position-embedding taps, MRoPE positions, MRoPE attention = text attention at text positions |
 | `qwen3vl_tokenizer_test` | `qwen3vl_embed_2b;model` | the GGUF: HF tokenizer fixtures |
 | `qwen3vl_embed_2b_reference_oracle_test` | `qwen3vl_embed_2b;model` | GGUF + oracle: ids, CPU reference vs HF fp32 (cosine ≥ 0.999), retrieval ranks |
+| `qwen3vl_embed_2b_vision_oracle_test` | `qwen3vl_embed_2b;model` | GGUF + mmproj + oracle `--images`: patch grid, ids, CPU vision + text reference vs HF fp32 (cosine ≥ 0.999) |
 | `qwen3vl_embed_2b_gemm_test` | `qwen3vl_embed_2b;npu;kernels` | NPU: every GEMM shape vs a double reference (relative error < 1e-2) |
 | `qwen3vl_embed_2b_npu_embed_test` | `qwen3vl_embed_2b;npu;model` | NPU + GGUF + oracle: cosine ≥ 0.99, retrieval ranks, alone = batched |
 
 Variables: `GUFO_NPU_QWEN3VL_EMBED_2B_GGUF` (the BF16 GGUF) and
 `GUFO_NPU_QWEN3VL_EMBED_2B_ORACLE` (the output of
-`tools/reference/qwen3vl_embedding_oracle.py`).
+`tools/reference/qwen3vl_embedding_oracle.py`, with `--images` for the
+vision test), plus `GUFO_NPU_QWEN3VL_EMBED_2B_MMPROJ` (the mmproj GGUF,
+e.g. `Qwen3-VL-Embedding-2B.mmproj-f16.gguf`) for images.

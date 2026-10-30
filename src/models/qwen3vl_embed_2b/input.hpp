@@ -42,4 +42,18 @@ std::vector<int> InputIdsFromTokens(const Tokenizer& tokenizer,
                                     const std::vector<int>& content,
                                     std::string_view instruction);
 
+// The image placeholder token (one per merged image token).
+inline constexpr char kImagePad[] = "<|image_pad|>";
+
+// Token ids of an input holding one image (`image_tokens` placeholders)
+// and optional text, as the reference embedder orders them (image first):
+//   <|im_start|>system\n{instruction}<|im_end|>\n<|im_start|>user\n
+//   <|vision_start|><|image_pad|> x image_tokens<|vision_end|>{text}
+//   <|im_end|>\n<|im_start|>assistant\n<|endoftext|>
+// Throws std::runtime_error when the vocabulary lacks a special token and
+// std::invalid_argument for image_tokens < 1.
+std::vector<int> ImageInputIds(const Tokenizer& tokenizer, int image_tokens,
+                               std::string_view text,
+                               std::string_view instruction);
+
 }  // namespace gufo_npu::qwen3vl_embed_2b

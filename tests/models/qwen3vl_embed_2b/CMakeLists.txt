@@ -1,7 +1,9 @@
 # Qwen3-VL-Embedding-2B (arch qwen3vl), text embeddings.
 #   GUFO_NPU_QWEN3VL_EMBED_2B_GGUF    its BF16 GGUF (llama.cpp's converter)
 #   GUFO_NPU_QWEN3VL_EMBED_2B_ORACLE  the HF oracle's output
-#                                     (tools/reference/qwen3vl_embedding_oracle.py)
+#                                     (tools/reference/qwen3vl_embedding_oracle.py,
+#                                     --images for the vision test)
+#   GUFO_NPU_QWEN3VL_EMBED_2B_MMPROJ  the vision tower (llama.cpp mmproj GGUF)
 # Model tests exit 77 (skip) when these are unset. The tokenizer fixtures
 # test (qwen3vl_tokenizer_test) is registered with the core tests.
 
@@ -14,12 +16,30 @@ add_test(NAME qwen3vl_embed_2b_ops_test COMMAND qwen3vl_embed_2b_ops_test)
 set_tests_properties(qwen3vl_embed_2b_ops_test PROPERTIES
                      LABELS qwen3vl_embed_2b)
 
+# Image preprocessing, patch order, positions, MRoPE: no model, hosted CI.
+add_executable(qwen3vl_embed_2b_vision_test vision_test.cpp)
+target_link_libraries(qwen3vl_embed_2b_vision_test PRIVATE
+                      gufo_npu_qwen3vl_embed_2b)
+target_compile_options(qwen3vl_embed_2b_vision_test PRIVATE -march=x86-64-v3)
+add_test(NAME qwen3vl_embed_2b_vision_test COMMAND qwen3vl_embed_2b_vision_test)
+set_tests_properties(qwen3vl_embed_2b_vision_test PROPERTIES
+                     LABELS qwen3vl_embed_2b)
+
 add_executable(qwen3vl_embed_2b_reference_oracle_test reference_oracle_test.cpp)
 target_link_libraries(qwen3vl_embed_2b_reference_oracle_test PRIVATE
                       gufo_npu_qwen3vl_embed_2b nlohmann_json)
 add_test(NAME qwen3vl_embed_2b_reference_oracle_test
          COMMAND qwen3vl_embed_2b_reference_oracle_test)
 set_tests_properties(qwen3vl_embed_2b_reference_oracle_test PROPERTIES
+                     SKIP_RETURN_CODE 77 LABELS "qwen3vl_embed_2b;model"
+                     TIMEOUT 1800)
+
+add_executable(qwen3vl_embed_2b_vision_oracle_test vision_oracle_test.cpp)
+target_link_libraries(qwen3vl_embed_2b_vision_oracle_test PRIVATE
+                      gufo_npu_qwen3vl_embed_2b nlohmann_json)
+add_test(NAME qwen3vl_embed_2b_vision_oracle_test
+         COMMAND qwen3vl_embed_2b_vision_oracle_test)
+set_tests_properties(qwen3vl_embed_2b_vision_oracle_test PROPERTIES
                      SKIP_RETURN_CODE 77 LABELS "qwen3vl_embed_2b;model"
                      TIMEOUT 1800)
 

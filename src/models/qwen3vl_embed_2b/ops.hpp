@@ -70,6 +70,38 @@ void Attention(const Config& cfg, const RopeTable& rope, const float* q_norm,
                float* in, float* out, const ParallelRun& run, bool avx512);
 }  // namespace detail
 
+// The text model's interleaved MRoPE sections (t, h, w), in frequencies.
+inline constexpr int kMropeSections[3] = {24, 20, 20};
+
+// Interleaved MRoPE, as HF's Qwen3VLTextRotaryEmbedding: frequency i of the
+// head's half turns by the h position when i % 3 == 1 and i < 3 *
+// sections[1], by w when i % 3 == 2 and i < 3 * sections[2], by t
+// otherwise; rotate-half pairs (i, i + half). Equal t, h and w give
+// RopeTable's rotation.
+class MropeTable {
+public:
+  MropeTable(int head_dim, float theta);
+  int half() const { return half_; }
+  // cos and sin (half() values each) for the position thw = {t, h, w}.
+  void Angles(const int* thw, float* cos, float* sin) const;
+  // Rotates x (2 * half() values) in place by Angles' output.
+  void Apply(float* x, const float* cos, const float* sin) const;
+
+private:
+  int half_ = 0;
+  std::vector<float> inv_freq_;
+  std::vector<int> axis_;  // per frequency: 0 t, 1 h, 2 w
+};
+
+// Attention with MRoPE: as Attention (same kernels), but each packed row r
+// is rotated to positions[3 r .. 3 r + 2] = (t, h, w) (an input with
+// images, MropePositions in vision.hpp) instead of its index in the
+// segment.
+void AttentionMrope(const Config& cfg, const MropeTable& rope,
+                    const int* positions, const float* q_norm,
+                    const float* k_norm, const std::vector<Segment>& segments,
+                    float* in, float* out, const ParallelRun& run);
+
 // The embedding of each segment: its last row of `h` (row stride
 // cfg.hidden) through the final RMSNorm, L2-normalized.
 std::vector<std::vector<float>> Pool(const Config& cfg,
