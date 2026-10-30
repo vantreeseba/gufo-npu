@@ -59,6 +59,17 @@ void Attention(const Config& cfg, const RopeTable& rope, const float* q_norm,
                const float* k_norm, const std::vector<Segment>& segments,
                float* in, float* out, const ParallelRun& run);
 
+namespace detail {
+// Whether the CPU runs the AVX-512 attention kernel, which Attention picks
+// when it does (otherwise a plain loop).
+bool HasAvx512();
+// Attention with the kernel chosen: the AVX-512 one (throws
+// std::invalid_argument without HasAvx512()) or the plain loop. For tests.
+void Attention(const Config& cfg, const RopeTable& rope, const float* q_norm,
+               const float* k_norm, const std::vector<Segment>& segments,
+               float* in, float* out, const ParallelRun& run, bool avx512);
+}  // namespace detail
+
 // The embedding of each segment: its last row of `h` (row stride
 // cfg.hidden) through the final RMSNorm, L2-normalized.
 std::vector<std::vector<float>> Pool(const Config& cfg,

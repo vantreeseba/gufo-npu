@@ -81,17 +81,17 @@ void TestPack() {
 
 // The mixer against a direct implementation: per segment, per query head,
 // normalized and rotated q and k, a full causal softmax, the weighted sum.
-void TestAttention() {
-  e::Config cfg;
-  cfg.heads = 4;
-  cfg.kv_heads = 2;
-  cfg.head_dim = 8;
-  cfg.hidden = 32;
-  cfg.rms_eps = 1e-6f;
-  cfg.rope_theta = 10000.0f;
-  // Lengths that cross the 64-key and 16-query blocks.
-  const std::vector<e::Segment> segments = {{0, 70}, {70, 1}, {71, 150}};
-  const int rows = 221;
+// Runs each kernel the CPU has (the AVX-512 one and the plain loop).
+void TestAttention(const e::Config& cfg, const std::vector<int>& lengths,
+                   const std::string& name) {
+  std::vector<e::Segment> segments;
+  int rows = 0;
+  int longest = 0;
+  for (const int length : lengths) {
+    segments.push_back({rows, length});
+    rows += length;
+    longest = std::max(longest, length);
+  }
   const int stride = cfg.InRows();
   std::mt19937 rng(7);
   std::normal_distribution<float> dist(0.0f, 1.0f);
@@ -101,11 +101,11 @@ void TestAttention() {
   }
   std::vector<float> q_norm(cfg.head_dim), k_norm(cfg.head_dim);
   for (int i = 0; i < cfg.head_dim; ++i) {
-    q_norm[i] = 1.0f + 0.1f * static_cast<float>(i);
-    k_norm[i] = 1.0f - 0.05f * static_cast<float>(i);
+    q_norm[i] = 1.0f + 0.1f * static_cast<float>(i % 8);
+    k_norm[i] = 1.0f - 0.05f * static_cast<float>(i % 8);
   }
   e::RopeTable rope(cfg.head_dim, cfg.rope_theta);
-  rope.Reserve(150);
+  rope.Reserve(longest);
 
   // Direct: q and k prepared on a copy.
   std::vector<float> prepared = in;
@@ -168,21 +168,51 @@ void TestAttention() {
     }
   }
 
-  std::vector<float> got(want.size());
   const e::ParallelRun serial = [](std::size_t n,
                                    const std::function<void(std::size_t)>& fn) {
     for (std::size_t i = 0; i < n; ++i) {
       fn(i);
     }
   };
-  e::Attention(cfg, rope, q_norm.data(), k_norm.data(), segments, in.data(),
-               got.data(), serial);
-  double worst = 0;
-  for (std::size_t i = 0; i < want.size(); ++i) {
-    worst = std::max(worst, std::fabs(got[i] - want[i]));
+  std::vector<bool> kernels = {false};
+  if (e::detail::HasAvx512()) {
+    kernels.push_back(true);
+  } else {
+    std::puts("note: no AVX-512, only the plain attention loop is checked");
   }
-  Check(worst < 1e-4, "attention matches the direct softmax (max error " +
-                          std::to_string(worst) + ")");
+  for (const bool avx512 : kernels) {
+    std::vector<float> scratch = in;  // Attention prepares q and k in place
+    std::vector<float> got(want.size());
+    e::detail::Attention(cfg, rope, q_norm.data(), k_norm.data(), segments,
+                         scratch.data(), got.data(), serial, avx512);
+    double worst = 0;
+    for (std::size_t i = 0; i < want.size(); ++i) {
+      worst = std::max(worst, std::fabs(got[i] - want[i]));
+    }
+    Check(worst < 1e-4, name + (avx512 ? ", AVX-512" : ", plain") +
+                            ": attention matches the direct softmax (max "
+                            "error " +
+                            std::to_string(worst) + ")");
+  }
+}
+
+void TestAttention() {
+  e::Config cfg;
+  cfg.heads = 4;
+  cfg.kv_heads = 2;
+  cfg.head_dim = 8;
+  cfg.hidden = 32;
+  cfg.rms_eps = 1e-6f;
+  cfg.rope_theta = 10000.0f;
+  // Lengths that cross the 64-key and 16-query blocks.
+  TestAttention(cfg, {70, 1, 150}, "small heads");
+  // The model's shape: 16 query heads over 8 kv heads of 128.
+  cfg.heads = 16;
+  cfg.kv_heads = 8;
+  cfg.head_dim = 128;
+  cfg.hidden = 2048;
+  cfg.rope_theta = 5000000.0f;
+  TestAttention(cfg, {1, 63, 64, 65, 300}, "model shape");
 }
 
 void TestPoolAndTruncate() {
