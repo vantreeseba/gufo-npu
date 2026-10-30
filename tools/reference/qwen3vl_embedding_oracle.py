@@ -123,17 +123,32 @@ def smart_resize(height: int, width: int) -> tuple[int, int]:
 
 
 def image_cases(model_dir: Path, model) -> list[dict]:
-    from PIL import Image
     from transformers import AutoProcessor
 
+    try:
+        from PIL import Image
+    except ImportError:
+        Image = None
     processor = AutoProcessor.from_pretrained(model_dir)
     end = processor.tokenizer.convert_tokens_to_ids("<|endoftext|>")
     cases = []
     for name, width, height, seed, text, instruction in IMAGES:
         rgb = test_card(width, height, seed)
-        image = Image.frombytes("RGB", (width, height), rgb)
         rh, rw = smart_resize(height, width)
-        image = image.resize((rw, rh))  # Pillow's default: bicubic
+        if (rh, rw) == (height, width):
+            # Kept size: no resize, so no Pillow needed. (C, H, W) uint8.
+            image = (
+                torch.frombuffer(bytearray(rgb), dtype=torch.uint8)
+                .reshape(height, width, 3)
+                .permute(2, 0, 1)
+                .contiguous()
+            )
+        elif Image is None:
+            print(f"{name}: skipped (resizing needs Pillow)")
+            continue
+        else:
+            image = Image.frombytes("RGB", (width, height), rgb)
+            image = image.resize((rw, rh))  # Pillow's default: bicubic
         content = [{"type": "image", "image": image}]
         if text:
             content.append({"type": "text", "text": text})
