@@ -1,6 +1,8 @@
 #include "models/qwen3vl_embed_2b/reference.hpp"
 
 #include <algorithm>
+#include <functional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -39,6 +41,14 @@ void MatMul(const gguf::TensorInfo& w, const float* x, int count, float* out,
   });
 }
 
+void Run(std::size_t count, const std::function<void(std::size_t)>& fn) {
+  ParallelFor(count, [&](std::size_t begin, std::size_t end) {
+    for (std::size_t i = begin; i < end; ++i) {
+      fn(i);
+    }
+  });
+}
+
 }  // namespace
 
 struct Reference::Impl {
@@ -58,9 +68,12 @@ struct Reference::Impl {
   std::vector<Layer> layers;
   std::vector<float> output_norm;
   RopeTable rope;
+  MropeTable mrope;
 
   explicit Impl(const gguf::File& file)
-      : config(ReadConfig(file)), rope(config.head_dim, config.rope_theta) {
+      : config(ReadConfig(file)),
+        rope(config.head_dim, config.rope_theta),
+        mrope(config.head_dim, config.rope_theta) {
     embed = &file.Tensor("token_embd.weight");
     output_norm = ToFloats(file.Tensor("output_norm.weight"));
     for (int il = 0; il < config.layers; ++il) {
@@ -84,6 +97,69 @@ struct Reference::Impl {
     }
   }
 
+  // The token embedding of each id, packed (n x hidden).
+  std::vector<float> Lookup(const std::vector<std::vector<int>>& inputs,
+                            int n) const {
+    const int d = config.hidden;
+    std::vector<float> h(static_cast<std::size_t>(n) * d);
+    std::size_t row = 0;
+    for (const auto& ids : inputs) {
+      for (const int id : ids) {
+        quant::Dequantize(embed->type,
+                          embed->data + static_cast<std::size_t>(id) *
+                                            quant::RowBytes(embed->type, d),
+                          h.data() + row * d, d);
+        ++row;
+      }
+    }
+    return h;
+  }
+
+  // The decoder layers over the packed rows h (n x hidden), in place:
+  // attend(layer, in, mixed) runs the attention mixer, after(il) runs once
+  // layer il is done.
+  void Layers(std::vector<float>& h, int n,
+              const std::function<void(const Layer&, float*, float*)>& attend,
+              const std::function<void(int)>& after) {
+    const Config& cfg = config;
+    const int d = cfg.hidden;
+    const auto rows = static_cast<std::size_t>(n);
+    std::vector<float> x(rows * d), tmp(rows * d);
+    std::vector<float> in(rows * cfg.InRows()), mixed(rows * cfg.QDim());
+    std::vector<float> gate(rows * cfg.ffn), up(rows * cfg.ffn);
+    auto norm_rows = [&](const std::vector<float>& w) {
+      Run(rows, [&](std::size_t t) {
+        vec::RmsNorm(h.data() + t * d, w.data(), d, cfg.rms_eps,
+                     x.data() + t * d);
+      });
+    };
+    auto add_tmp = [&] {
+      for (std::size_t i = 0; i < h.size(); ++i) {
+        h[i] += tmp[i];
+      }
+    };
+    for (int il = 0; il < static_cast<int>(layers.size()); ++il) {
+      const Layer& l = layers[static_cast<std::size_t>(il)];
+      norm_rows(l.attn_norm);
+      MatMul(*l.q, x.data(), n, in.data(), cfg.InRows(), 0);
+      MatMul(*l.k, x.data(), n, in.data(), cfg.InRows(), cfg.QDim());
+      MatMul(*l.v, x.data(), n, in.data(), cfg.InRows(),
+             cfg.QDim() + cfg.KvDim());
+      attend(l, in.data(), mixed.data());
+      MatMul(*l.o, mixed.data(), n, tmp.data(), d, 0);
+      add_tmp();
+      norm_rows(l.ffn_norm);
+      MatMul(*l.gate, x.data(), n, gate.data(), cfg.ffn, 0);
+      MatMul(*l.up, x.data(), n, up.data(), cfg.ffn, 0);
+      for (std::size_t i = 0; i < gate.size(); ++i) {
+        gate[i] = simd::Silu(gate[i]) * up[i];
+      }
+      MatMul(*l.down, gate.data(), n, tmp.data(), d, 0);
+      add_tmp();
+      after(il);
+    }
+  }
+
   std::vector<std::vector<float>> Embed(
       const std::vector<std::vector<int>>& inputs) {
     const Config& cfg = config;
@@ -97,63 +173,82 @@ struct Reference::Impl {
       longest = std::max(longest, s.length);
     }
     rope.Reserve(longest);
-    const ParallelRun run = [](std::size_t count,
-                               const std::function<void(std::size_t)>& fn) {
-      ParallelFor(count, [&](std::size_t begin, std::size_t end) {
-        for (std::size_t i = begin; i < end; ++i) {
-          fn(i);
-        }
-      });
-    };
-
-    const int d = cfg.hidden;
-    const auto rows = static_cast<std::size_t>(n);
-    std::vector<float> h(rows * d), x(rows * d), tmp(rows * d);
-    std::vector<float> in(rows * cfg.InRows()), mixed(rows * cfg.QDim());
-    std::vector<float> gate(rows * cfg.ffn), up(rows * cfg.ffn);
-    {
-      std::size_t row = 0;
-      for (const auto& ids : inputs) {
-        for (const int id : ids) {
-          quant::Dequantize(embed->type,
-                            embed->data + static_cast<std::size_t>(id) *
-                                              quant::RowBytes(embed->type, d),
-                            h.data() + row * d, d);
-          ++row;
-        }
-      }
-    }
-    auto norm_rows = [&](const std::vector<float>& w) {
-      run(rows, [&](std::size_t t) {
-        vec::RmsNorm(h.data() + t * d, w.data(), d, cfg.rms_eps,
-                     x.data() + t * d);
-      });
-    };
-    auto add_tmp = [&] {
-      for (std::size_t i = 0; i < h.size(); ++i) {
-        h[i] += tmp[i];
-      }
-    };
-    for (const Layer& l : layers) {
-      norm_rows(l.attn_norm);
-      MatMul(*l.q, x.data(), n, in.data(), cfg.InRows(), 0);
-      MatMul(*l.k, x.data(), n, in.data(), cfg.InRows(), cfg.QDim());
-      MatMul(*l.v, x.data(), n, in.data(), cfg.InRows(),
-             cfg.QDim() + cfg.KvDim());
-      Attention(cfg, rope, l.q_norm.data(), l.k_norm.data(), segments,
-                in.data(), mixed.data(), run);
-      MatMul(*l.o, mixed.data(), n, tmp.data(), d, 0);
-      add_tmp();
-      norm_rows(l.ffn_norm);
-      MatMul(*l.gate, x.data(), n, gate.data(), cfg.ffn, 0);
-      MatMul(*l.up, x.data(), n, up.data(), cfg.ffn, 0);
-      for (std::size_t i = 0; i < gate.size(); ++i) {
-        gate[i] = simd::Silu(gate[i]) * up[i];
-      }
-      MatMul(*l.down, gate.data(), n, tmp.data(), d, 0);
-      add_tmp();
-    }
+    std::vector<float> h = Lookup(inputs, n);
+    Layers(
+        h, n,
+        [&](const Layer& l, float* in, float* mixed) {
+          Attention(cfg, rope, l.q_norm.data(), l.k_norm.data(), segments, in,
+                    mixed, Run);
+        },
+        [](int) {});
     return Pool(cfg, output_norm.data(), segments, h.data());
+  }
+
+  std::vector<float> EmbedImage(const std::vector<int>& ids, int image_pad_id,
+                                const std::vector<ImageFeatures>& images) {
+    const Config& cfg = config;
+    const int d = cfg.hidden;
+    const auto segments = Pack({ids}, cfg.vocab);
+    const int n = segments.back().length;
+    const auto positions = MropePositions(ids, image_pad_id, images);
+    for (const ImageFeatures& f : images) {
+      if (f.embeds.size() != static_cast<std::size_t>(f.Tokens()) * d) {
+        throw std::invalid_argument("qwen3vl: image features of another width");
+      }
+      for (const auto& ds : f.deepstack) {
+        if (ds.size() != f.embeds.size()) {
+          throw std::invalid_argument("qwen3vl: DeepStack features' shape");
+        }
+      }
+    }
+    // Each image token's row and the feature row it takes, in order
+    // (MropePositions has checked that the runs match the images).
+    struct Slot {
+      std::size_t row;
+      const ImageFeatures* image;
+      std::size_t k;
+    };
+    std::vector<Slot> slots;
+    {
+      std::size_t next = 0;
+      std::size_t k = 0;
+      for (std::size_t i = 0; i < ids.size(); ++i) {
+        if (ids[i] != image_pad_id) {
+          continue;
+        }
+        slots.push_back({i, &images[next], k});
+        if (++k == static_cast<std::size_t>(images[next].Tokens())) {
+          ++next;
+          k = 0;
+        }
+      }
+    }
+    std::vector<float> h = Lookup({ids}, n);
+    for (const Slot& s : slots) {
+      std::copy_n(s.image->embeds.data() + s.k * d, d, h.data() + s.row * d);
+    }
+    Layers(
+        h, n,
+        [&](const Layer& l, float* in, float* mixed) {
+          AttentionMrope(cfg, mrope, positions.data(), l.q_norm.data(),
+                         l.k_norm.data(), segments, in, mixed, Run);
+        },
+        [&](int il) {
+          // DeepStack: block il of an image's features joins its rows after
+          // text layer il.
+          const auto layer = static_cast<std::size_t>(il);
+          for (const Slot& s : slots) {
+            if (layer >= s.image->deepstack.size()) {
+              continue;
+            }
+            const float* src = s.image->deepstack[layer].data() + s.k * d;
+            float* dst = h.data() + s.row * d;
+            for (int i = 0; i < d; ++i) {
+              dst[i] += src[i];
+            }
+          }
+        });
+    return Pool(cfg, output_norm.data(), segments, h.data()).front();
   }
 };
 
@@ -169,6 +264,12 @@ const Config& Reference::config() const {
 std::vector<std::vector<float>> Reference::Embed(
     const std::vector<std::vector<int>>& inputs) {
   return impl_->Embed(inputs);
+}
+
+std::vector<float> Reference::EmbedImage(
+    const std::vector<int>& ids, int image_pad_id,
+    const std::vector<ImageFeatures>& images) {
+  return impl_->EmbedImage(ids, image_pad_id, images);
 }
 
 }  // namespace gufo_npu::qwen3vl_embed_2b

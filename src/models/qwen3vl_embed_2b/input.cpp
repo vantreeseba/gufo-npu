@@ -99,4 +99,29 @@ std::vector<int> InputIdsFromTokens(const Tokenizer& tokenizer,
   return ids;
 }
 
+std::vector<int> ImageInputIds(const Tokenizer& tokenizer, int image_tokens,
+                               std::string_view text,
+                               std::string_view instruction) {
+  if (image_tokens < 1) {
+    throw std::invalid_argument("qwen3vl: an image needs at least one token");
+  }
+  const int end = Special(tokenizer, "<|endoftext|>");
+  const int pad = Special(tokenizer, kImagePad);
+  Special(tokenizer, "<|im_start|>");
+  Special(tokenizer, "<|im_end|>");
+  Special(tokenizer, "<|vision_start|>");
+  Special(tokenizer, "<|vision_end|>");
+  std::vector<int> ids = tokenizer.Encode(
+      "<|im_start|>system\n" + NormalizeInstruction(instruction) +
+      "<|im_end|>\n<|im_start|>user\n<|vision_start|>");
+  ids.insert(ids.end(), static_cast<std::size_t>(image_tokens), pad);
+  std::string tail = "<|vision_end|>";
+  tail += text;
+  tail += "<|im_end|>\n<|im_start|>assistant\n";
+  const auto rest = tokenizer.Encode(tail);
+  ids.insert(ids.end(), rest.begin(), rest.end());
+  ids.push_back(end);
+  return ids;
+}
+
 }  // namespace gufo_npu::qwen3vl_embed_2b

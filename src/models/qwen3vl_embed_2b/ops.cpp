@@ -378,6 +378,11 @@ void Attention(const Config& cfg, const RopeTable& rope, const float* q_norm,
 
 namespace detail {
 
+// The softmax mixing of Attention, on rows already normalized, rotated and
+// (q) scaled: the AVX-512 kernel or the plain loop.
+void Mix(const Config& cfg, const std::vector<Segment>& segments, float* in,
+         float* out, const ParallelRun& run, bool avx512);
+
 bool HasAvx512() {
 #ifdef GUFO_QWEN3VL_AVX512
   static const bool has = __builtin_cpu_supports("avx512f");
@@ -429,7 +434,15 @@ void Attention(const Config& cfg, const RopeTable& rope, const float* q_norm,
       rope.Apply(k, position);
     }
   });
+  Mix(cfg, segments, in, out, run, avx512);
+}
 
+void Mix(const Config& cfg, const std::vector<Segment>& segments, float* in,
+         float* out, const ParallelRun& run, bool avx512) {
+  const int hd = cfg.head_dim;
+  const int kv_heads = cfg.kv_heads;
+  const int q_dim = cfg.QDim();
+  const auto stride = static_cast<std::size_t>(cfg.InRows());
   // Work items: (segment, kv head, block of query rows), each with that kv
   // head's query heads, softmax online over key blocks; the longest first,
   // so a pool that hands out items in order finishes evenly.
@@ -506,6 +519,78 @@ void Attention(const Config& cfg, const RopeTable& rope, const float* q_norm,
 }
 
 }  // namespace detail
+
+MropeTable::MropeTable(int head_dim, float theta) : half_(head_dim / 2) {
+  inv_freq_.resize(half_);
+  axis_.resize(half_);
+  for (int i = 0; i < half_; ++i) {
+    // As RopeTable, so equal t, h and w give RopeTable's angles exactly.
+    inv_freq_[i] = static_cast<float>(
+        1.0 / std::pow(static_cast<double>(theta),
+                       static_cast<double>(2 * i) / (2.0 * half_)));
+    // HF's recomposition_frequencies: h at 1, 4, ... below 3 * sections[1],
+    // w at 2, 5, ... below 3 * sections[2], t elsewhere.
+    if (i % 3 == 1 && i < 3 * kMropeSections[1]) {
+      axis_[i] = 1;
+    } else if (i % 3 == 2 && i < 3 * kMropeSections[2]) {
+      axis_[i] = 2;
+    } else {
+      axis_[i] = 0;
+    }
+  }
+}
+
+void MropeTable::Angles(const int* thw, float* cos, float* sin) const {
+  for (int i = 0; i < half_; ++i) {
+    const float angle = static_cast<float>(thw[axis_[i]]) * inv_freq_[i];
+    cos[i] = std::cos(angle);
+    sin[i] = std::sin(angle);
+  }
+}
+
+void MropeTable::Apply(float* x, const float* cos, const float* sin) const {
+  for (int i = 0; i < half_; ++i) {
+    const float a = x[i];
+    const float b = x[i + half_];
+    x[i] = a * cos[i] - b * sin[i];
+    x[i + half_] = b * cos[i] + a * sin[i];
+  }
+}
+
+void AttentionMrope(const Config& cfg, const MropeTable& rope,
+                    const int* positions, const float* q_norm,
+                    const float* k_norm, const std::vector<Segment>& segments,
+                    float* in, float* out, const ParallelRun& run) {
+  const int hd = cfg.head_dim;
+  const int q_dim = cfg.QDim();
+  const auto stride = static_cast<std::size_t>(cfg.InRows());
+  const float scale = 1.0f / std::sqrt(static_cast<float>(hd));
+  int rows = 0;
+  for (const Segment& s : segments) {
+    rows = std::max(rows, s.begin + s.length);
+  }
+  run(static_cast<std::size_t>(rows), [&](std::size_t r) {
+    thread_local std::vector<float> cs, sn;
+    cs.resize(static_cast<std::size_t>(rope.half()));
+    sn.resize(cs.size());
+    rope.Angles(positions + 3 * r, cs.data(), sn.data());
+    float* row = in + r * stride;
+    for (int h = 0; h < cfg.heads; ++h) {
+      float* q = row + h * hd;
+      RmsNorm(q, q_norm, hd, cfg.rms_eps, q);
+      rope.Apply(q, cs.data(), sn.data());
+      for (int e = 0; e < hd; ++e) {
+        q[e] *= scale;
+      }
+    }
+    for (int h = 0; h < cfg.kv_heads; ++h) {
+      float* k = row + q_dim + h * hd;
+      RmsNorm(k, k_norm, hd, cfg.rms_eps, k);
+      rope.Apply(k, cs.data(), sn.data());
+    }
+  });
+  detail::Mix(cfg, segments, in, out, run, detail::HasAvx512());
+}
 
 std::vector<std::vector<float>> Pool(const Config& cfg,
                                      const float* output_norm,
