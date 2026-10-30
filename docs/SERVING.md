@@ -140,6 +140,27 @@ Generation also ends at the chat template's end-of-turn tokens
 "choices": [{"text", "index", "logprobs", "finish_reason"}], "usage"}`;
 streaming sends the same shape per piece of text, then `data: [DONE]`.
 
+### `POST /v1/embeddings`
+
+For an embedding model (Qwen3-VL-Embedding-2B). Chat and completion
+requests to an embedding model, and embedding requests to a chat model, get
+400 for `model`.
+
+| Field | Support |
+|---|---|
+| `input` | A non-empty string, an array of them, an array of token ids, or an array of such arrays; at most 2,048 inputs. Token ids stand for the text inside the model's template. |
+| `encoding_format` | `float` (default) or `base64` (little-endian float32). |
+| `dimensions` | Matryoshka: the first n values, renormalized; 64 to 2,048 for Qwen3-VL-Embedding-2B. |
+| `instruction` | Extension: the task the input is embedded for, the model's system message (default "Represent the user's input."). Give queries a task ("Retrieve passages that answer the question") and leave documents on the default. |
+| `user` | Accepted, ignored. |
+
+Each input, as the model formats it, must fit the context limit
+(`--context-length`, default 8,192 tokens), or the request gets 400
+`context_length_exceeded`. A request's inputs run as one batch, queued like
+any other request. The reply is `{"object": "list", "data": [{"object":
+"embedding", "index", "embedding"}], "model", "usage": {"prompt_tokens",
+"total_tokens"}}`; `prompt_tokens` counts the formatted inputs.
+
 ### Structured outputs
 
 `response_format` json_object / json_schema and a forced `tool_choice`
@@ -217,7 +238,8 @@ gufo-npu serve --model 2b.gguf --model 4b.gguf --model 35b.gguf \
 ```
 
 - **Ids** come from each GGUF (`qwen3.5-2b`, `qwen3.5-4b`,
-  `qwen3.6-35b-a3b`); two models with the same id are refused.
+  `qwen3.6-35b-a3b`, `qwen3-vl-embedding-2b`); two models with the same id
+  are refused.
 - **One model on the NPU at a time.** A request for another model first
   unloads the current one, releasing its device buffers and pinned memory
   (the 35B pins ~22 GB), then loads the requested one. The switch is part
@@ -499,5 +521,8 @@ client (`pip install openai httpx`). Each takes `--base-url` (default
 - Tool-call arguments streamed while the model writes them (a call is sent
   once complete).
 - Images and audio.
-- The `/v1/responses` API; embeddings.
+- The `/v1/responses` API.
+- An embedding model resident next to a chat model: in one server they take
+  turns like any two models; run a second server for embeddings to keep
+  both loaded.
 - TLS (put a reverse proxy in front for that) and CORS headers.

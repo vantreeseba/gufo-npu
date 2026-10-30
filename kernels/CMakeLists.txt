@@ -34,3 +34,5 @@ add_subdirectory("${PROJECT_SOURCE_DIR}/src/models/qwen35_4b/kernels"
                  "${CMAKE_CURRENT_BINARY_DIR}/qwen35_4b")
 add_subdirectory("${PROJECT_SOURCE_DIR}/src/models/qwen36_35b_a3b/kernels"
                  "${CMAKE_CURRENT_BINARY_DIR}/qwen36_35b_a3b")
+add_subdirectory("${PROJECT_SOURCE_DIR}/src/models/qwen3vl_embed_2b/kernels"
+                 "${CMAKE_CURRENT_BINARY_DIR}/qwen3vl_embed_2b")

@@ -51,6 +51,14 @@ public:
                           const std::function<bool(int)>& on_token) override {
     return pool_.Generate(index_, request, on_token);
   }
+  std::vector<int> EmbeddingIds(const EmbeddingInput& input,
+                                std::string_view instruction) const override {
+    return probe_.EmbeddingIds(input, instruction);
+  }
+  std::vector<std::vector<float>> Embed(
+      const std::vector<std::vector<int>>& inputs) override {
+    return pool_.Embed(index_, inputs);
+  }
 
 private:
   EnginePool& pool_;
@@ -163,20 +171,36 @@ GenerateResult EnginePool::Generate(std::size_t index,
                                     const GenerateRequest& request,
                                     const std::function<bool(int)>& on_token) {
   const std::lock_guard lock(device_mutex_);
-  if (loaded_ != index) {
-    if (loaded_) {
-      Logger::Info("loader",
-                   "event=switch from=" + slots_[*loaded_].probe->info().id +
-                       " to=" + slots_[index].probe->info().id);
-    }
-    UnloadLocked();
-    LoadLocked(index);
-  }
+  SwitchLocked(index);
   struct Touch {
     EnginePool& pool;
     ~Touch() { pool.last_used_ = Clock::now(); }
   } touch{*this};
   return engine_->Generate(request, on_token);
+}
+
+std::vector<std::vector<float>> EnginePool::Embed(
+    std::size_t index, const std::vector<std::vector<int>>& inputs) {
+  const std::lock_guard lock(device_mutex_);
+  SwitchLocked(index);
+  struct Touch {
+    EnginePool& pool;
+    ~Touch() { pool.last_used_ = Clock::now(); }
+  } touch{*this};
+  return engine_->Embed(inputs);
+}
+
+void EnginePool::SwitchLocked(std::size_t index) {
+  if (loaded_ == index) {
+    return;
+  }
+  if (loaded_) {
+    Logger::Info("loader",
+                 "event=switch from=" + slots_[*loaded_].probe->info().id +
+                     " to=" + slots_[index].probe->info().id);
+  }
+  UnloadLocked();
+  LoadLocked(index);
 }
 
 void EnginePool::LoadLocked(std::size_t index) {

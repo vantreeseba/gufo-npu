@@ -8,7 +8,8 @@
 #include "serve/engine_pool.hpp"
 
 // The OpenAI-compatible HTTP server (docs/SERVING.md): /v1/chat/completions
-// (streaming and not), the legacy /v1/completions, /v1/models, /health
+// (streaming and not), the legacy /v1/completions, /v1/embeddings (for an
+// embedding model), /v1/models, /health
 // and /metrics over one engine, or over an EnginePool where each request's
 // `model` picks the engine.
 namespace gufo_npu::serve {

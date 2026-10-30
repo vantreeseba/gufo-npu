@@ -4,6 +4,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -23,6 +24,17 @@ struct ModelInfo {
   int context_length = 0;    // most prompt + generated tokens per request
   int vocab = 0;
   bool can_draft = false;  // MTP speculative decoding available
+  // An embedding model (POST /v1/embeddings, no generation): the size of
+  // its vectors, and the smallest size `dimensions` may cut them to.
+  int embedding_length = 0;
+  int embedding_min_dimensions = 0;
+};
+
+// One /v1/embeddings input: text, or content as token ids (an OpenAI
+// token array), which the model's input template wraps either way.
+struct EmbeddingInput {
+  std::string text;
+  std::optional<std::vector<int>> tokens;
 };
 
 struct GenerateRequest {
@@ -77,7 +89,30 @@ public:
   // as kCancelled.
   virtual GenerateResult Generate(const GenerateRequest& request,
                                   const std::function<bool(int)>& on_token) = 0;
+
+  // Embedding models (info().embedding_length > 0) only; others throw
+  // std::invalid_argument.
+  //
+  // The token ids the model embeds for `input`: its template around the
+  // text or ids, with `instruction` (empty: the model's default) as the
+  // task. Needs only the tokenizer, so it works before the model loads.
+  virtual std::vector<int> EmbeddingIds(const EmbeddingInput& input,
+                                        std::string_view instruction) const;
+  // One unit vector of info().embedding_length per input (each as
+  // EmbeddingIds built it), in order. One call runs at a time, as Generate.
+  virtual std::vector<std::vector<float>> Embed(
+      const std::vector<std::vector<int>>& inputs);
 };
+
+inline std::vector<int> Engine::EmbeddingIds(const EmbeddingInput&,
+                                             std::string_view) const {
+  throw std::invalid_argument(info().id + " does not make embeddings");
+}
+
+inline std::vector<std::vector<float>> Engine::Embed(
+    const std::vector<std::vector<int>>&) {
+  throw std::invalid_argument(info().id + " does not make embeddings");
+}
 
 struct EngineOptions {
   std::string model_path;              // GGUF
@@ -93,7 +128,8 @@ struct EngineOptions {
 };
 
 // Loads the GGUF's model on the device, picking the model package by
-// architecture and shape (Qwen3.5-2B, Qwen3.5-4B, Qwen3.6-35B-A3B).
+// architecture and shape (Qwen3.5-2B, Qwen3.5-4B, Qwen3.6-35B-A3B, and the
+// embedding model Qwen3-VL-Embedding-2B).
 std::unique_ptr<Engine> LoadEngine(const EngineOptions& options);
 
 }  // namespace gufo_npu::serve

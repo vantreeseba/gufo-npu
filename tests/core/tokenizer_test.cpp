@@ -10,17 +10,19 @@
 #include "core/gguf.hpp"
 
 // Encodes the HF fixtures (tools/reference/tokenizer_fixtures.py) and checks
-// ids and decoded text match exactly. Needs GUFO_NPU_QWEN35_2B_GGUF for the
-// vocabulary; exits 77 (skip) without it.
+// ids and decoded text match exactly. The vocabulary comes from the GGUF
+// named by the environment variable ENV (default GUFO_NPU_QWEN35_2B_GGUF);
+// exits 77 (skip) when it is unset.
 int main(int argc, char** argv) {
-  const char* model = std::getenv("GUFO_NPU_QWEN35_2B_GGUF");
-  if (model == nullptr || *model == '\0') {
-    std::puts("SKIP: set GUFO_NPU_QWEN35_2B_GGUF to a Qwen3.5 GGUF");
-    return 77;
-  }
-  if (argc != 2) {
-    std::fprintf(stderr, "usage: tokenizer_test <fixtures.jsonl>\n");
+  if (argc != 2 && argc != 3) {
+    std::fprintf(stderr, "usage: tokenizer_test <fixtures.jsonl> [ENV]\n");
     return 2;
+  }
+  const char* env = argc == 3 ? argv[2] : "GUFO_NPU_QWEN35_2B_GGUF";
+  const char* model = std::getenv(env);
+  if (model == nullptr || *model == '\0') {
+    std::printf("SKIP: set %s to the fixtures' GGUF\n", env);
+    return 77;
   }
   const auto file = gufo_npu::gguf::File::Open(model);
   const auto load_start = std::chrono::steady_clock::now();

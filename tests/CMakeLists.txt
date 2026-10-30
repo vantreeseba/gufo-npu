@@ -79,8 +79,13 @@ add_test(NAME serve_extras_test COMMAND serve_extras_test)
 add_executable(serve_logging_test serve/logging_test.cpp)
 target_link_libraries(serve_logging_test PRIVATE gufo_npu_serve cpp_httplib)
 add_test(NAME serve_logging_test COMMAND serve_logging_test)
+# POST /v1/embeddings over a scripted embedding engine.
+add_executable(serve_embeddings_test serve/server_embeddings_test.cpp)
+target_link_libraries(serve_embeddings_test PRIVATE gufo_npu_serve cpp_httplib)
+add_test(NAME serve_embeddings_test COMMAND serve_embeddings_test)
 set_tests_properties(serve_text_test serve_server_test serve_chat_test
                      serve_extras_test serve_engine_pool_test serve_logging_test
+                     serve_embeddings_test
                      PROPERTIES LABELS serve TIMEOUT 120)
 # Structured outputs: grammar masks against token-by-token simulation,
 # constrained generations validated against their schema, forced tool calls,
@@ -99,6 +104,13 @@ add_test(NAME tokenizer_test
                  "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/tokenizer/qwen35.jsonl")
 set_tests_properties(tokenizer_test PROPERTIES SKIP_RETURN_CODE 77
                      LABELS model)
+# The Qwen2/Qwen3 pre-tokenizer on Qwen3-VL-Embedding-2B's vocabulary.
+add_test(NAME qwen3vl_tokenizer_test
+         COMMAND tokenizer_test
+                 "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/tokenizer/qwen3vl.jsonl"
+                 GUFO_NPU_QWEN3VL_EMBED_2B_GGUF)
+set_tests_properties(qwen3vl_tokenizer_test PROPERTIES SKIP_RETURN_CODE 77
+                     LABELS "qwen3vl_embed_2b;model")
 
 add_test(NAME cli_version COMMAND gufo-npu version)
 set_tests_properties(cli_version PROPERTIES PASS_REGULAR_EXPRESSION
@@ -115,6 +127,7 @@ add_subdirectory(models/qwen35)
 add_subdirectory(models/qwen35_2b)
 add_subdirectory(models/qwen36_35b_a3b)
 add_subdirectory(models/qwen35_4b)
+add_subdirectory(models/qwen3vl_embed_2b)
 
 # The server's chat format against the GGUF chat template (fixtures rendered
 # by tools/reference/qwen35_chat_template.py); no model needed.

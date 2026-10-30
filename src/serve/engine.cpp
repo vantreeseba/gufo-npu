@@ -25,6 +25,10 @@
 #include "models/qwen35_4b/npu_decoder.hpp"
 #include "models/qwen35_4b/npu_prefill.hpp"
 #include "models/qwen36_35b_a3b/npu_prefill.hpp"
+#include "models/qwen3vl_embed_2b/config.hpp"
+#include "models/qwen3vl_embed_2b/input.hpp"
+#include "models/qwen3vl_embed_2b/npu_embedder.hpp"
+#include "models/qwen3vl_embed_2b/reference.hpp"
 #include "serve/engine_pool.hpp"
 #include "serve/model_registry.hpp"
 
@@ -387,10 +391,134 @@ private:
   ModelInfo info_;
 };
 
+// ---- Embedding models (Qwen3-VL-Embedding-2B) ----
+
+// ModelInfo for an embedding model: no generation, a context limit of the
+// reference embedder's 8,192 tokens by default.
+ModelInfo DescribeEmbedding(const EngineOptions& options,
+                            const gguf::File& file,
+                            const qwen3vl_embed_2b::Config& config) {
+  if (options.device != "npu" && options.device != "cpu") {
+    throw std::invalid_argument("device must be npu or cpu, not " +
+                                options.device);
+  }
+  if (options.context_length < 0) {
+    throw std::invalid_argument("context_length must not be negative");
+  }
+  const int trained = config.context_length > 0
+                          ? config.context_length
+                          : qwen3vl_embed_2b::kDefaultMaxLength;
+  if (options.context_length > trained) {
+    throw std::invalid_argument(
+        "context_length " + std::to_string(options.context_length) +
+        " exceeds the model's trained context length of " +
+        std::to_string(trained));
+  }
+  ModelInfo info;
+  info.id = options.model_id.empty() ? ModelIdFor(file, options.model_path)
+                                     : options.model_id;
+  info.architecture = qwen3vl_embed_2b::kArchitecture;
+  info.context_length =
+      options.context_length > 0
+          ? options.context_length
+          : std::min(qwen3vl_embed_2b::kDefaultMaxLength, trained);
+  info.vocab = config.vocab;
+  info.embedding_length = config.hidden;
+  info.embedding_min_dimensions = qwen3vl_embed_2b::kMinDimensions;
+  return info;
+}
+
+std::vector<int> EmbeddingIdsFor(const Tokenizer& tokenizer,
+                                 const EmbeddingInput& input,
+                                 std::string_view instruction) {
+  return input.tokens
+             ? qwen3vl_embed_2b::InputIdsFromTokens(tokenizer, *input.tokens,
+                                                    instruction)
+             : qwen3vl_embed_2b::InputIds(tokenizer, input.text, instruction);
+}
+
+class EmbeddingEngine final : public Engine {
+public:
+  EmbeddingEngine(std::unique_ptr<gguf::File> file, ModelInfo info,
+                  const EngineOptions& options)
+      : file_(std::move(file)), tokenizer_(*file_), info_(std::move(info)) {
+    if (options.device == "cpu") {
+      embedder_ = std::make_unique<qwen3vl_embed_2b::Reference>(*file_);
+    } else {
+      embedder_ = std::make_unique<qwen3vl_embed_2b::NpuEmbedder>(
+          *file_, KernelDir(options.kernels));
+    }
+  }
+
+  const ModelInfo& info() const override { return info_; }
+  const Tokenizer& tokenizer() const override { return tokenizer_; }
+  GenerateResult Generate(const GenerateRequest&,
+                          const std::function<bool(int)>&) override {
+    throw std::invalid_argument(info_.id +
+                                " is an embedding model; it does not "
+                                "generate text");
+  }
+  std::vector<int> EmbeddingIds(const EmbeddingInput& input,
+                                std::string_view instruction) const override {
+    return EmbeddingIdsFor(tokenizer_, input, instruction);
+  }
+  std::vector<std::vector<float>> Embed(
+      const std::vector<std::vector<int>>& inputs) override {
+    const std::lock_guard lock(mutex_);
+    for (const auto& ids : inputs) {
+      if (static_cast<int>(ids.size()) > info_.context_length) {
+        throw std::invalid_argument("an input of " +
+                                    std::to_string(ids.size()) +
+                                    " tokens exceeds the context length of " +
+                                    std::to_string(info_.context_length));
+      }
+    }
+    return embedder_->Embed(inputs);
+  }
+
+private:
+  std::unique_ptr<gguf::File> file_;
+  Tokenizer tokenizer_;
+  ModelInfo info_;
+  std::unique_ptr<qwen3vl_embed_2b::Embedder> embedder_;
+  std::mutex mutex_;
+};
+
+// An embedding model's info and tokenizer, no weights.
+class ProbedEmbeddingEngine final : public Engine {
+public:
+  ProbedEmbeddingEngine(const gguf::File& file, ModelInfo info)
+      : tokenizer_(file), info_(std::move(info)) {}
+
+  const ModelInfo& info() const override { return info_; }
+  const Tokenizer& tokenizer() const override { return tokenizer_; }
+  GenerateResult Generate(const GenerateRequest&,
+                          const std::function<bool(int)>&) override {
+    throw std::logic_error(info_.id + " is not loaded");
+  }
+  std::vector<int> EmbeddingIds(const EmbeddingInput& input,
+                                std::string_view instruction) const override {
+    return EmbeddingIdsFor(tokenizer_, input, instruction);
+  }
+  std::vector<std::vector<float>> Embed(
+      const std::vector<std::vector<int>>&) override {
+    throw std::logic_error(info_.id + " is not loaded");
+  }
+
+private:
+  Tokenizer tokenizer_;
+  ModelInfo info_;
+};
+
 }  // namespace
 
 std::unique_ptr<Engine> ProbeEngine(const EngineOptions& options) {
   const auto file = gguf::File::Open(options.model_path);
+  if (qwen3vl_embed_2b::IsEmbeddingModel(*file)) {
+    const auto config = qwen3vl_embed_2b::ReadConfig(*file);
+    return std::make_unique<ProbedEmbeddingEngine>(
+        *file, DescribeEmbedding(options, *file, config));
+  }
   const auto config = qwen35::ReadConfig(*file);
   std::optional<ModelPackage> package;
   ModelInfo info = Describe(options, *file, config, package);
@@ -400,6 +528,12 @@ std::unique_ptr<Engine> ProbeEngine(const EngineOptions& options) {
 
 std::unique_ptr<Engine> LoadEngine(const EngineOptions& options) {
   auto file = gguf::File::Open(options.model_path);
+  if (qwen3vl_embed_2b::IsEmbeddingModel(*file)) {
+    const auto config = qwen3vl_embed_2b::ReadConfig(*file);
+    ModelInfo info = DescribeEmbedding(options, *file, config);
+    return std::make_unique<EmbeddingEngine>(std::move(file), std::move(info),
+                                             options);
+  }
   const auto config = qwen35::ReadConfig(*file);
   std::optional<ModelPackage> package;
   const ModelInfo info = Describe(options, *file, config, package);
