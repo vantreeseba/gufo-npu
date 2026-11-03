@@ -6,7 +6,8 @@
 
 #include "core/gguf.hpp"
 
-// q4nx: the 4-bit weight format of the NPU GEMV (kernels/designs/q4nx_gemv.py).
+// q4nx: the 4-bit weight format of the NPU GEMV
+// (src/models/*/kernels/decode_gemv.py).
 //
 // A block holds kMTile out-features by kKTile in-features (4736 bytes, 4.625
 // bits per weight):

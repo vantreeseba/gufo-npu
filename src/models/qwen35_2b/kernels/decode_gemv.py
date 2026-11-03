@@ -2,8 +2,8 @@
 dim) x, for one or two tokens per weight read (two verify a speculative
 draft).
 
-Copied from kernels/designs/q4nx_gemv.py, which served the 2B and
-Qwen3.6-35B-A3B, into the 2B's own xclbin, so changes here cannot reach
+Copied from the q4nx GEMV design the 2B shared with Qwen3.6-35B-A3B (now
+src/models/qwen36_35b_a3b/kernels/decode_gemv.py) into the 2B's own xclbin, so changes here cannot reach
 another model's NPU program. The 35B's shapes, MoE gathers and scaled SwiGLU
 are left out; the geometry (decode_gemv_variants.py), tiling and core code
 are the same.

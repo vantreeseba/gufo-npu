@@ -10,10 +10,12 @@ NPU kernels are built with, and may include code from:
 - MLIR-AIE (https://github.com/Xilinx/mlir-aie), Apache-2.0 WITH LLVM-exception
 - IRON (https://github.com/amd/IRON), Apache-2.0
 - llvm-aie / Peano (https://github.com/Xilinx/llvm-aie), Apache-2.0 WITH LLVM-exception
-kernels/designs/q4nx_gemv.py is adapted from IRON's
-iron/operators/flm/lm_head design. kernels/aie/q4nx_gemv.cc includes
-MLIR-AIE's aie_kernels/flm_gemma4 headers (q4nx block format) and adapts
-their q4nx_accumulate. kernels/designs/bfp16_gemm.py builds IRON's
+The decode GEMV designs (src/models/*/kernels/decode_gemv.py) are adapted
+from IRON's iron/operators/flm/lm_head design. Their core programs
+(src/models/*/kernels/aie/decode_gemv.cc) include MLIR-AIE's
+aie_kernels/flm_gemma4 headers (q4nx block format) and adapt their
+q4nx_accumulate. The prefill GEMM designs
+(src/models/*/kernels/prefill_gemm.py) build IRON's
 iron/operators/flm/gemm design with MLIR-AIE's fused_mm kernel
 (aie_kernels/fused), and src/core/bfp16.cpp ports IRON's pack_b and
 f32_to_bfp16ebs8 (iron/operators/flm/packing.py). All Copyright (C) 2026

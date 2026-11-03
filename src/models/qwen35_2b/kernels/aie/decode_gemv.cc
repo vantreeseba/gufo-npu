@@ -1,6 +1,6 @@
 // Qwen3.5-2B's q4nx matrix-vector product for decode: y = W x for one or two
-// tokens per weight read (two verify a speculative draft). A copy of
-// kernels/aie/q4nx_gemv.cc without the MoE scaled SwiGLU, built by
+// tokens per weight read (two verify a speculative draft). A copy of the
+// core program it shared with the 35B (now the 35B's aie/decode_gemv.cc) without the MoE scaled SwiGLU, built by
 // ../decode_gemv.py into the 2B's own NPU program.
 //
 // Each core owns Q4NX_M_TILE out-features per round and streams their q4nx

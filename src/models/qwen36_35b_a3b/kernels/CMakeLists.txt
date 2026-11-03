@@ -13,7 +13,7 @@ gufo_npu_add_kernel(NAME qwen36_35b_a3b_dequant DESIGN prefill_dequant.py
                     SOURCES aie/prefill_dequant.cc
                     MODEL qwen36_35b_a3b)
 
-# Prefill GEMM: the 2B's bfp16_gemm core program with the 35B's shapes,
+# Prefill GEMM: the 2B's prefill GEMM core program with the 35B's shapes,
 # reading B from the dequant's output.
 gufo_npu_add_kernel(NAME qwen36_35b_a3b_prefill DESIGN prefill_gemm.py
                     SOURCES prefill_dequant_variants.py

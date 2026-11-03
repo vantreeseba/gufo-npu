@@ -101,7 +101,7 @@ flowchart TB
 
 *The CPU does the small, state-heavy work (mixers, routing, sampling); the NPU streams the weights. Prompts under 6–7 tokens go straight to the decode loop.*
 
-How one decode GEMV uses the NPU array (`kernels/designs/q4nx_gemv.py`):
+How one decode GEMV uses the NPU array (`src/models/qwen35_2b/kernels/decode_gemv.py`; each model has its own copy):
 
 ```mermaid
 flowchart TB

@@ -82,14 +82,16 @@ Compiling NPU kernels needs no NPU; running them does. Run NPU work with
   `finish()`) takes the next completion token of that task's shim channel,
   whichever task sent it. Await the tasks of one channel in the order they
   were queued, or a wait returns early and a reused BD can overwrite a
-  transfer still in flight (see `kernels/designs/q4nx_gemv.py`;
-  `q4nx_gemv_chain_test` runs the chain 60,000 times to catch this).
+  transfer still in flight (see `src/models/qwen35_2b/kernels/decode_gemv.py`;
+  `qwen35_decode_gemv_chain_test` runs the chain 60,000 times to catch
+  this).
 - A core starts in floor (truncating) rounding mode; kernels that narrow to
-  bf16 set round-to-nearest-even first (see `kernels/aie/q4nx_gemv.cc`).
+  bf16 set round-to-nearest-even first (see each package's
+  `kernels/aie/decode_gemv.cc`).
 - One xclbin per kernel family, one instruction sequence per shape (shape
   in runtime parameters), so every call runs in one hardware context and
-  can join a runlist. `kernels/designs/q4nx_gemv.py` checks that all its
-  shapes build the same array configuration.
+  can join a runlist. Each `src/models/<model>/kernels/decode_gemv.py`
+  checks that all its shapes build the same array configuration.
 
 ## Code layout
 
@@ -114,14 +116,12 @@ one hardware context, one flow), as a kernel source file is in gufo.
   (`docs/models/<slug>/`: README, BENCHMARKS, QUALITY, EXPERIMENTS) and
   tools. A model may borrow another's kernel only through a split-out
   library, and its docs say so.
-- Moving there: today the 2B and the 35B still share
-  `src/models/qwen35/npu_decoder.*` and the `q4nx_gemv` design and xclbin,
-  and the 2B's prefill sits in `src/models/qwen35/`. The plan is to fork the
-  decode kernel per model (`src/models/<model>/kernels/`, xclbin
-  `<model>_decode`), trim each copy to its own shapes, split the NPU decoder
-  per model and select the model through a registry by GGUF arch and shape.
-  New models start in their own package and never edit another model's
-  kernels.
+- Every model runs its own decode program (`src/models/<model>/kernels/`,
+  xclbin `<model>_decode`), NPU decoder and prefill. Still to move:
+  `src/npu/gemv.hpp` holds the 2B/35B geometry (`kGemvHidden`,
+  `kGemvMaxDim`) and the 35B's expert constants, and the CLI picks the
+  package with its own checks instead of `serve::NpuPackageFor`. New models
+  start in their own package and never edit another model's kernels.
 
 ## Development
 

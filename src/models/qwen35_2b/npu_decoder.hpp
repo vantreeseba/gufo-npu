@@ -12,16 +12,16 @@
 #include "models/qwen35/generate.hpp"
 
 // Qwen3.5-2B decode on the NPU, on the 2B's own decode GEMV program
-// (src/models/qwen35_2b/kernels). Copied from models/qwen35/npu_decoder
-// without the MoE layers; the CPU side (config, Mixer, MTP draft vocabulary)
-// is the family's shared code. Every matrix product, every RMS norm before
-// one, the residual adds and SwiGLU run in the q4nx GEMV (its resnorm input
-// stage and SwiGLU output stage); the residual stream stays on the device.
-// Each GEMV writes into the input region of the next, so the calls from one
-// layer's mixer output to the next layer's input projection (out, gate + up,
-// down, next in) run as one chain. The CPU runs the token mixers (Gated
-// DeltaNet, attention) and the DeltaNet alpha/beta rows: 25 NPU submissions
-// per step.
+// (src/models/qwen35_2b/kernels). Copied from the decoder it shared with the
+// 35B (now models/qwen36_35b_a3b/npu_decoder) without the MoE layers; the CPU
+// side (config, Mixer, MTP draft vocabulary) is the family's shared code. Every
+// matrix product, every RMS norm before one, the residual adds and SwiGLU run
+// in the q4nx GEMV (its resnorm input stage and SwiGLU output stage); the
+// residual stream stays on the device. Each GEMV writes into the input region
+// of the next, so the calls from one layer's mixer output to the next layer's
+// input projection (out, gate + up, down, next in) run as one chain. The CPU
+// runs the token mixers (Gated DeltaNet, attention) and the DeltaNet alpha/beta
+// rows: 25 NPU submissions per step.
 //
 // A step takes one or two tokens; the weights are read once for both. The
 // second token of a pair can be a speculative draft: Resolve() keeps it or

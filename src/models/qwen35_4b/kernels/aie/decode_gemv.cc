@@ -1,6 +1,6 @@
 // Qwen3.5-4B's q4nx matrix-vector product for decode: y = W x for one or two
 // tokens per weight read (two verify a speculative draft). A copy of
-// kernels/aie/q4nx_gemv.cc (Qwen3.5-2B), built with the 4B's geometry by
+// the 2B's core program (now src/models/qwen35_2b/kernels/aie/decode_gemv.cc), built with the 4B's geometry by
 // ../decode_gemv.py into the 4B's own NPU program.
 //
 // Each core owns Q4NX_M_TILE out-features per round and streams their q4nx
