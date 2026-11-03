@@ -17,14 +17,6 @@ gufo_npu_add_kernel(NAME smoke_add_one DESIGN designs/smoke_add_one.py MODEL com
 gufo_npu_add_kernel(NAME bw_memcpy DESIGN designs/bw_memcpy.py MODEL common)
 gufo_npu_add_kernel(NAME bw_read DESIGN designs/bw_read.py MODEL common)
 
-# Decode GEMVs: one core program and xclbin for the 35B's calls, including
-# its MoE gathers (designs/q4nx_gemv_variants.py lists the shapes; each
-# sequence as an instruction ELF and as raw instruction words). Qwen3.5-2B
-# runs its own copy (src/models/qwen35_2b/kernels).
-gufo_npu_add_kernel(NAME q4nx_gemv DESIGN designs/q4nx_gemv.py
-                    SOURCES aie/q4nx_gemv.cc
-                    MODEL qwen36_35b_a3b)
-
 # Per-model kernel packages (src/models/<model>/kernels), registered in this
 # scope so they share the settings above.
 add_subdirectory("${PROJECT_SOURCE_DIR}/src/models/qwen35_2b/kernels"

@@ -32,7 +32,7 @@
 #if !defined(Q4NX_M_TILE) || !defined(Q4NX_K_TILE) || !defined(Q4NX_GROUP) || \
     !defined(GEMV_MAX_DIM) || !defined(GEMV_RMS_EPS) ||                      \
     !defined(GEMV_HIDDEN) || !defined(GEMV_TOKENS) || !defined(GEMV_SLOT)
-#error "q4nx_gemv.cc needs its geometry -D defined"
+#error "decode_gemv.cc needs its geometry -D defined"
 #endif
 
 // One M by N block. Per row: d and dmin (bf16). Per row and 32 inputs,
@@ -170,7 +170,7 @@ constexpr int PROLOGUE_ACT = 2;      // dim bf16 per token, MAX_DIM apart
 constexpr int EPILOGUE_STORE = 0;   // per token: M_TILE fp32
 constexpr int EPILOGUE_SWIGLU = 1;  // per token: 16 bf16 silu(g) * u, then pad
 constexpr int EPILOGUE_SWIGLU_SCALED = 2;  // the same times a per-round scale
-// RTP words (kernels/designs/q4nx_gemv.py): the output stage, and the first of
+// RTP words (decode_gemv.py): the output stage, and the first of
 // the swiglu_scaled scales (round-major, then token).
 constexpr int RTP_EPILOGUE = 3;
 constexpr int RTP_SCALES = 7;

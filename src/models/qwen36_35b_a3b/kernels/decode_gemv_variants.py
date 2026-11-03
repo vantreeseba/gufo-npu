@@ -1,9 +1,10 @@
-"""Shape variants of the q4nx GEMV design (q4nx_gemv.py): pure data, no
-IRON imports, so the build can list the design's outputs at configure time
-(build.py --list-outputs).
+"""Qwen3.6-35B-A3B's decode GEMV shapes (decode_gemv.py): pure data, no
+IRON imports, so kernels/build.py --list-outputs can read OUTPUTS at
+configure time. The host mirrors the geometry in
+src/models/qwen36_35b_a3b/npu/gemv.hpp.
 """
 
-XCLBIN = "q4nx_gemv"
+XCLBIN = "qwen36_35b_a3b_decode"
 # The longest input a call takes: a down gather over 17 experts (two tokens'
 # 16 routed experts and the shared one, 17 x 512).
 MAX_DIM = 8704
@@ -13,30 +14,25 @@ SLOT = 2 * HIDDEN  # fp32 per plain/resnorm token slot ([H | D])
 EXPERT_FFN = 512  # an MoE expert's width (Qwen3.6-35B-A3B)
 MAX_EXPERTS = MAX_DIM // EXPERT_FFN  # experts a down gather can concatenate
 
-# Decode calls of Qwen3.5-2B as (dim, padded rows, input, output, Y token
-# stride): mixer output (into the next resnorm's D slots), the MTP head's
-# eh_proj (into the residual H slots), fused attention
-# input (q + gate, k, v), fused DeltaNet input (qkv + z), fused gate + up with
-# SwiGLU, down (into the next D slots), and the LM head (248320 rows padded to
-# 248832). Each is built for 1 and 2 tokens.
+# Dense decode calls as (dim, padded rows, input, output, Y token stride),
+# each built for 1 and 2 tokens.
 VARIANTS = [
-    (2048, 2048, "plain", "store", SLOT),
+    # Mixer outputs (ssm_out, attn_output: 4096 -> 2048) into the next
+    # resnorm's D slots, and the MTP head's eh_proj (4096 -> 2048) into the
+    # residual H slots.
     (4096, 2048, "plain", "store", SLOT),
-    (2048, 5120, "resnorm", "store", 5120),
-    (2048, 8192, "resnorm", "store", 8192),
-    (2048, 12288, "resnorm", "swiglu", MAX_DIM // 2),
-    (6144, 2048, "act", "store", SLOT),
+    # Fused DeltaNet input: qkv (8192) + z (4096).
+    (2048, 12288, "resnorm", "store", 12288),
+    # Fused attention input: q + gate (8192), k (512), v (512).
+    (2048, 9216, "resnorm", "store", 9216),
+    # The LM head (248,320 rows padded to 248,832).
     (2048, 248832, "resnorm", "store", 248832),
     # The MTP draft's LM head over the draft vocabulary.
     (2048, 32768, "resnorm", "store", 32768),
-    # Qwen3.6-35B-A3B MoE, one expert per call: gate + up and down.
+    # One expert per call, gate + up and down: only tools/bench/npu_moe_spike
+    # (the per-expert baseline the gathers replaced).
     (2048, 1024, "resnorm", "swiglu", MAX_DIM // 2),
     (512, 2048, "act", "store", SLOT),
-    # Qwen3.6-35B-A3B input projections: DeltaNet (qkv + z), attention
-    # (q + gate, k, v). Its mixer outputs (4096 -> 2048) and LM head
-    # (248,320 rows) use the shapes above.
-    (2048, 12288, "resnorm", "store", 12288),
-    (2048, 9216, "resnorm", "store", 9216),
 ]
 
 # MoE gathers as (dim, rows, input, output, Y token stride, gather, experts,

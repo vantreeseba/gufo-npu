@@ -1,5 +1,6 @@
-"""q4nx GEMV for decode on the whole array: y (n_out) = W (n_out x dim) x, for
-one or two tokens per weight read (two verify a speculative draft).
+"""Qwen3.6-35B-A3B's q4nx decode GEMV on the whole array: y (n_out) = W (n_out
+x dim) x, for one or two tokens per weight read (two verify a speculative
+draft), and the MoE expert gathers. Its shapes are in decode_gemv_variants.py.
 
 Every core (8 columns x 4 rows) owns M_TILE out-features per round and
 accumulates one q4nx block per K_TILE in-features. Each column's weights come
@@ -12,7 +13,7 @@ packed in this design's order (src/core/q4nx.hpp):
 One core program serves every call: each core reads its k block count, round
 count, token count and input/output stages from a runtime parameter that the
 variant's instruction sequence writes before it streams. The build emits one
-xclbin (q4nx_gemv.xclbin) and one instruction ELF per variant, all for the
+xclbin (qwen36_35b_a3b_decode.xclbin) and one instruction ELF per variant, all for the
 same hardware context, so calls chain in one runlist.
 
 The token buffer X is always X_FLOATS fp32: TOKENS slots of SLOT fp32, then a
@@ -60,7 +61,7 @@ from aie.utils import config
 from aie.utils.compile.utils import compile_mlir_module
 
 # Shapes, sequence names and outputs: pure data, also read by CMake.
-from q4nx_gemv_variants import (  # noqa: E402
+from decode_gemv_variants import (  # noqa: E402 (sibling; build.py puts it on the path)
     EXPERT_FFN,
     HIDDEN,
     MAX_DIM,
@@ -105,7 +106,7 @@ RTP_WORDS = RTP_SCALES + MAX_EXPERTS * TOKENS
 SCALE_SENTINEL = 0x7FA50000
 STACK_SIZE = 8 * 1024
 
-KERNEL_SOURCE = Path(__file__).resolve().parent.parent / "aie" / "q4nx_gemv.cc"
+KERNEL_SOURCE = Path(__file__).resolve().parent / "aie" / "decode_gemv.cc"
 
 bf16 = np.dtype[bfloat16]
 # k blocks, rounds, input stage, output stage, residual pieces, core row,
