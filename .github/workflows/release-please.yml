@@ -3,7 +3,9 @@ name: Release Please
 # Keeps a release pull request up to date from Conventional Commit titles on
 # main, and tags the release when it merges. Uses the job token, so the
 # release PR does not trigger other workflows; run CI on it manually
-# (workflow_dispatch) before merging.
+# (workflow_dispatch) before merging. For the same reason the tag push does
+# not start CI, so a run that creates a release builds and pushes the
+# versioned image itself (:<version>, :<major>.<minor>, :latest).
 
 on:
   schedule:
@@ -11,8 +13,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 concurrency:
   group: release-please
@@ -23,10 +24,29 @@ jobs:
     name: Release pull request
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      version: ${{ steps.release.outputs.version }}
     steps:
       - name: Maintain release pull request or publish merged release
+        id: release
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+  image:
+    name: Release image
+    needs: release
+    if: needs.release.outputs.release_created == 'true'
+    uses: ./.github/workflows/linux-build.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      push: true
+      version: ${{ needs.release.outputs.version }}

@@ -3,6 +3,9 @@ name: Linux build
 # Builds the Dockerfile on a hosted runner. The build stage compiles the host
 # binaries and NPU kernels (no NPU needed) and runs the CPU tests. Uploads the
 # installed tree as an artifact and, when asked, pushes the runtime image.
+# With `version` (a release, from release-please.yml) it builds the release
+# tag and pushes :<version>, :<major>.<minor> and :latest instead of the
+# branch tag.
 
 on:
   workflow_call:
@@ -10,6 +13,10 @@ on:
       push:
         type: boolean
         default: false
+      version:
+        description: Release version (x.y.z); builds tag v<version>
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -23,17 +30,27 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.version && format('v{0}', inputs.version) || '' }}
 
       - name: Image name and tags
         id: meta
         shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
-          ref="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
-          branch_tag="$(printf '%s' "${ref}" | tr -c 'A-Za-z0-9_.-' '-')"
+          sha="$(git rev-parse HEAD)"
+          if [[ -n "${VERSION}" ]]; then
+            tags="${image}:${VERSION},${image}:${VERSION%.*},${image}:latest"
+          else
+            ref="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+            tags="${image}:$(printf '%s' "${ref}" | tr -c 'A-Za-z0-9_.-' '-')"
+          fi
           {
             echo "image=${image}"
-            echo "tags=${image}:${branch_tag},${image}:sha-${GITHUB_SHA}"
+            echo "sha=${sha}"
+            echo "tags=${tags},${image}:sha-${sha}"
           } >> "${GITHUB_OUTPUT}"
 
       - name: Set up Docker Buildx
@@ -64,7 +81,8 @@ jobs:
       - name: Package installed tree
         shell: bash
         env:
-          IMAGE: ${{ steps.meta.outputs.image }}:sha-${{ github.sha }}
+          IMAGE: ${{ steps.meta.outputs.image }}:sha-${{ steps.meta.outputs.sha }}
+          SHA: ${{ steps.meta.outputs.sha }}
         run: |
           set -euo pipefail
           container="$(docker create "${IMAGE}")"
@@ -73,7 +91,7 @@ jobs:
           tar --sort=name --owner=0 --group=0 --numeric-owner \
             -czf gufo-npu-linux-x86_64.tar.gz gufo-npu
           {
-            echo "### gufo-npu ${GITHUB_SHA::12}"
+            echo "### gufo-npu ${SHA::12}"
             echo '```'
             find gufo-npu -type f | sort
             echo '```'
@@ -85,7 +103,7 @@ jobs:
       - name: Upload installed tree
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: gufo-npu-linux-x86_64-${{ github.sha }}
+          name: gufo-npu-linux-x86_64-${{ steps.meta.outputs.sha }}
           path: gufo-npu-linux-x86_64.tar.gz
           compression-level: 0
           retention-days: 7

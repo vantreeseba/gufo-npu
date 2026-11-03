@@ -8,9 +8,10 @@
 | `linux-build.yml` | called by CI | hosted | Docker build (host + NPU kernels + CPU tests), uploads `gufo-npu-linux-x86_64-<sha>` tarball, pushes the image on non-PR runs |
 | `npu-smoke.yml` | manual | self-hosted `[linux, strix-halo, npu]` | pulls an image, runs `diagnose` and `smoke` on the NPU |
 | `pr-title.yml` | PR | hosted | Conventional Commit title |
-| `release-please.yml` | daily, manual | hosted | release PR and tags |
+| `release-please.yml` | daily, manual | hosted | release PR and tags; when it tags a release, `linux-build.yml` on the tag pushes the versioned image |
 
-Images: `ghcr.io/vantreeseba/gufo-npu:<branch>` and `:sha-<commit>`.
+Images: `ghcr.io/vantreeseba/gufo-npu:<branch>` and `:sha-<commit>`; releases
+also push `:<version>`, `:<major>.<minor>` and `:latest`.
 
 ## Testing a CI build on your Strix Halo
 
