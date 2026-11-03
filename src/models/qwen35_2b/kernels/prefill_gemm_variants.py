@@ -1,9 +1,10 @@
-"""Shape variants of the bfp16 GEMM design (bfp16_gemm.py): pure data, no
-IRON imports, so the build can list the design's outputs at configure time
-(build.py --list-outputs).
+"""Qwen3.5-2B's prefill GEMM shapes (prefill_gemm.py): pure data, no IRON
+imports, so kernels/build.py --list-outputs can read OUTPUTS at configure
+time. The host's name for the program is npu::kPrefillName
+(src/models/qwen35_2b/npu/gemv.hpp).
 """
 
-XCLBIN = "bfp16_gemm"
+XCLBIN = "qwen35_2b_prefill"
 
 # Prompt tokens per call (rows of A), each a multiple of 256.
 CHUNKS = [256, 512, 1024]

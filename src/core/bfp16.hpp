@@ -5,8 +5,8 @@
 #include <vector>
 
 // bfp16ebs8, the AIE2P block-floating-point type the prefill GEMM's mmul
-// multiplies (kernels/designs/bfp16_gemm.py): 8 values share an 8-bit
-// exponent byte and carry 8-bit two's-complement mantissas, 9 bytes per
+// multiplies (src/models/qwen35_2b/kernels/prefill_gemm.py): 8 values share an
+// 8-bit exponent byte and carry 8-bit two's-complement mantissas, 9 bytes per
 // block, value = mantissa * 2^(exponent - 133).
 //
 // PackGemmB lays a weight matrix out as the GEMM's B operand in the order its

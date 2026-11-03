@@ -12,6 +12,8 @@ namespace gufo_npu::qwen35_2b::npu {
 // The decode GEMV program (kernels/decode_gemv.py): its xclbin and the
 // prefix of its instruction sequences, in the kernel directory.
 inline constexpr char kDecodeName[] = "qwen35_2b_decode";
+// The prefill GEMM program (kernels/prefill_gemm.py).
+inline constexpr char kPrefillName[] = "qwen35_2b_prefill";
 // Residual width of the resnorm input stage.
 inline constexpr std::size_t kHidden = 2048;
 // The token buffer's per-token activation width, in values (MAX_DIM: the

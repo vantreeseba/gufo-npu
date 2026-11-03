@@ -22,6 +22,7 @@
 #include "core/simd.hpp"
 #include "core/vec.hpp"
 #include "models/qwen35/prefill_mixer.hpp"
+#include "models/qwen35_2b/npu/gemv.hpp"
 #include "npu/gemm.hpp"
 
 namespace gufo_npu::qwen35_2b {
@@ -216,7 +217,7 @@ struct NpuPrefill::Impl {
   }
 
   Impl(const gguf::File& file, const std::filesystem::path& kernel_dir)
-      : config(ReadConfig(file)), runtime(kernel_dir) {
+      : config(ReadConfig(file)), runtime(kernel_dir, npu::kPrefillName) {
     const Config& cfg = config;
     if (cfg.experts != 0 || !cfg.tied_embeddings) {
       throw std::runtime_error(

@@ -6,31 +6,31 @@
 #include <memory>
 #include <string>
 
-// The prefill GEMM design (kernels/designs/bfp16_gemm.py): C = A W^T for a
-// chunk of m prompt tokens, A (m x k) and C (m x n) bf16 row-major, W the
-// weights as bfp16 (src/core/bfp16.hpp), resident on the device. One xclbin
-// in its own hardware context (separate from the decode GEMV's), one
-// instruction sequence per (m, k, n).
+// A prefill GEMM design (IRON's flm.GEMM; each model compiles its own copy
+// with its shapes, e.g. src/models/qwen35_2b/kernels/prefill_gemm.py): C =
+// A W^T for a chunk of m prompt tokens, A (m x k) and C (m x n) bf16
+// row-major, W the weights as bfp16 (src/core/bfp16.hpp), resident on the
+// device. One xclbin in its own hardware context (separate from the decode
+// GEMV's), one instruction sequence per (m, k, n).
 namespace gufo_npu::npu {
 
 // Prompt tokens per GEMM call (rows of A and C), smallest first; every
-// matrix has a sequence for each (CHUNKS in kernels/designs/bfp16_gemm.py).
+// matrix has a sequence for each (the designs' CHUNKS).
 inline constexpr std::size_t kGemmChunks[] = {256, 512, 1024};
 inline constexpr std::size_t kGemmMaxChunk = 1024;
 
-// The instruction sequence name, e.g. "bfp16_gemm_m256_k2048_n8192"
+// The instruction sequence name, e.g. "qwen35_2b_prefill_m256_k2048_n8192"
 // (`design` is the prefix).
 std::string Bfp16GemmSequence(std::size_t m, std::size_t k, std::size_t n,
-                              const std::string& design = "bfp16_gemm");
+                              const std::string& design);
 
 class GemmRuntime {
 public:
-  // Loads <design>.xclbin from `kernel_dir`: kernels/designs/bfp16_gemm.py
-  // by default, or a model's own copy of it (same core program, its own
-  // shapes, e.g. src/models/qwen35_4b/kernels). Throws when it is missing or
-  // the NPU cannot be opened.
-  explicit GemmRuntime(const std::filesystem::path& kernel_dir,
-                       const std::string& design = "bfp16_gemm");
+  // Loads <design>.xclbin from `kernel_dir` (a model's prefill GEMM, e.g.
+  // qwen35_2b_prefill). Throws when it is missing or the NPU cannot be
+  // opened.
+  GemmRuntime(const std::filesystem::path& kernel_dir,
+              const std::string& design);
   ~GemmRuntime();
   GemmRuntime(const GemmRuntime&) = delete;
   GemmRuntime& operator=(const GemmRuntime&) = delete;

@@ -11,7 +11,8 @@
 #include "models/qwen35/state_capture.hpp"
 #include "models/qwen35_2b/npu_decoder.hpp"
 
-// Qwen3.5-2B prompt processing (prefill) on the NPU. A chunk of up to
+// Qwen3.5-2B prompt processing (prefill) on the NPU, on the 2B's own GEMM
+// program (src/models/qwen35_2b/kernels/prefill_gemm.py). A chunk of up to
 // gufo_npu::npu::kGemmMaxChunk prompt tokens goes through each layer at once:
 // its matrix products run as bfp16 GEMMs on the NPU (the weights are read
 // once per chunk), and the CPU runs the norms, residual adds
@@ -32,7 +33,8 @@ using qwen35::StateCapture;
 
 class NpuPrefill {
 public:
-  // Keeps pointers into `file`, which must outlive it.
+  // Keeps pointers into `file`, which must outlive it. Loads the 2B's
+  // prefill program (npu::kPrefillName) from kernel_dir.
   NpuPrefill(const gguf::File& file, const std::filesystem::path& kernel_dir);
   ~NpuPrefill();
   NpuPrefill(const NpuPrefill&) = delete;

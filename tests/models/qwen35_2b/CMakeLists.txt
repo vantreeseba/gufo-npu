@@ -73,9 +73,10 @@ if(GUFO_NPU_ENABLE_XRT AND GUFO_NPU_BUILD_KERNELS)
                        LABELS "qwen35_2b;npu;kernels" SKIP_RETURN_CODE 77
                        TIMEOUT 600)
 
-  add_executable(bfp16_gemm_test bfp16_gemm_test.cpp)
-  target_link_libraries(bfp16_gemm_test PRIVATE gufo_npu_runtime)
-  add_test(NAME bfp16_gemm_test COMMAND bfp16_gemm_test "${kernels}")
-  set_tests_properties(bfp16_gemm_test PROPERTIES
+  add_executable(qwen35_prefill_gemm_test prefill_gemm_test.cpp)
+  target_link_libraries(qwen35_prefill_gemm_test PRIVATE gufo_npu_runtime)
+  add_test(NAME qwen35_prefill_gemm_test
+           COMMAND qwen35_prefill_gemm_test "${kernels}")
+  set_tests_properties(qwen35_prefill_gemm_test PROPERTIES
                        LABELS "qwen35_2b;npu;kernels" SKIP_RETURN_CODE 77)
 endif()

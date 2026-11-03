@@ -6,3 +6,9 @@
 gufo_npu_add_kernel(NAME qwen35_2b_decode DESIGN decode_gemv.py
                     SOURCES aie/decode_gemv.cc decode_gemv_variants.py
                     MODEL qwen35_2b)
+
+# Prefill GEMM: IRON's flm.GEMM with the 2B's projections (the other models'
+# prefill GEMMs are copies of it).
+gufo_npu_add_kernel(NAME qwen35_2b_prefill DESIGN prefill_gemm.py
+                    SOURCES prefill_gemm_variants.py
+                    MODEL qwen35_2b)

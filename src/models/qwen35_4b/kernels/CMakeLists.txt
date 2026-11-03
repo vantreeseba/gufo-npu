@@ -6,7 +6,7 @@ gufo_npu_add_kernel(NAME qwen35_4b_decode DESIGN decode_gemv.py
                     SOURCES aie/decode_gemv.cc decode_gemv_variants.py
                     MODEL qwen35_4b)
 
-# Prefill GEMM: the 2B's bfp16_gemm core program with the 4B's shapes.
+# Prefill GEMM: the 2B's prefill GEMM core program with the 4B's shapes.
 gufo_npu_add_kernel(NAME qwen35_4b_prefill DESIGN prefill_gemm.py
                     SOURCES prefill_gemm_variants.py
                     MODEL qwen35_4b)
