@@ -189,8 +189,7 @@ Q4nxGemv::Q4nxGemv(GemvRuntime& runtime, const q4nx::Matrix& weights,
   if (weights.dim > design.max_dim) {
     throw std::invalid_argument("q4nx GEMV: dim above the design's maximum");
   }
-  // Must match the design's variants (kernels/designs/q4nx_gemv.py, or a
-  // model's own copy).
+  // Must match the design's variants (the model's decode_gemv_variants.py).
   if (epilogue == Epilogue::kSwiGlu) {
     // Compact bf16 tokens MAX_DIM apart, where the act input stage reads them.
     y_token_stride_ = design.max_dim / 2;
@@ -322,16 +321,17 @@ constexpr std::size_t kArrayCores = q4nx::kCols * q4nx::kRows;
 // Output rounds of a down gather (kGemvHidden rows).
 constexpr std::size_t kDownRounds = kGemvHidden / q4nx::kOutPerRound;
 
-std::string GatherSequence(Q4nxGather::Kind kind, std::size_t experts,
-                           std::size_t tokens) {
+// `design` is the sequence-name prefix (GemvDesign::name).
+std::string GatherSequence(const std::string& design, Q4nxGather::Kind kind,
+                           std::size_t experts, std::size_t tokens) {
   const std::string count = std::to_string(experts);
   const std::string t = "_t" + std::to_string(tokens);
   if (kind == Q4nxGather::Kind::kGateUp) {
-    return "q4nx_gemv_k" + std::to_string(kGemvHidden) + "_n" +
+    return design + "_k" + std::to_string(kGemvHidden) + "_n" +
            std::to_string(experts * q4nx::kOutPerRound) +
            "_resnorm_swiglu_scaled_rounds" + count + t;
   }
-  return "q4nx_gemv_k" + std::to_string(experts * kExpertFfn) + "_n" +
+  return design + "_k" + std::to_string(experts * kExpertFfn) + "_n" +
          std::to_string(kGemvHidden) + "_act_store_k" + count + t;
 }
 
@@ -376,7 +376,8 @@ struct Q4nxGather::Impl {
                                   std::to_string(experts) + " experts and " +
                                   std::to_string(tokens) + " token(s)");
     }
-    const std::string name = GatherSequence(kind, experts, tokens);
+    const std::string name =
+        GatherSequence(rt.design.name, kind, experts, tokens);
     instructions = std::make_unique<InstrSequence>(rt.hw, *rt.kernel,
                                                    rt.Path(name, ".insts.bin"));
     const auto& w = instructions->words;

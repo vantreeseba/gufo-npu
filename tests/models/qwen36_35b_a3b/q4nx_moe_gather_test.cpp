@@ -10,6 +10,7 @@
 
 #include "core/q4nx.hpp"
 #include "core/quant.hpp"
+#include "models/qwen36_35b_a3b/npu/gemv.hpp"
 #include "npu/gemv.hpp"
 
 // MoE FFN on the NPU with experts chosen per call (npu::Q4nxGather,
@@ -53,7 +54,8 @@ int main(int argc, char** argv) {
     std::puts("SKIP: no NPU at /dev/accel/accel0");
     return 77;
   }
-  npu::GemvRuntime rt(argv[1], npu::Flow::kInstructionBuffer);
+  npu::GemvRuntime rt(argv[1], npu::Flow::kInstructionBuffer,
+                      gufo_npu::qwen36_35b_a3b::npu::DecodeDesign());
   std::mt19937 rng(5);
   std::normal_distribution<float> weight(0.0f, 0.02f);
   std::normal_distribution<float> act(0.0f, 1.0f);
