@@ -369,6 +369,37 @@ Turbo shortens the single-call round trip by ~14 µs and the GEMVs by ~3%
 (+0.6% decode). Bandwidth does not move, so the NPU clock is not the limit.
 gufo-npu does not change the power mode.
 
+### One chain sequence per layer (to measure)
+
+Each layer's out → gate + up → down → next projection now runs as one
+instruction sequence (`qwen35_2b_decode_chain_*`, one call per submission
+instead of four), on regions of one activation buffer. Not measured yet;
+expected 1.1–1.4 ms per token (4–5%), from the ~20 µs command cost of the 72
+calls it removes from the runlists.
+
+On the box, the same toolchain for both builds: main and this branch, warm,
+interleaved, three runs of each per prompt:
+
+```sh
+# The cost of a call inside a runlist, per decode shape (one-token calls).
+gufo-npu bench gemv --model "$GUFO_NPU_QWEN35_2B_Q4_GGUF" --chain 16
+# Decode speed, without and with MTP; the [timeline: ...] line shows the
+# mean wall time of each kind of submission (layer = a layer's chain).
+for draft in none mtp; do
+  gufo-npu generate --device npu --model "$GUFO_NPU_QWEN35_2B_Q4_GGUF" \
+    --prompt "Why is the sky blue?" --max-tokens 256 --draft $draft
+  gufo-npu generate --device npu --model "$GUFO_NPU_QWEN35_2B_Q4_GGUF" \
+    --prompt "Write a Python function for Fibonacci numbers." \
+    --max-tokens 256 --draft $draft
+done
+# Same output: the chain sequences against the per-call chain, then the
+# decoder against the CPU decoder.
+ctest --preset npu -R 'qwen35_decode_gemv_chain_test|qwen35_decode_gemv_test|qwen35_npu_decode_test|qwen35_npu_sampling_test'
+```
+
+The replies must hash the same as main's (greedy). The layer submission's
+mean (timeline) should drop by about 60 µs.
+
 ## NPU prefill (Phase 4)
 
 `gufo-npu generate --device npu` now runs every prompt token but the last

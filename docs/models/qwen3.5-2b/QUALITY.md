@@ -148,7 +148,10 @@ proposed; acceptance per prompt and vocabulary size is in BENCHMARKS.md.
 Greedy output on the NPU must be the same on every run.
 `qwen35_decode_gemv_chain_test` (label `npu`) runs one decoder layer's chain of
 GEMVs 60,000 times with the same inputs, alternating 1 and 2 tokens, and
-requires every output to be bit-identical.
+requires every output to be bit-identical. It runs the layer two ways on two
+copies of the activation buffer, each GEMV as its own call and as the chain
+sequence the decoder submits, and requires both to match bit for bit after
+every run.
 
 2026-10-27: about one sweep run in ten (long prompts: one call in ~30,000)
 gave a different reply. The chain test (200,000 runs) found 6 runs whose
