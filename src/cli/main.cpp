@@ -68,8 +68,10 @@ constexpr char kUsage[] =
     "                           per-dispatch cost: sync, async and runlist\n"
     "  bench bandwidth [--iters N] [--kernels DIR]\n"
     "                           NPU DDR bandwidth: copy, and read only\n"
-    "  bench gemv --model GGUF [--iters N] [--kernels DIR]\n"
-    "                           q4nx GEMV on the model's decode shapes\n"
+    "  bench gemv --model GGUF [--iters N] [--chain N] [--kernels DIR]\n"
+    "                           q4nx GEMV on the model's decode shapes;\n"
+    "                           --chain also times N calls in one runlist\n"
+    "                           (per call)\n"
     "  bench mtp --model GGUF --prompt TEXT [--tokens N] [--kernels DIR]\n"
     "                           MTP draft acceptance on a greedy NPU decode\n"
     "  bench prefill --model GGUF [--tokens 35,125,1024] [--runs N]\n"
@@ -376,12 +378,15 @@ void BenchMoeFfn(const gufo_npu::gguf::File& file,
 
 int BenchGemv(const std::vector<std::string_view>& args) {
   int iterations = 200;
+  int chain = 0;
   std::optional<std::string> kernels;
   std::string model;
   for (std::size_t i = 0; i < args.size(); ++i) {
     const bool has_value = i + 1 < args.size();
     if (args[i] == "--iters" && has_value) {
       iterations = std::atoi(std::string(args[++i]).c_str());
+    } else if (args[i] == "--chain" && has_value) {
+      chain = std::atoi(std::string(args[++i]).c_str());
     } else if (args[i] == "--kernels" && has_value) {
       kernels = std::string(args[++i]);
     } else if (args[i] == "--model" && has_value) {
@@ -465,8 +470,12 @@ int BenchGemv(const std::vector<std::string_view>& args) {
                  Prologue::kResNorm,
                  Epilogue::kStore},
             };
-  std::printf("%-22s %6s %7s %8s %10s %10s %8s %9s\n", "stage", "dim", "rows",
+  std::printf("%-22s %6s %7s %8s %10s %10s %8s %9s", "stage", "dim", "rows",
               "MB", "1 tok us", "2 tok us", "GB/s(1)", "2 vs 1");
+  if (chain > 0) {
+    std::printf(" %11s", "chained us");
+  }
+  std::printf("\n");
   for (const auto& c : cases) {
     std::vector<q4nx::Segment> segments;
     for (const char* name : c.tensors) {
@@ -492,9 +501,30 @@ int BenchGemv(const std::vector<std::string_view>& args) {
       mean_us[tokens - 1] = gemv.Time(iterations).mean_us;
     }
     const double mb = static_cast<double>(gemv.weight_bytes()) / 1e6;
-    std::printf("%-22s %6zu %7zu %8.1f %10.1f %10.1f %8.1f %8.2fx\n", c.label,
+    std::printf("%-22s %6zu %7zu %8.1f %10.1f %10.1f %8.1f %8.2fx", c.label,
                 dim, packed.rows, mb, mean_us[0], mean_us[1],
                 mb * 1e6 / mean_us[0] / 1e3, mean_us[1] / mean_us[0]);
+    if (chain > 0) {
+      // `chain` one-token calls in one runlist: the cost of a call inside a
+      // chain, without the submission's own round trip.
+      npu::Chain calls(runtime);
+      for (int i = 0; i < chain; ++i) {
+        calls.Add(gemv, x, y, r, 1);
+      }
+      for (int i = 0; i < 5; ++i) {
+        calls.Run();  // warm up
+      }
+      const auto start = std::chrono::steady_clock::now();
+      const int runs = std::max(iterations / chain, 5);
+      for (int i = 0; i < runs; ++i) {
+        calls.Run();
+      }
+      const double us = std::chrono::duration<double, std::micro>(
+                            std::chrono::steady_clock::now() - start)
+                            .count();
+      std::printf(" %11.1f", us / (static_cast<double>(runs) * chain));
+    }
+    std::printf("\n");
   }
   if (moe) {
     BenchMoeFfn(*file, runtime, iterations);
@@ -934,6 +964,24 @@ int GenerateOnNpu(const gufo_npu::gguf::File& file,
                stats.steps ? 100.0 * stats.accepted / stats.steps : 0.0,
                npu.submissions(), npu.npu_seconds(), npu.cpu_seconds(),
                routing_seconds, load_seconds);
+  // Where a step's time goes, for decoders that keep a timeline: the mean
+  // wall time of each kind of submission and the host's buffer syncs per
+  // step.
+  if constexpr (requires { npu.timeline(); }) {
+    const auto& tl = npu.timeline();
+    const auto mean_us = [](const auto& s) {
+      return s.count ? 1e6 * s.seconds / s.count : 0.0;
+    };
+    const double steps = tl.steps ? static_cast<double>(tl.steps) : 1.0;
+    std::fprintf(stderr,
+                 "[timeline: %ld steps, %.0f us each; per submission: first "
+                 "%.0f us (x%ld), layer %.0f us (x%ld), head %.0f us (x%ld), "
+                 "MTP %.0f us (x%ld); %.0f us syncing buffers per step]\n",
+                 tl.steps, 1e6 * tl.step_seconds / steps, mean_us(tl.first),
+                 tl.first.count, mean_us(tl.layers), tl.layers.count,
+                 mean_us(tl.head), tl.head.count, mean_us(tl.mtp), tl.mtp.count,
+                 1e6 * tl.sync_seconds / steps);
+  }
   return 0;
 }
 

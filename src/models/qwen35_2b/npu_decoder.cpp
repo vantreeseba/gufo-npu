@@ -141,6 +141,7 @@ struct NpuDecoder::Impl {
   double npu_seconds = 0;
   long submissions = 0;
   double cpu_seconds = 0;
+  NpuDecoder::Timeline timeline;
 
   Block MakeBlock(const gguf::File& file, int il) {
     const Config& c = config;
@@ -213,8 +214,9 @@ struct NpuDecoder::Impl {
   // Runs block b's FFN for `count` tokens and the call chained after it (the
   // next block's input projection, or an LM head).
   // With `bare`, the last block's chain without the LM head.
-  void SubmitFfn(Block& b, int count, bool bare = false) {
-    Submit(bare ? *b.bare_chain[count - 1] : *b.chain[count - 1]);
+  void SubmitFfn(Block& b, int count, NpuDecoder::Timeline::Submissions& kind,
+                 bool bare = false) {
+    Submit(bare ? *b.bare_chain[count - 1] : *b.chain[count - 1], kind);
   }
 
   Impl(const gguf::File& file, const std::filesystem::path& kernel_dir)
@@ -313,13 +315,26 @@ struct NpuDecoder::Impl {
     final_hidden.resize(kMaxTokens * hidden);
   }
 
-  void Submit(Chain& chain) {
+  void Submit(Chain& chain, NpuDecoder::Timeline::Submissions& kind) {
     const auto start = std::chrono::steady_clock::now();
     chain.Run();
-    npu_seconds +=
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
-            .count();
+    const double seconds = SecondsSince(start);
+    npu_seconds += seconds;
     ++submissions;
+    kind.seconds += seconds;
+    ++kind.count;
+  }
+
+  // Host <-> device syncs, timed for the timeline.
+  void ToDevice(Buffer& b) {
+    const auto start = std::chrono::steady_clock::now();
+    b.ToDevice();
+    timeline.sync_seconds += SecondsSince(start);
+  }
+  void FromDevice(Buffer& b) {
+    const auto start = std::chrono::steady_clock::now();
+    b.FromDevice();
+    timeline.sync_seconds += SecondsSince(start);
   }
 
   // The CPU part of block `b` (blk `il`) for `count` tokens: reads its input
@@ -339,7 +354,7 @@ struct NpuDecoder::Impl {
                 DecodeState::Layer& st, bool speculative) {
     const Config& c = config;
     const int d = c.hidden;
-    b.in_y->FromDevice();
+    FromDevice(*b.in_y);
     const std::size_t rows = b.in->rows();
     const std::size_t in_stride = StageOutputs(
         c, b.attention ? Stage::kAttentionIn : Stage::kLinearIn, il);
@@ -348,7 +363,7 @@ struct NpuDecoder::Impl {
     std::optional<Buffer> h;
     if (!b.attention) {
       h.emplace(b.ffn_x->Sub(kH, kSlottedBytes));
-      h->FromDevice();
+      FromDevice(*h);
     }
     for (int t = 0; t < count; ++t) {
       float* in_t = in.data() + t * in_stride;
@@ -378,7 +393,7 @@ struct NpuDecoder::Impl {
         mixer.Linear(il, in_t, st, y);
       }
     }
-    out_x.ToDevice();
+    ToDevice(out_x);
   }
 };
 
@@ -429,6 +444,10 @@ double NpuDecoder::cpu_seconds() const {
   return impl_->cpu_seconds;
 }
 
+const NpuDecoder::Timeline& NpuDecoder::timeline() const {
+  return impl_->timeline;
+}
+
 bool NpuDecoder::can_draft() const {
   return impl_->has_mtp;
 }
@@ -448,9 +467,9 @@ const float* NpuDecoder::Logits(const float* hidden) {
   float* x = slot.as<float>();
   std::memcpy(x, hidden, static_cast<std::size_t>(d) * sizeof(float));
   std::fill(x + npu::kHidden, x + npu::kHidden + d, 0.0f);
-  slot.ToDevice();
-  m.Submit(*m.lm_only);
-  m.lm_y->FromDevice();
+  m.ToDevice(slot);
+  m.Submit(*m.lm_only, m.timeline.head);
+  m.FromDevice(*m.lm_y);
   std::memcpy(m.logits.data(), m.lm_y->as<float>(), c.vocab * sizeof(float));
   std::memcpy(m.final_hidden.data(), hidden,
               static_cast<std::size_t>(d) * sizeof(float));
@@ -472,6 +491,15 @@ const float* NpuDecoder::Step(const int* tokens, int count, DecodeState& state,
   if (count < 1 || count > kMaxTokens) {
     throw std::invalid_argument("npu decoder: 1 or 2 tokens per step");
   }
+  // Counts the step's wall time however it returns.
+  struct StepTimer {
+    NpuDecoder::Timeline& timeline;
+    std::chrono::steady_clock::time_point start;
+    ~StepTimer() {
+      ++timeline.steps;
+      timeline.step_seconds += SecondsSince(start);
+    }
+  } step_timer{m.timeline, std::chrono::steady_clock::now()};
   {
     Buffer h = m.layers[0].in_x->Sub(kH, kSlottedBytes);
     for (int t = 0; t < count; ++t) {
@@ -483,20 +511,20 @@ const float* NpuDecoder::Step(const int* tokens, int count, DecodeState& state,
                                             quant::RowBytes(m.embed->type, d),
                         h.as<float>() + t * npu::kSlot, d);
     }
-    h.ToDevice();
+    m.ToDevice(h);
   }
-  m.Submit(*m.first[count - 1]);
+  m.Submit(*m.first[count - 1], m.timeline.first);
   for (int il = 0; il < c.layers; ++il) {
     auto& layer = m.layers[il];
     m.Mix(layer, il, count, state.position, state.layers[il], count == 2);
-    m.SubmitFfn(layer, count, !logits && il + 1 == c.layers);
+    m.SubmitFfn(layer, count, m.timeline.layers, !logits && il + 1 == c.layers);
   }
   state.position += count;
 
   if (!logits) {
     // The final residual H + D from the LM head's input region, the same
     // fp32 sum its input stage writes to lm_r.
-    m.lm_x->FromDevice();
+    m.FromDevice(*m.lm_x);
     for (int t = 0; t < count; ++t) {
       const float* slot = m.lm_x->as<float>() + t * npu::kSlot;
       float* out = m.final_hidden.data() + static_cast<std::size_t>(t) * d;
@@ -506,8 +534,8 @@ const float* NpuDecoder::Step(const int* tokens, int count, DecodeState& state,
     }
     return nullptr;
   }
-  m.lm_y->FromDevice();
-  m.lm_r->FromDevice();
+  m.FromDevice(*m.lm_y);
+  m.FromDevice(*m.lm_r);
   for (int t = 0; t < count; ++t) {
     std::memcpy(m.logits.data() + static_cast<std::size_t>(t) * c.vocab,
                 m.lm_y->as<float>() + t * m.lm->y_token_stride(),
@@ -565,10 +593,10 @@ void NpuDecoder::FillMtp(const float* const* hidden, const int* tokens,
     RmsNorm(hidden[t], m.output_norm.data(), d, c.rms_eps, m.normed.data());
     RmsNorm(m.normed.data(), m.hnorm.data(), d, c.rms_eps, slot + d);
   }
-  x.ToDevice();
+  m.ToDevice(x);
   // eh_proj and the block's input projection; the attention appends to the
   // cache.
-  m.Submit(*m.mtp_first[count - 1]);
+  m.Submit(*m.mtp_first[count - 1], m.timeline.mtp);
   m.Mix(m.mtp, c.layers, count, position, state.layers[c.layers], false);
 }
 
@@ -576,8 +604,8 @@ int NpuDecoder::Draft(const float* const* hidden, const int* tokens, int count,
                       int position, DecodeState& state) {
   Impl& m = *impl_;
   FillMtp(hidden, tokens, count, position, state);
-  m.SubmitFfn(m.mtp, count);
-  m.mtp_lm_y->FromDevice();
+  m.SubmitFfn(m.mtp, count, m.timeline.mtp);
+  m.FromDevice(*m.mtp_lm_y);
   const float* scores =
       m.mtp_lm_y->as<float>() +
       static_cast<std::size_t>(count - 1) * m.draft_lm->y_token_stride();

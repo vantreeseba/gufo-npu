@@ -106,6 +106,25 @@ public:
   long submissions() const;
   double cpu_seconds() const;
 
+  // Where decode time goes, since construction: per kind of NPU submission
+  // its count and wall time (submit to completion), the host's buffer syncs
+  // (inside the mixers and around the submissions), and the wall time inside
+  // Step().
+  struct Timeline {
+    struct Submissions {
+      long count = 0;
+      double seconds = 0;
+    };
+    Submissions first;   // layer 0's input projection
+    Submissions layers;  // a layer's FFN into the next projection or LM head
+    Submissions head;    // the LM head alone (Logits)
+    Submissions mtp;     // the MTP head's
+    double sync_seconds = 0;
+    long steps = 0;
+    double step_seconds = 0;
+  };
+  const Timeline& timeline() const;
+
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
