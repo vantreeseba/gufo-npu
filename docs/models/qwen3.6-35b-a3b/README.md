@@ -14,7 +14,8 @@ Weights, in order of support:
 State: the fp32 CPU reference (`src/models/qwen35/reference.cpp`, shared with
 Qwen3.5-2B) runs this model from the GGUF and is checked against llama.cpp
 ([QUALITY.md](QUALITY.md)). `generate --device npu` decodes it on the NPU
-(`NpuDecoder`): every matrix in q4nx (4.625 bits per weight) on the NPU,
+(`NpuDecoder` in src/models/qwen36_35b_a3b, on its own decode program
+`qwen36_35b_a3b_decode`, src/models/qwen36_35b_a3b/kernels): every matrix in q4nx (4.625 bits per weight) on the NPU,
 each layer's experts in one device arena read through two gathers, the
 mixers and the router on the CPU. The MTP layer drafts on the NPU and a
 two-token pass verifies (same output as plain greedy). Prompts of 6 tokens

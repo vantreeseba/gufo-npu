@@ -59,7 +59,8 @@ SwiGLU GEMV of similar size runs at about 38 GB/s.
   - A dense 8192 × 2048 GEMV costs the same in either flow inside the MoE
     chain (about 216 µs).
   - Non-cacheable instruction BOs are refused (`err=95`).
-- **Gather variants** (`MOE_VARIANTS` in `kernels/designs/q4nx_gemv.py`), in
+- **Gather variants** (`MOE_VARIANTS` in
+  `src/models/qwen36_35b_a3b/kernels/decode_gemv_variants.py`), in
   the same xclbin and core program as every other GEMV:
   - **Gate + up, `rounds` gather.**
     - Round r is expert r's gate + up (1024 rows = one round of the 8 × 4
@@ -188,12 +189,14 @@ both tokens' experts, up to 17 (8 + 8 routed + shared). Its cost:
 
 ## Code
 
-- `kernels/designs/q4nx_gemv.py`: `MOE_VARIANTS` (`rounds` and `k`
-  gathers), grouped and awaited segment fills, `swiglu_scaled`, the
-  `RTP_WORDS` layout and the scale placeholders. Also per-expert dense
-  shapes for option (a): 2048 × 1024 SwiGLU and 512 × 2048 act.
-- `kernels/aie/q4nx_gemv.cc`: `gemv_store(y, y_acc, rtp, round)` with the
-  scaled SwiGLU stage.
+- `src/models/qwen36_35b_a3b/kernels/decode_gemv.py` (the 35B's decode
+  program, `qwen36_35b_a3b_decode`; shapes in `decode_gemv_variants.py`):
+  `MOE_VARIANTS` (`rounds` and `k` gathers), grouped and awaited segment
+  fills, `swiglu_scaled`, the `RTP_WORDS` layout and the scale
+  placeholders. Also per-expert dense shapes for option (a): 2048 × 1024
+  SwiGLU and 512 × 2048 act.
+- `src/models/qwen36_35b_a3b/kernels/aie/decode_gemv.cc`:
+  `gemv_store(y, y_acc, rtp, round)` with the scaled SwiGLU stage.
 - `tests/models/qwen36_35b_a3b/q4nx_moe_gather_test.cpp`: correctness and patch/layer timing.
 - `tools/bench/npu_moe_spike.cpp`: the comparisons above, options (a), (b)
   and (c), and the chains. Build it against a release tree:
