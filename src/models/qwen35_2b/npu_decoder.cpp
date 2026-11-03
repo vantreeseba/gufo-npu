@@ -70,9 +70,8 @@ q4nx::Matrix PackOne(const gguf::TensorInfo& t, q4nx::Fit fit) {
 
 // A GEMV input region: token t's slot at t * npu::kSlot fp32 ([H | D] for a
 // resnorm input), then the norm weight. Outputs that feed it are written
-// from H or D with token stride npu::kSlot.
+// from H or D with token stride npu::kSlot (the chain sequences write D).
 constexpr std::size_t kH = 0;
-constexpr std::size_t kD = npu::kHidden * sizeof(float);
 constexpr std::size_t kW = npu::kNormOffset;
 constexpr std::size_t kHiddenBytes = npu::kHidden * sizeof(float);
 constexpr std::size_t kSlotBytes = npu::kSlot * sizeof(float);
@@ -98,13 +97,17 @@ struct NpuDecoder::Impl {
   // SwiGLU output.
   struct Block {
     bool attention = false;
+    // Where the block's regions start in `acts` (npu::kBlock*).
+    std::size_t base = 0;
     std::unique_ptr<Q4nxGemv> in, out, ffn, down;
+    // out, ffn and down's weights, back to back (a chain's second argument).
+    std::unique_ptr<Buffer> ffn_weights;
     std::unique_ptr<Buffer> in_x, in_y, out_x, ffn_x, ffn_y;
     std::deque<Buffer> views;      // sub-buffers wired between calls (stable)
     std::vector<float> attn_norm;  // fp32, for alpha/beta on the CPU
     std::vector<float> alpha, beta;
     // Per token count: out, ffn, down, then the next block's in (or the LM
-    // head).
+    // head), as one chain sequence.
     std::unique_ptr<Chain> chain[kMaxTokens];
     // The last block's chains without the LM head after them (prompt
     // passes whose logits nobody reads); the residual stays in lm_x.
@@ -119,6 +122,9 @@ struct NpuDecoder::Impl {
   std::vector<float> prompt_hidden;
   gufo_npu::npu::GemvRuntime runtime;
   const gguf::TensorInfo* embed = nullptr;
+  // Every region the chains read and write, in the chains' layout: the
+  // layers' blocks, the LM head's, then the MTP block and its draft head's.
+  std::unique_ptr<Buffer> acts;
   std::vector<Block> layers;
   std::unique_ptr<Q4nxGemv> lm;
   std::unique_ptr<Buffer> lm_x, lm_y, lm_r, scratch;
@@ -143,7 +149,13 @@ struct NpuDecoder::Impl {
   double cpu_seconds = 0;
   NpuDecoder::Timeline timeline;
 
-  Block MakeBlock(const gguf::File& file, int il) {
+  // `bytes` of `acts` at `offset`, as a buffer of its own.
+  std::unique_ptr<Buffer> Region(std::size_t offset, std::size_t bytes) {
+    return std::make_unique<Buffer>(acts->Sub(offset, bytes));
+  }
+
+  // Block `il` with its regions at `base` in `acts`.
+  Block MakeBlock(const gguf::File& file, int il, std::size_t base) {
     const Config& c = config;
     const auto hidden = static_cast<std::size_t>(c.hidden);
     const std::string p = "blk." + std::to_string(il) + ".";
@@ -152,6 +164,7 @@ struct NpuDecoder::Impl {
     };
     Block b;
     b.attention = c.IsFullAttention(il);
+    b.base = base;
     q4nx::Matrix in_w;
     const gguf::TensorInfo* out_t = nullptr;
     if (b.attention) {
@@ -170,45 +183,63 @@ struct NpuDecoder::Impl {
     }
     b.in = std::make_unique<Q4nxGemv>(runtime, in_w, Prologue::kResNorm,
                                       Epilogue::kStore);
-    b.out = std::make_unique<Q4nxGemv>(runtime, PackOne(*out_t, fit),
-                                       Prologue::kPlain, Epilogue::kStore);
+    // out, gate + up and down in one buffer, in the chain's order.
+    const q4nx::Matrix out_w = PackOne(*out_t, fit);
+    const q4nx::Matrix ffn_w = q4nx::PackRows(
+        {SegmentOf(t("ffn_gate.weight")), SegmentOf(t("ffn_up.weight"))},
+        hidden, fit, q4nx::SwiGluOrder(c.ffn));
+    const q4nx::Matrix down_w = PackOne(t("ffn_down.weight"), fit);
+    const std::size_t out_bytes = out_w.bytes.size();
+    const std::size_t ffn_bytes = ffn_w.bytes.size();
+    const std::size_t down_bytes = down_w.bytes.size();
+    b.ffn_weights =
+        std::make_unique<Buffer>(runtime, out_bytes + ffn_bytes + down_bytes);
+    b.out = std::make_unique<Q4nxGemv>(runtime, out_w, Prologue::kPlain,
+                                       Epilogue::kStore,
+                                       b.ffn_weights->Sub(0, out_bytes));
     b.ffn = std::make_unique<Q4nxGemv>(
-        runtime,
-        q4nx::PackRows(
-            {SegmentOf(t("ffn_gate.weight")), SegmentOf(t("ffn_up.weight"))},
-            hidden, fit, q4nx::SwiGluOrder(c.ffn)),
-        Prologue::kResNorm, Epilogue::kSwiGlu);
-    b.down =
-        std::make_unique<Q4nxGemv>(runtime, PackOne(t("ffn_down.weight"), fit),
-                                   Prologue::kAct, Epilogue::kStore);
-    b.in_x = std::make_unique<Buffer>(runtime, npu::kInputBytes);
-    b.in_y = std::make_unique<Buffer>(runtime, b.in->y_bytes());
-    b.out_x = std::make_unique<Buffer>(runtime, npu::kInputBytes);
-    b.ffn_x = std::make_unique<Buffer>(runtime, npu::kInputBytes);
-    b.ffn_y = std::make_unique<Buffer>(runtime, b.ffn->y_bytes());
+        runtime, ffn_w, Prologue::kResNorm, Epilogue::kSwiGlu,
+        b.ffn_weights->Sub(out_bytes, ffn_bytes));
+    b.down = std::make_unique<Q4nxGemv>(
+        runtime, down_w, Prologue::kAct, Epilogue::kStore,
+        b.ffn_weights->Sub(out_bytes + ffn_bytes, down_bytes));
+    if (b.in->y_bytes() > npu::kInYBytes ||
+        b.ffn->y_bytes() != npu::kFfnYBytes) {
+      throw std::logic_error(
+          "npu decoder: a block's outputs do not fit the "
+          "chains' layout");
+    }
+    b.in_x = Region(base + npu::kBlockInX, npu::kInputBytes);
+    b.ffn_x = Region(base + npu::kBlockFfnX, npu::kInputBytes);
+    b.in_y = Region(base + npu::kBlockInY, b.in->y_bytes());
+    b.out_x = Region(base + npu::kBlockOutX, npu::kInputBytes);
+    b.ffn_y = Region(base + npu::kBlockFfnY, b.ffn->y_bytes());
     SetNormWeight(*b.in_x, t("attn_norm.weight"));
     SetNormWeight(*b.ffn_x, t("post_attention_norm.weight"));
     b.attn_norm = ToFloats(t("attn_norm.weight"));
     return b;
   }
 
-  // b's chain for `tokens`: out -> ffn_x.D, ffn (residual -> next.H) ->
-  // ffn_y, down -> next.D, then `next` with its own buffers.
-  // With `bare`, the chain goes to bare_chain and stops before `next`
-  // (which must still be given: its input region gets the residual).
-  void WireBlock(Block& b, Buffer& next_x, int tokens, Q4nxGemv& next,
-                 Buffer& next_y, Buffer& next_r, bool bare = false) {
-    Buffer& ffn_d = b.views.emplace_back(b.ffn_x->Sub(kD, kSlottedBytes));
-    Buffer& next_h = b.views.emplace_back(next_x.Sub(kH, kSlottedBytes));
-    Buffer& next_d = b.views.emplace_back(next_x.Sub(kD, kSlottedBytes));
+  // b's chain for `tokens` (one sequence): out -> ffn_x.D, ffn (residual ->
+  // the next block's or head's x.H) -> ffn_y, down -> that x's D, then the
+  // `next` call (`next_gemv`) on the regions after b in `acts`. With `bare`,
+  // the chain goes to bare_chain and stops before the next call (its input
+  // region still gets the residual).
+  void WireBlock(Block& b, npu::ChainNext next, Q4nxGemv& next_gemv, int tokens,
+                 bool bare = false) {
+    if (next_gemv.padded_rows() != npu::ChainNextRows(next)) {
+      throw std::logic_error(
+          "npu decoder: the next call does not match the "
+          "chain's");
+    }
+    const npu::ChainNext kind = bare ? npu::ChainNext::kNone : next;
+    Buffer& window = b.views.emplace_back(
+        acts->Sub(b.base + npu::kBlockFfnX, npu::ChainWindowBytes(kind)));
+    Buffer& next_w = b.views.emplace_back(next_gemv.weights());
     auto& chain = bare ? b.bare_chain[tokens - 1] : b.chain[tokens - 1];
     chain = std::make_unique<Chain>(runtime);
-    chain->Add(*b.out, *b.out_x, ffn_d, *scratch, tokens);
-    chain->Add(*b.ffn, *b.ffn_x, *b.ffn_y, next_h, tokens);
-    chain->Add(*b.down, *b.ffn_y, next_d, *scratch, tokens);
-    if (!bare) {
-      chain->Add(next, next_x, next_y, next_r, tokens);
-    }
+    chain->Add(npu::ChainSequence(kind, static_cast<std::size_t>(tokens)),
+               window, *b.ffn_weights, next_w, *scratch);
   }
 
   // Runs block b's FFN for `count` tokens and the call chained after it (the
@@ -228,17 +259,33 @@ struct NpuDecoder::Impl {
     const auto hidden = static_cast<std::size_t>(c.hidden);
     embed = &file.Tensor("token_embd.weight");
     scratch = std::make_unique<Buffer>(runtime, npu::kResidualBytes);
+    has_mtp = HasMtpLayer(file, c);
+    // The arena: the layers' blocks, the LM head's regions right after the
+    // last (its chain runs into them), then the MTP block and its draft
+    // head's.
+    const auto head_bytes = [](npu::ChainNext next) {
+      return npu::kHeadY +
+             npu::kTokens * npu::ChainNextRows(next) * sizeof(float);
+    };
+    const std::size_t lm_base =
+        static_cast<std::size_t>(c.layers) * npu::kBlockBytes;
+    const std::size_t mtp_base = lm_base + head_bytes(npu::ChainNext::kLmHead);
+    const std::size_t draft_base = mtp_base + npu::kBlockBytes;
+    acts = std::make_unique<Buffer>(
+        runtime, has_mtp ? draft_base + head_bytes(npu::ChainNext::kDraftHead)
+                         : mtp_base);
     for (int il = 0; il < c.layers; ++il) {
-      layers.push_back(MakeBlock(file, il));
+      layers.push_back(
+          MakeBlock(file, il, static_cast<std::size_t>(il) * npu::kBlockBytes));
     }
     const auto& head =
         c.tied_embeddings ? *embed : file.Tensor("output.weight");
     lm = std::make_unique<Q4nxGemv>(
         runtime, q4nx::Pack(head.type, head.data, head.Rows(), hidden, fit),
         Prologue::kResNorm, Epilogue::kStore);
-    lm_x = std::make_unique<Buffer>(runtime, npu::kInputBytes);
-    lm_y = std::make_unique<Buffer>(runtime, lm->y_bytes());
-    lm_r = std::make_unique<Buffer>(runtime, npu::kResidualBytes);
+    lm_x = Region(lm_base + npu::kHeadX, npu::kInputBytes);
+    lm_r = Region(lm_base + npu::kHeadR, npu::kResidualBytes);
+    lm_y = Region(lm_base + npu::kHeadY, lm->y_bytes());
     output_norm = ToFloats(file.Tensor("output_norm.weight"));
     SetNormWeight(*lm_x, file.Tensor("output_norm.weight"));
     lm_only = std::make_unique<Chain>(runtime);
@@ -255,22 +302,23 @@ struct NpuDecoder::Impl {
       for (int il = 0; il < c.layers; ++il) {
         Block& l = layers[il];
         if (il + 1 == c.layers) {
-          WireBlock(l, *lm_x, tokens, *lm, *lm_y, *lm_r);
-          WireBlock(l, *lm_x, tokens, *lm, *lm_y, *lm_r, true);
+          WireBlock(l, npu::ChainNext::kLmHead, *lm, tokens);
+          WireBlock(l, npu::ChainNext::kLmHead, *lm, tokens, true);
         } else {
           Block& n = layers[il + 1];
-          Buffer& n_res = n.views.emplace_back(n.ffn_x->Sub(kH, kSlottedBytes));
-          WireBlock(l, *n.in_x, tokens, *n.in, *n.in_y, n_res);
+          WireBlock(l,
+                    n.attention ? npu::ChainNext::kAttention
+                                : npu::ChainNext::kDeltaNet,
+                    *n.in, tokens);
         }
       }
     }
 
-    if (HasMtpLayer(file, c)) {
-      has_mtp = true;
+    if (has_mtp) {
       const std::string p = "blk." + std::to_string(c.layers) + ".";
       enorm = ToFloats(file.Tensor(p + "nextn.enorm.weight"));
       hnorm = ToFloats(file.Tensor(p + "nextn.hnorm.weight"));
-      mtp = MakeBlock(file, c.layers);
+      mtp = MakeBlock(file, c.layers, mtp_base);
       eh_proj = std::make_unique<Q4nxGemv>(
           runtime, PackOne(file.Tensor(p + "nextn.eh_proj.weight"), fit),
           Prologue::kPlain, Epilogue::kStore);
@@ -288,8 +336,8 @@ struct NpuDecoder::Impl {
       draft_lm = std::make_unique<Q4nxGemv>(
           runtime, q4nx::PackRows(draft_rows, hidden, fit), Prologue::kResNorm,
           Epilogue::kStore);
-      mtp_lm_x = std::make_unique<Buffer>(runtime, npu::kInputBytes);
-      mtp_lm_y = std::make_unique<Buffer>(runtime, draft_lm->y_bytes());
+      mtp_lm_x = Region(draft_base + npu::kHeadX, npu::kInputBytes);
+      mtp_lm_y = Region(draft_base + npu::kHeadY, draft_lm->y_bytes());
       SetNormWeight(*mtp_lm_x,
                     file.Tensor(p + "nextn.shared_head_norm.weight"));
       // eh_proj -> block in_x.H (its D stays zero); in: residual ->
@@ -303,7 +351,7 @@ struct NpuDecoder::Impl {
         chain->Add(*mtp.in, *mtp.in_x, *mtp.in_y,
                    mtp.views.emplace_back(mtp.ffn_x->Sub(kH, kSlottedBytes)),
                    tokens);
-        WireBlock(mtp, *mtp_lm_x, tokens, *draft_lm, *mtp_lm_y, *scratch);
+        WireBlock(mtp, npu::ChainNext::kDraftHead, *draft_lm, tokens);
       }
     }
 

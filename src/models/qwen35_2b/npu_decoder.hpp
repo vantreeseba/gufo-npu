@@ -19,7 +19,8 @@
 // in the q4nx GEMV (its resnorm input stage and SwiGLU output stage); the
 // residual stream stays on the device. Each GEMV writes into the input region
 // of the next, so the calls from one layer's mixer output to the next layer's
-// input projection (out, gate + up, down, next in) run as one chain. The CPU
+// input projection (out, gate + up, down, next in) run as one chain sequence:
+// one call, on regions of one activation buffer (npu/gemv.hpp). The CPU
 // runs the token mixers (Gated DeltaNet, attention) and the DeltaNet alpha/beta
 // rows: 25 NPU submissions per step.
 //

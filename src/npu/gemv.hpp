@@ -137,6 +137,11 @@ public:
   Q4nxGemv(GemvRuntime& runtime, const q4nx::Matrix& weights,
            Prologue prologue = Prologue::kPlain,
            Epilogue epilogue = Epilogue::kStore);
+  // The same, with the weights uploaded into `storage` (at least
+  // weights.bytes.size() bytes), e.g. a window of one buffer that holds
+  // several matrices back to back for a sequence that reads them all.
+  Q4nxGemv(GemvRuntime& runtime, const q4nx::Matrix& weights, Prologue prologue,
+           Epilogue epilogue, const Buffer& storage);
   ~Q4nxGemv();
   Q4nxGemv(const Q4nxGemv&) = delete;
   Q4nxGemv& operator=(const Q4nxGemv&) = delete;
@@ -180,6 +185,10 @@ public:
   Impl& impl() { return *impl_; }
 
 private:
+  // `storage` null: the call allocates its own weight buffer.
+  Q4nxGemv(GemvRuntime& runtime, const q4nx::Matrix& weights, Prologue prologue,
+           Epilogue epilogue, const Buffer* storage);
+
   std::unique_ptr<Impl> impl_;
   std::size_t dim_ = 0;
   std::size_t rows_ = 0;
@@ -270,6 +279,11 @@ public:
   // A gather over the experts in `arena` (an ExpertArena's bytes).
   void Add(Q4nxGather& gather, Buffer& x, Buffer& arena, Buffer& y,
            Buffer& residual);
+  // A run of one of the design's other instruction sequences, by name (e.g.
+  // several GEMVs in one stream), on its four buffer arguments in order.
+  // Throws when the sequence was not compiled.
+  void Add(const std::string& sequence, Buffer& a0, Buffer& a1, Buffer& a2,
+           Buffer& a3);
   // Runs every call in order and waits for the last.
   void Run();
 
