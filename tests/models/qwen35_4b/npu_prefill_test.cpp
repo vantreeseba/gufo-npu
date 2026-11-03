@@ -41,7 +41,7 @@
 //   GUFO_NPU_QWEN35_4B_GGUF    UD-Q4_K_XL GGUF of Qwen3.5-4B
 //   GUFO_NPU_QWEN35_4B_ORACLE  oracle output directory (the prompts)
 // Qwen3.5-4B on its own prefill and decode programs; adapted from
-// tests/models/qwen35/npu_prefill_test.cpp (the 2B's), same tolerances.
+// tests/models/qwen35_2b/npu_prefill_test.cpp (the 2B's), same tolerances.
 // Exits 77 (skip) when either is unset or there is no NPU.
 namespace {
 

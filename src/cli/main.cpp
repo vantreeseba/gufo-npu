@@ -30,8 +30,8 @@
 #include "models/qwen35/generate.hpp"
 #include "models/qwen35/mtp.hpp"
 #include "models/qwen35/npu_decoder.hpp"
-#include "models/qwen35/npu_prefill.hpp"
 #include "models/qwen35/reference.hpp"
+#include "models/qwen35_2b/npu_prefill.hpp"
 #include "models/qwen35_4b/npu/gemv.hpp"
 #include "models/qwen35_4b/npu_decoder.hpp"
 #include "models/qwen35_4b/npu_prefill.hpp"
@@ -828,8 +828,9 @@ int BenchPrefill(const std::vector<std::string_view>& args) {
     return BenchMoePrefill(npu, *file, KernelDir(kernels), ids, lengths, runs,
                            decode_path, experts);
   }
-  qwen35::NpuPrefill prefill(*file, KernelDir(kernels));
-  return BenchDensePrefill(npu, prefill, qwen35::PrefillPrompt(prefill), ids,
+  gufo_npu::qwen35_2b::NpuPrefill prefill(*file, KernelDir(kernels));
+  return BenchDensePrefill(npu, prefill,
+                           gufo_npu::qwen35_2b::PrefillPrompt(prefill), ids,
                            lengths, runs, decode_path);
 }
 
@@ -939,7 +940,7 @@ int Generate(const std::vector<std::string_view>& args) {
     qwen35::NpuDecoder npu(*file, KernelDir(kernels));
     // Prompt processing: the family's for dense models, Qwen3.6-35B-A3B's
     // own for the MoE one (reading the decoder's weights in place).
-    std::optional<qwen35::NpuPrefill> prefill;
+    std::optional<gufo_npu::qwen35_2b::NpuPrefill> prefill;
     std::optional<gufo_npu::qwen36_35b_a3b::NpuPrefill> moe_prefill;
     if (npu.config().IsMoe()) {
       moe_prefill.emplace(*file, npu, KernelDir(kernels));
@@ -955,7 +956,7 @@ int Generate(const std::vector<std::string_view>& args) {
     qwen35::SpeculativeStats stats;
     qwen35::SpeculativeGenerate(
         npu, ids, max_tokens, stop, speculate, print, &stats,
-        prefill       ? qwen35::PrefillPrompt(*prefill)
+        prefill       ? gufo_npu::qwen35_2b::PrefillPrompt(*prefill)
         : moe_prefill ? gufo_npu::qwen36_35b_a3b::PrefillPrompt(*moe_prefill)
                       : qwen35::PromptPrefill{},
         sampling);

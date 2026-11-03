@@ -115,12 +115,10 @@ add_library(gufo_npu_qwen35_npu STATIC src/models/qwen35/npu_decoder.cpp
                                        src/models/qwen35/q4nx_projections.cpp)
 target_link_libraries(gufo_npu_qwen35_npu PUBLIC gufo_npu_qwen35
                       gufo_npu_runtime)
-# Prompt processing on the NPU (GEMMs) with the mixers batched on the CPU
-# (prefill_mixer: the family's, shared with the 35B's prefill).
-target_sources(gufo_npu_qwen35_npu PRIVATE src/models/qwen35/npu_prefill.cpp
-                                           src/models/qwen35/prefill_mixer.cpp)
-set_source_files_properties(src/models/qwen35/npu_prefill.cpp
-  src/models/qwen35/prefill_mixer.cpp PROPERTIES
+# The prefill mixers batched on the CPU (the family's, shared by the models'
+# own NPU prefills).
+target_sources(gufo_npu_qwen35_npu PRIVATE src/models/qwen35/prefill_mixer.cpp)
+set_source_files_properties(src/models/qwen35/prefill_mixer.cpp PROPERTIES
   COMPILE_OPTIONS "-march=x86-64-v3;-O3")
 
 if(GUFO_NPU_BUILD_KERNELS)
@@ -128,6 +126,7 @@ if(GUFO_NPU_BUILD_KERNELS)
 endif()
 
 # Per-model packages: their own NPU programs and host wiring.
+add_subdirectory(src/models/qwen35_2b)
 add_subdirectory(src/models/qwen35_4b)
 add_subdirectory(src/models/qwen36_35b_a3b)
 add_subdirectory(src/models/qwen3vl_embed_2b)
@@ -150,7 +149,8 @@ target_link_libraries(gufo_npu_serve PUBLIC gufo_npu_core nlohmann_json
                       PRIVATE cpp_httplib)
 
 add_executable(gufo-npu src/cli/main.cpp)
-target_link_libraries(gufo-npu PRIVATE gufo_npu_qwen35_npu gufo_npu_qwen35_4b
+target_link_libraries(gufo-npu PRIVATE gufo_npu_qwen35_npu gufo_npu_qwen35_2b
+                      gufo_npu_qwen35_4b
                       gufo_npu_qwen36_35b_a3b gufo_npu_qwen3vl_embed_2b_npu
                       gufo_npu_serve
                       gufo_npu_serve_chat gufo_npu_serve_engine)

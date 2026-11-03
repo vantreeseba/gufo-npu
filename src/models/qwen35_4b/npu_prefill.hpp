@@ -13,7 +13,7 @@
 
 // Qwen3.5-4B prompt processing (prefill) on the NPU, on the 4B's own GEMM
 // program (src/models/qwen35_4b/kernels/prefill_gemm.py). Copied from
-// models/qwen35/npu_prefill (Qwen3.5-2B). A chunk of up to
+// models/qwen35_2b/npu_prefill (Qwen3.5-2B). A chunk of up to
 // gufo_npu::npu::kGemmChunk prompt tokens goes through each layer at once: its
 // matrix products run as bfp16 GEMMs on the NPU (the weights are read once per
 // chunk), and the CPU runs the norms, residual adds

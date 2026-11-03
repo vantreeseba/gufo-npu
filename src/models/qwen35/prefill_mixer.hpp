@@ -11,7 +11,7 @@
 #include "models/qwen35/state_capture.hpp"
 
 // The token mixers of a prompt chunk on the CPU, for the NPU prefills of the
-// Qwen3.5 family (src/models/qwen35/npu_prefill.cpp, the 2B's; the 35B's in
+// Qwen3.5 family (src/models/qwen35_2b/npu_prefill.cpp, the 2B's; the 35B's in
 // src/models/qwen36_35b_a3b): Gated DeltaNet (conv, delta rule, gated norm)
 // over the chunk with the value heads in parallel, and gated attention,
 // causal over the cache plus the chunk, with heads and query blocks in
