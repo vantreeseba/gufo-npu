@@ -31,7 +31,6 @@
 #include "models/qwen35/config.hpp"
 #include "models/qwen35/generate.hpp"
 #include "models/qwen35/mtp.hpp"
-#include "models/qwen35/npu_decoder.hpp"
 #include "models/qwen35/reference.hpp"
 #include "models/qwen35_2b/npu/gemv.hpp"
 #include "models/qwen35_2b/npu_decoder.hpp"
@@ -39,6 +38,8 @@
 #include "models/qwen35_4b/npu/gemv.hpp"
 #include "models/qwen35_4b/npu_decoder.hpp"
 #include "models/qwen35_4b/npu_prefill.hpp"
+#include "models/qwen36_35b_a3b/npu/gemv.hpp"
+#include "models/qwen36_35b_a3b/npu_decoder.hpp"
 #include "models/qwen36_35b_a3b/npu_prefill.hpp"
 #include "models/qwen3vl_embed_2b/input.hpp"
 #include "models/qwen3vl_embed_2b/npu_embedder.hpp"
@@ -403,7 +404,8 @@ int BenchGemv(const std::vector<std::string_view>& args) {
   // the MoE model's, which needs the instruction-buffer flow.
   npu::GemvRuntime runtime(
       KernelDir(kernels), moe ? npu::Flow::kInstructionBuffer : npu::Flow::kElf,
-      moe ? npu::GemvDesign{} : gufo_npu::qwen35_2b::npu::DecodeDesign());
+      moe ? gufo_npu::qwen36_35b_a3b::npu::DecodeDesign()
+          : gufo_npu::qwen35_2b::npu::DecodeDesign());
 
   using npu::Epilogue;
   using npu::Prologue;
@@ -624,9 +626,9 @@ int BenchMtp(const std::vector<std::string_view>& args) {
   const std::size_t prompt_len = seq.size();
   const int stop = tokenizer.Find(qwen35::kImEnd);
 
-  // Qwen3.5-2B on its own decoder; the MoE model on the family's.
+  // Each model on its own decoder.
   if (qwen35::ReadConfig(*file).IsMoe()) {
-    qwen35::NpuDecoder npu(*file, KernelDir(kernels));
+    gufo_npu::qwen36_35b_a3b::NpuDecoder npu(*file, KernelDir(kernels));
     return BenchMtpOn(npu, *file, seq, prompt_len, stop, tokens);
   }
   gufo_npu::qwen35_2b::NpuDecoder npu(*file, KernelDir(kernels));
@@ -637,7 +639,7 @@ int BenchMtp(const std::vector<std::string_view>& args) {
 // (qwen36_35b_a3b::NpuPrefill, through PrefillPrompt, so prompts shorter
 // than MinPrefillPrompt take the decode path), per length the time to the
 // first token and where the prefill's time went (per run).
-int BenchMoePrefill(gufo_npu::qwen35::NpuDecoder& npu,
+int BenchMoePrefill(gufo_npu::qwen36_35b_a3b::NpuDecoder& npu,
                     const gufo_npu::gguf::File& file,
                     const std::filesystem::path& kernels,
                     const std::vector<int>& ids,
@@ -657,7 +659,7 @@ int BenchMoePrefill(gufo_npu::qwen35::NpuDecoder& npu,
       std::vector<double> ttft;
       for (int run = 0; run <= runs; ++run) {
         qwen35::SpeculativeStats stats;
-        qwen35::SpeculativeGenerate(npu, prompt, 1, {}, true, {}, &stats, h);
+        moe::SpeculativeGenerate(npu, prompt, 1, {}, true, {}, &stats, h);
         if (run > 0) {
           ttft.push_back(stats.prefill_seconds);
         }
@@ -684,7 +686,7 @@ int BenchMoePrefill(gufo_npu::qwen35::NpuDecoder& npu,
         first = prefill.profile();
       }
       qwen35::SpeculativeStats stats;
-      qwen35::SpeculativeGenerate(npu, prompt, 1, {}, true, {}, &stats, hook);
+      moe::SpeculativeGenerate(npu, prompt, 1, {}, true, {}, &stats, hook);
       if (run > 0) {
         ttft.push_back(stats.prefill_seconds);
       }
@@ -844,7 +846,7 @@ int BenchPrefill(const std::vector<std::string_view>& args) {
                              lengths, runs, decode_path);
   }
   if (moe) {
-    qwen35::NpuDecoder npu(*file, KernelDir(kernels));
+    gufo_npu::qwen36_35b_a3b::NpuDecoder npu(*file, KernelDir(kernels));
     return BenchMoePrefill(npu, *file, KernelDir(kernels), ids, lengths, runs,
                            decode_path, experts);
   }
@@ -855,9 +857,9 @@ int BenchPrefill(const std::vector<std::string_view>& args) {
                            lengths, runs, decode_path);
 }
 
-// generate --device npu on a family model's decoder and prefill: Qwen3.5-2B's
-// own (src/models/qwen35_2b), or the MoE decoder with Qwen3.6-35B-A3B's
-// prefill, which reads the decoder's weights in place. SpeculativeGenerate is
+// generate --device npu on a model's own decoder and prefill: Qwen3.5-2B's
+// (src/models/qwen35_2b) or Qwen3.6-35B-A3B's (src/models/qwen36_35b_a3b),
+// whose prefill reads the decoder's weights in place. SpeculativeGenerate is
 // found by argument. Prints the run's timing to stderr.
 template<typename Decoder, typename Prefill>
 int GenerateOnNpu(const gufo_npu::gguf::File& file,
@@ -1039,7 +1041,7 @@ int Generate(const std::vector<std::string_view>& args) {
   if (device == "npu") {
     const bool mtp = draft == "mtp";
     if (config.IsMoe()) {
-      return GenerateOnNpu<qwen35::NpuDecoder,
+      return GenerateOnNpu<gufo_npu::qwen36_35b_a3b::NpuDecoder,
                            gufo_npu::qwen36_35b_a3b::NpuPrefill>(
           *file, KernelDir(kernels), ids, max_tokens, stop, mtp, print,
           sampling);

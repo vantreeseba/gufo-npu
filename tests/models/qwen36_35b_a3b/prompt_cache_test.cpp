@@ -60,7 +60,7 @@ int main(int argc, char** argv) {
                    const qwen35::PromptPrefill& hook,
                    qwen35::SpeculativeStats* stats) {
     return moe::SpeculativeGenerate(npu, prompt, max_tokens, stop, true, {},
-                                       stats, hook);
+                                    stats, hook);
   };
   m.new_state = [&] { return npu.NewState(); };
   m.new_mtp_state = [&] { return npu.NewMtpState(); };

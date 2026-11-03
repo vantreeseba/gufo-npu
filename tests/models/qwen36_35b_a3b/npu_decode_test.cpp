@@ -15,8 +15,8 @@
 #include "core/gguf.hpp"
 #include "models/qwen35/decoder.hpp"
 #include "models/qwen35/moe.hpp"
-#include "models/qwen36_35b_a3b/npu_decoder.hpp"
 #include "models/qwen35/q4nx_projections.hpp"
+#include "models/qwen36_35b_a3b/npu_decoder.hpp"
 
 // Qwen3.6-35B-A3B decoded on the NPU (NpuDecoder: q4nx GEMVs, expert gathers,
 // the router on the CPU), teacher forced over the oracle prompts, against the

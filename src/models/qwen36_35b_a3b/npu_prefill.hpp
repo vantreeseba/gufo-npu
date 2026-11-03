@@ -7,9 +7,9 @@
 #include "core/gguf.hpp"
 #include "models/qwen35/config.hpp"
 #include "models/qwen35/decoder.hpp"
-#include "models/qwen36_35b_a3b/npu_decoder.hpp"
 #include "models/qwen35/prompt_cache.hpp"
 #include "models/qwen35/state_capture.hpp"
+#include "models/qwen36_35b_a3b/npu_decoder.hpp"
 
 // Qwen3.6-35B-A3B prompt processing (prefill) on the NPU and the CPU
 // (docs/research/NPU-MOE-PREFILL.md, docs/research/TTFT.md). The prompt goes

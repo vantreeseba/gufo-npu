@@ -38,8 +38,8 @@ int main(int argc, char** argv) {
   const auto sample = [&](bool draft, int tokens,
                           const gufo_npu::SamplingParams& sampling,
                           qwen35::SpeculativeStats* stats) {
-    return gufo_npu::qwen36_35b_a3b::SpeculativeGenerate(npu, prompt, tokens, {}, draft, {},
-                                       stats, {}, sampling);
+    return gufo_npu::qwen36_35b_a3b::SpeculativeGenerate(
+        npu, prompt, tokens, {}, draft, {}, stats, {}, sampling);
   };
   const int failures =
       qwen35::testing::CheckSpeculativeSampling(sample, runs, 5);

@@ -62,9 +62,11 @@ Config CheckShapes(Config c) {
                              std::to_string(gufo_npu::npu::kGemvHidden));
   }
   if (c.IsMoe() &&
-      (static_cast<std::size_t>(c.experts_used) + 1 != gufo_npu::npu::kGatherExperts ||
+      (static_cast<std::size_t>(c.experts_used) + 1 !=
+           gufo_npu::npu::kGatherExperts ||
        static_cast<std::size_t>(c.expert_ffn) != gufo_npu::npu::kExpertFfn ||
-       static_cast<std::size_t>(c.shared_expert_ffn) != gufo_npu::npu::kExpertFfn)) {
+       static_cast<std::size_t>(c.shared_expert_ffn) !=
+           gufo_npu::npu::kExpertFfn)) {
     throw std::runtime_error("npu decoder: MoE layers need " +
                              std::to_string(gufo_npu::npu::kGatherExperts - 1) +
                              " routed experts and a shared expert of width " +
@@ -371,12 +373,14 @@ struct NpuDecoder::Impl {
     const Config& c = config;
     const auto hidden = static_cast<std::size_t>(c.hidden);
     embed = &file.Tensor("token_embd.weight");
-    scratch = std::make_unique<Buffer>(runtime, gufo_npu::npu::kGemvResidualBytes);
+    scratch =
+        std::make_unique<Buffer>(runtime, gufo_npu::npu::kGemvResidualBytes);
     if (c.IsMoe()) {
       const ExpertArena arena{static_cast<std::size_t>(c.experts) + 1};
-      for (std::size_t tokens = 1; tokens <= gufo_npu::npu::kGemvTokens; ++tokens) {
-        const std::size_t most =
-            tokens == 1 ? gufo_npu::npu::kGatherExperts : gufo_npu::npu::kMaxGatherExperts;
+      for (std::size_t tokens = 1; tokens <= gufo_npu::npu::kGemvTokens;
+           ++tokens) {
+        const std::size_t most = tokens == 1 ? gufo_npu::npu::kGatherExperts
+                                             : gufo_npu::npu::kMaxGatherExperts;
         for (std::size_t n = gufo_npu::npu::kGatherExperts; n <= most; ++n) {
           gathers[tokens - 1].push_back(
               {std::make_unique<Q4nxGather>(runtime, Q4nxGather::Kind::kGateUp,
@@ -452,7 +456,8 @@ struct NpuDecoder::Impl {
       draft_lm = std::make_unique<Q4nxGemv>(
           runtime, q4nx::PackRows(draft_rows, hidden, fit), Prologue::kResNorm,
           Epilogue::kStore);
-      mtp_lm_x = std::make_unique<Buffer>(runtime, gufo_npu::npu::kGemvInputBytes);
+      mtp_lm_x =
+          std::make_unique<Buffer>(runtime, gufo_npu::npu::kGemvInputBytes);
       mtp_lm_y = std::make_unique<Buffer>(runtime, draft_lm->y_bytes());
       SetNormWeight(*mtp_lm_x,
                     file.Tensor(p + "nextn.shared_head_norm.weight"));
@@ -712,7 +717,8 @@ const float* NpuDecoder::Logits(const float* hidden) {
   Buffer slot = m.lm_x->Sub(0, kSlotBytes);
   float* x = slot.as<float>();
   std::memcpy(x, hidden, static_cast<std::size_t>(d) * sizeof(float));
-  std::fill(x + gufo_npu::npu::kGemvHidden, x + gufo_npu::npu::kGemvHidden + d, 0.0f);
+  std::fill(x + gufo_npu::npu::kGemvHidden, x + gufo_npu::npu::kGemvHidden + d,
+            0.0f);
   slot.ToDevice();
   m.Submit(*m.lm_only);
   m.lm_y->FromDevice();
@@ -778,7 +784,8 @@ const float* NpuDecoder::Step(const int* tokens, int count, DecodeState& state,
                 m.lm_y->as<float>() + t * m.lm->y_token_stride(),
                 c.vocab * sizeof(float));
     std::memcpy(m.final_hidden.data() + static_cast<std::size_t>(t) * d,
-                m.lm_r->as<float>() + t * gufo_npu::npu::kGemvSlot, d * sizeof(float));
+                m.lm_r->as<float>() + t * gufo_npu::npu::kGemvSlot,
+                d * sizeof(float));
   }
   return m.logits.data();
 }

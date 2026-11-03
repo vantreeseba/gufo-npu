@@ -115,8 +115,8 @@ public:
   // The weights the decoder keeps on the device, for an NPU prefill that
   // converts them in place (src/models/qwen36_35b_a3b): each layer's input
   // and output projections (q4nx in the GEMV's block order; rows include
-  // padding) and, for MoE layers, its expert arena (gufo_npu::npu::ExpertArena of
-  // config().experts + 1 experts, the shared one last); the MTP head's
+  // padding) and, for MoE layers, its expert arena (gufo_npu::npu::ExpertArena
+  // of config().experts + 1 experts, the shared one last); the MTP head's
   // eh_proj and its block's input projection.
   struct DeviceMatrix {
     gufo_npu::npu::Buffer weights;

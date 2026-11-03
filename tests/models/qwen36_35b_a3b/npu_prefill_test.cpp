@@ -491,9 +491,9 @@ int main(int argc, char** argv) {
     const auto hook = moe::PrefillPrompt(prefill);
     qwen35::SpeculativeStats spec_stats;
     const auto plain = moe::SpeculativeGenerate(npu, prompt, kTokens, stop,
-                                                   false, {}, nullptr, hook);
-    const auto spec = moe::SpeculativeGenerate(npu, prompt, kTokens, stop,
-                                                  true, {}, &spec_stats, hook);
+                                                false, {}, nullptr, hook);
+    const auto spec = moe::SpeculativeGenerate(npu, prompt, kTokens, stop, true,
+                                               {}, &spec_stats, hook);
     const auto unprefilled =
         moe::SpeculativeGenerate(npu, prompt, kTokens, stop, false, {});
     const bool same = plain == spec;
