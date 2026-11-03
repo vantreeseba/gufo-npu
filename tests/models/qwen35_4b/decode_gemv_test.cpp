@@ -20,8 +20,8 @@
 // the input/output stages it is built for, for one and two tokens, then the
 // same calls chained in one runlist. Hidden-sized outputs (2560 rows) run a
 // partial last round: only their rows are stored, and the rest of the output
-// buffer must stay untouched. Adapted from tests/npu/q4nx_gemv_test.cpp.
-// Exits 77 without an NPU.
+// buffer must stay untouched. Adapted from
+// tests/models/qwen35_2b/decode_gemv_test.cpp. Exits 77 without an NPU.
 namespace {
 
 namespace q4nx = gufo_npu::q4nx;

@@ -399,10 +399,11 @@ int BenchGemv(const std::vector<std::string_view>& args) {
   namespace npu = gufo_npu::npu;
   const auto file = gufo_npu::gguf::File::Open(model);
   const bool moe = gufo_npu::qwen35::ReadConfig(*file).IsMoe();
-  // The decoder's flow: MoE models need the instruction-buffer flow.
+  // The decoder's program and flow: Qwen3.5-2B's own (qwen35_2b_decode), or
+  // the MoE model's, which needs the instruction-buffer flow.
   npu::GemvRuntime runtime(
-      KernelDir(kernels),
-      moe ? npu::Flow::kInstructionBuffer : npu::Flow::kElf);
+      KernelDir(kernels), moe ? npu::Flow::kInstructionBuffer : npu::Flow::kElf,
+      moe ? npu::GemvDesign{} : gufo_npu::qwen35_2b::npu::DecodeDesign());
 
   using npu::Epilogue;
   using npu::Prologue;
@@ -474,14 +475,14 @@ int BenchGemv(const std::vector<std::string_view>& args) {
     // Timing only: the fit does not change the bytes.
     const auto packed = q4nx::PackRows(segments, dim, q4nx::Fit::kMinMax);
     npu::Q4nxGemv gemv(runtime, packed, c.prologue, c.epilogue);
-    // Unit inputs: timing only (tests/models/qwen35_2b/q4nx_gemv_test.cpp
+    // Unit inputs: timing only (tests/models/qwen35_2b/decode_gemv_test.cpp
     // checks values).
-    npu::Buffer x(runtime, std::max<std::size_t>(npu::kGemvInputBytes,
+    npu::Buffer x(runtime, std::max<std::size_t>(runtime.design().input_bytes(),
                                                  4 * dim * sizeof(float)));
     std::fill_n(x.as<float>(), x.size() / sizeof(float), 1.0f);
     x.ToDevice();
     npu::Buffer y(runtime, gemv.y_bytes());
-    npu::Buffer r(runtime, npu::kGemvResidualBytes);
+    npu::Buffer r(runtime, runtime.design().residual_bytes());
     double mean_us[2];
     for (std::size_t tokens = 1; tokens <= 2; ++tokens) {
       gemv.Run(x, y, r, tokens);

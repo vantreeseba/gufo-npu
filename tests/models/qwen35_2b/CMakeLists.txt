@@ -60,16 +60,18 @@ if(GUFO_NPU_ENABLE_XRT AND GUFO_NPU_BUILD_KERNELS)
                        TIMEOUT 1800)
 
   # Op tests of the kernels this model runs.
-  add_executable(q4nx_gemv_test q4nx_gemv_test.cpp)
-  target_link_libraries(q4nx_gemv_test PRIVATE gufo_npu_runtime)
-  add_test(NAME q4nx_gemv_test COMMAND q4nx_gemv_test "${kernels}")
-  set_tests_properties(q4nx_gemv_test PROPERTIES
+  add_executable(qwen35_decode_gemv_test decode_gemv_test.cpp)
+  target_link_libraries(qwen35_decode_gemv_test PRIVATE gufo_npu_runtime)
+  add_test(NAME qwen35_decode_gemv_test
+           COMMAND qwen35_decode_gemv_test "${kernels}")
+  set_tests_properties(qwen35_decode_gemv_test PROPERTIES
                        LABELS "qwen35_2b;npu;kernels" SKIP_RETURN_CODE 77)
 
-  add_executable(q4nx_gemv_chain_test q4nx_gemv_chain_test.cpp)
-  target_link_libraries(q4nx_gemv_chain_test PRIVATE gufo_npu_runtime)
-  add_test(NAME q4nx_gemv_chain_test COMMAND q4nx_gemv_chain_test "${kernels}")
-  set_tests_properties(q4nx_gemv_chain_test PROPERTIES
+  add_executable(qwen35_decode_gemv_chain_test decode_gemv_chain_test.cpp)
+  target_link_libraries(qwen35_decode_gemv_chain_test PRIVATE gufo_npu_runtime)
+  add_test(NAME qwen35_decode_gemv_chain_test
+           COMMAND qwen35_decode_gemv_chain_test "${kernels}")
+  set_tests_properties(qwen35_decode_gemv_chain_test PROPERTIES
                        LABELS "qwen35_2b;npu;kernels" SKIP_RETURN_CODE 77
                        TIMEOUT 600)
 
