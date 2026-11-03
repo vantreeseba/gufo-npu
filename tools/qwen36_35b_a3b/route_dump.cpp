@@ -16,7 +16,7 @@
 
 #include "core/gguf.hpp"
 #include "core/tokenizer.hpp"
-#include "models/qwen35/npu_decoder.hpp"
+#include "models/qwen36_35b_a3b/npu_decoder.hpp"
 
 namespace qwen35 = gufo_npu::qwen35;
 
@@ -35,7 +35,7 @@ int main(int argc, char** argv) {
   if (argc > 5) {
     ids.resize(std::min<std::size_t>(ids.size(), std::atoi(argv[5])));
   }
-  qwen35::NpuDecoder npu(*file, argv[2]);
+  gufo_npu::qwen36_35b_a3b::NpuDecoder npu(*file, argv[2]);
   const auto& c = npu.config();
   const int layers = c.layers;
   const int used = c.experts_used;

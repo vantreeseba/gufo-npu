@@ -13,35 +13,41 @@
 #include "models/qwen35/generate.hpp"
 #include "npu/gemv.hpp"
 
-// Qwen3.5 / Qwen3.6 decode on the NPU. Every matrix product, every RMS norm
-// before one, the residual adds and SwiGLU run in the q4nx GEMV (its resnorm
-// input stage and SwiGLU output stage); the residual stream stays on the
-// device. Each GEMV writes into the input region of the next, so the calls
-// from one layer's mixer output to the next layer's input projection (out,
-// gate + up, down, next in) run as one chain. The CPU runs the token mixers
-// (Gated DeltaNet, attention) and the DeltaNet alpha/beta rows: 25 NPU
-// submissions per step for Qwen3.5-2B.
+// Qwen3.6-35B-A3B decode on the NPU, on the 35B's own decode GEMV program
+// (src/models/qwen36_35b_a3b/kernels); the CPU side (config, Mixer, MoE
+// routing, MTP draft vocabulary) is the family's shared code. Every matrix
+// product, every RMS norm before one and the residual adds run in the q4nx
+// GEMV (its resnorm input stage); the residual stream stays on the device.
+// Each GEMV writes into the input region of the next. The CPU runs the token
+// mixers (Gated DeltaNet, attention) and the DeltaNet alpha/beta rows.
 //
-// MoE models (qwen35moe, Qwen3.6-35B-A3B) keep each layer's experts and its
-// shared expert in one device arena. After the mixer's output projection
-// (its own submission) the CPU routes in fp32 (moe.hpp) and points two
-// gathers at the chosen experts (npu::Q4nxGather): gate + up with SwiGLU
-// scaled by the router weights, then one down over all of them, chained
-// with the next layer's input projection. Two submissions per layer. A
-// two-token step reads the union of both tokens' experts once; each token
-// weighs the experts it did not choose 0.
+// Each layer keeps its experts and its shared expert in one device arena.
+// After the mixer's output projection (its own submission) the CPU routes in
+// fp32 (moe.hpp) and points two gathers at the chosen experts (Q4nxGather):
+// gate + up with SwiGLU scaled by the router weights, then one down over all
+// of them, chained with the next layer's input projection. Two submissions
+// per layer. A two-token step reads the union of both tokens' experts once;
+// each token weighs the experts it did not choose 0. (The dense FFN path
+// kept from the family's decoder is unused: the 35B's program has no dense
+// FFN shapes.)
 //
 // A step takes one or two tokens; the weights are read once for both. The
 // second token of a pair can be a speculative draft: Resolve() keeps it or
 // rolls the state back to just after the first. The MTP head drafts the
-// token after next on the NPU as well (two submissions per draft, four for
-// an MoE MTP block); its LM head scores only the draft vocabulary, and the
-// main model still checks each draft over every token.
-namespace gufo_npu::qwen35 {
+// token after next on the NPU as well (four submissions per draft); its LM
+// head scores only the draft vocabulary, and the main model still checks
+// each draft over every token.
+namespace gufo_npu::qwen36_35b_a3b {
+
+using qwen35::Config;
+using qwen35::DecodeState;
+using qwen35::PromptPrefill;
+using qwen35::SpeculativeStats;
 
 class NpuDecoder {
 public:
-  // Keeps pointers into `file`, which must outlive it.
+  // Keeps pointers into `file`, which must outlive it. Loads the 35B's
+  // decode program (npu::kDecodeName) from kernel_dir.
   NpuDecoder(const gguf::File& file, const std::filesystem::path& kernel_dir);
   ~NpuDecoder();
   NpuDecoder(const NpuDecoder&) = delete;
@@ -109,18 +115,18 @@ public:
   // The weights the decoder keeps on the device, for an NPU prefill that
   // converts them in place (src/models/qwen36_35b_a3b): each layer's input
   // and output projections (q4nx in the GEMV's block order; rows include
-  // padding) and, for MoE layers, its expert arena (npu::ExpertArena of
+  // padding) and, for MoE layers, its expert arena (gufo_npu::npu::ExpertArena of
   // config().experts + 1 experts, the shared one last); the MTP head's
   // eh_proj and its block's input projection.
   struct DeviceMatrix {
-    npu::Buffer weights;
+    gufo_npu::npu::Buffer weights;
     std::size_t rows = 0;
     std::size_t dim = 0;
   };
   struct DeviceWeights {
     struct Layer {
       std::optional<DeviceMatrix> in, out;
-      std::optional<npu::Buffer> arena;
+      std::optional<gufo_npu::npu::Buffer> arena;
     };
     std::vector<Layer> layers;
     std::optional<DeviceMatrix> eh_proj, mtp_in;
@@ -157,4 +163,4 @@ std::vector<int> SpeculativeGenerate(
     const std::function<bool(int)>& on_token, SpeculativeStats* stats = nullptr,
     const PromptPrefill& prefill = {}, const SamplingParams& sampling = {});
 
-}  // namespace gufo_npu::qwen35
+}  // namespace gufo_npu::qwen36_35b_a3b

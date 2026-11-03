@@ -15,7 +15,7 @@
 #include "core/gguf.hpp"
 #include "models/qwen35/decoder.hpp"
 #include "models/qwen35/moe.hpp"
-#include "models/qwen35/npu_decoder.hpp"
+#include "models/qwen36_35b_a3b/npu_decoder.hpp"
 #include "models/qwen35/q4nx_projections.hpp"
 
 // Qwen3.6-35B-A3B decoded on the NPU (NpuDecoder: q4nx GEMVs, expert gathers,
@@ -168,7 +168,7 @@ int main(int argc, char** argv) {
   }
   const auto file = gufo_npu::gguf::File::Open(model);
   auto start = std::chrono::steady_clock::now();
-  qwen35::NpuDecoder npu(*file, argv[1]);
+  gufo_npu::qwen36_35b_a3b::NpuDecoder npu(*file, argv[1]);
   std::printf(
       "packed and uploaded the NPU decoder in %.1f s\n",
       std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
@@ -266,9 +266,9 @@ int main(int argc, char** argv) {
           ReadIds(fs::path(oracle) / (std::string(reply.prompt) + ".ids.json"));
       qwen35::SpeculativeStats plain_stats;
       qwen35::SpeculativeStats spec_stats;
-      const auto plain = qwen35::SpeculativeGenerate(
+      const auto plain = gufo_npu::qwen36_35b_a3b::SpeculativeGenerate(
           npu, prompt, reply.tokens, stop, false, {}, &plain_stats);
-      const auto spec = qwen35::SpeculativeGenerate(
+      const auto spec = gufo_npu::qwen36_35b_a3b::SpeculativeGenerate(
           npu, prompt, reply.tokens, stop, true, {}, &spec_stats);
       std::size_t same = 0;
       while (same < std::min(plain.size(), spec.size()) &&

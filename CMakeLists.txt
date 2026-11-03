@@ -82,8 +82,7 @@ target_link_libraries(gufo_npu_qwen35 PUBLIC gufo_npu_core)
 # The decode steps' CPU math vectorizes with AVX2 + FMA (Zen 5 has more; the
 # hosted CI runners have at least this).
 set_source_files_properties(src/models/qwen35/decoder.cpp
-  src/models/qwen35/gguf_projections.cpp
-  src/models/qwen35/npu_decoder.cpp PROPERTIES
+  src/models/qwen35/gguf_projections.cpp PROPERTIES
   COMPILE_OPTIONS "-march=x86-64-v3;-O3")
 # The q4nx packer's fit vectorizes too; no fused multiply-adds, so Unpack and
 # Gemv round exactly as written (tests compare unpacked weights bit for bit).
@@ -111,8 +110,7 @@ else()
 endif()
 
 # Qwen3.5 decode on the NPU, and the same q4nx weights on the CPU for tests.
-add_library(gufo_npu_qwen35_npu STATIC src/models/qwen35/npu_decoder.cpp
-                                       src/models/qwen35/q4nx_projections.cpp)
+add_library(gufo_npu_qwen35_npu STATIC src/models/qwen35/q4nx_projections.cpp)
 target_link_libraries(gufo_npu_qwen35_npu PUBLIC gufo_npu_qwen35
                       gufo_npu_runtime)
 # The prefill mixers batched on the CPU (the family's, shared by the models'

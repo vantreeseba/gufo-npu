@@ -16,7 +16,7 @@
 
 #include "core/gguf.hpp"
 #include "core/vec.hpp"
-#include "models/qwen35/npu_decoder.hpp"
+#include "models/qwen36_35b_a3b/npu_decoder.hpp"
 
 // Qwen3.6-35B-A3B prompt processing on the NPU (qwen36_35b_a3b::NpuPrefill:
 // q4nx converted to bfp16 on the device, bfp16 GEMMs, CPU mixers and
@@ -227,7 +227,7 @@ struct Totals {
   int prompts = 0;
 };
 
-void Compare(qwen35::NpuDecoder& npu, moe::NpuPrefill& prefill,
+void Compare(moe::NpuDecoder& npu, moe::NpuPrefill& prefill,
              const std::string& name, const std::vector<int>& ids,
              Totals& totals) {
   const auto& c = npu.config();
@@ -435,7 +435,7 @@ int main(int argc, char** argv) {
   }
   const auto file = gufo_npu::gguf::File::Open(model);
   auto start = std::chrono::steady_clock::now();
-  qwen35::NpuDecoder npu(*file, argv[1]);
+  moe::NpuDecoder npu(*file, argv[1]);
   const double decoder_s = Seconds(start);
   start = std::chrono::steady_clock::now();
   moe::NpuPrefill prefill(*file, npu, argv[1], experts);
@@ -490,12 +490,12 @@ int main(int argc, char** argv) {
     constexpr int kTokens = 48;
     const auto hook = moe::PrefillPrompt(prefill);
     qwen35::SpeculativeStats spec_stats;
-    const auto plain = qwen35::SpeculativeGenerate(npu, prompt, kTokens, stop,
+    const auto plain = moe::SpeculativeGenerate(npu, prompt, kTokens, stop,
                                                    false, {}, nullptr, hook);
-    const auto spec = qwen35::SpeculativeGenerate(npu, prompt, kTokens, stop,
+    const auto spec = moe::SpeculativeGenerate(npu, prompt, kTokens, stop,
                                                   true, {}, &spec_stats, hook);
     const auto unprefilled =
-        qwen35::SpeculativeGenerate(npu, prompt, kTokens, stop, false, {});
+        moe::SpeculativeGenerate(npu, prompt, kTokens, stop, false, {});
     const bool same = plain == spec;
     std::size_t common = 0;
     while (common < plain.size() && common < unprefilled.size() &&

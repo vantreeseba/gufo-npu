@@ -7,7 +7,7 @@
 #include "core/gguf.hpp"
 #include "models/qwen35/config.hpp"
 #include "models/qwen35/decoder.hpp"
-#include "models/qwen35/npu_decoder.hpp"
+#include "models/qwen36_35b_a3b/npu_decoder.hpp"
 #include "models/qwen35/prompt_cache.hpp"
 #include "models/qwen35/state_capture.hpp"
 
@@ -48,7 +48,7 @@ class NpuPrefill {
 public:
   // Reads `decoder`'s device weights in place; `file` and `decoder` must
   // outlive it. Throws for models other than Qwen3.6-35B-A3B's shapes.
-  NpuPrefill(const gguf::File& file, qwen35::NpuDecoder& decoder,
+  NpuPrefill(const gguf::File& file, NpuDecoder& decoder,
              const std::filesystem::path& kernel_dir,
              ExpertBackend experts = ExpertBackend::kCpu);
   ~NpuPrefill();
@@ -130,7 +130,7 @@ qwen35::PromptPrefill PrefillPrompt(NpuPrefill& prefill);
 // `prefill` from MinPrefillPrompt tokens, `decoder` (the one `prefill`
 // reads) below that; the prompt's last token stays with the decoder, as in
 // PrefillPrompt.
-qwen35::PromptCacheModel MakePromptCacheModel(qwen35::NpuDecoder& decoder,
+qwen35::PromptCacheModel MakePromptCacheModel(NpuDecoder& decoder,
                                               NpuPrefill& prefill);
 
 }  // namespace gufo_npu::qwen36_35b_a3b
