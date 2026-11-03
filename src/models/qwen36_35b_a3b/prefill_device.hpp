@@ -64,14 +64,14 @@ public:
         gemm(kernel_dir, kGemmProgram),
         profile_(profile) {}
 
-  npu::Program dequant;
-  npu::Program gemm;
+  gufo_npu::npu::Program dequant;
+  gufo_npu::npu::Program gemm;
 
   NpuPrefill::Profile& profile() { return profile_; }
 
   // Runs `batch` of `program` and waits, counting a move between programs
   // (milliseconds each).
-  void Run(npu::Batch& batch, const npu::Program& program) {
+  void Run(gufo_npu::npu::Batch& batch, const gufo_npu::npu::Program& program) {
     if (batch.size() == 0) {
       return;
     }
@@ -93,18 +93,18 @@ public:
 
   // A window of `b` for one call. (Keeping the windows for reuse measured
   // slower than making them per call: EXPERIMENTS.md.)
-  static npu::Buffer Window(const npu::Buffer& b, std::size_t offset,
-                            std::size_t bytes) {
+  static gufo_npu::npu::Buffer Window(const gufo_npu::npu::Buffer& b,
+                                      std::size_t offset, std::size_t bytes) {
     return b.Sub(offset, bytes);
   }
 
   // Syncs the first `bytes` of `b` to or from the device.
-  void Sync(npu::Buffer& b, std::size_t bytes, bool to_device) {
+  void Sync(gufo_npu::npu::Buffer& b, std::size_t bytes, bool to_device) {
     if (bytes == 0) {
       return;
     }
     const auto start = Clock::now();
-    npu::Buffer window = b.Sub(0, bytes);
+    gufo_npu::npu::Buffer window = b.Sub(0, bytes);
     if (to_device) {
       window.ToDevice();
     } else {
@@ -115,7 +115,8 @@ public:
 
 private:
   NpuPrefill::Profile& profile_;
-  const npu::Program* current_ = nullptr;  // the program the NPU ran last
+  const gufo_npu::npu::Program* current_ =
+      nullptr;  // the program the NPU ran last
 };
 
 }  // namespace gufo_npu::qwen36_35b_a3b

@@ -14,9 +14,9 @@
 namespace gufo_npu::qwen36_35b_a3b {
 namespace {
 
-using npu::Batch;
-using npu::Buffer;
-using npu::ExpertArena;
+using gufo_npu::npu::Batch;
+using gufo_npu::npu::Buffer;
+using gufo_npu::npu::ExpertArena;
 
 // Expert GEMM rows run between two CPU steps (a group), and the group
 // buffers' capacity: the target plus the largest expert, the shared one
@@ -219,11 +219,10 @@ private:
 
 }  // namespace
 
-std::unique_ptr<ExpertStep> MakeNpuExperts(PrefillDevice& device,
-                                           BurstPool& pool,
-                                           std::vector<npu::Buffer> arenas,
-                                           std::size_t arena_experts,
-                                           std::size_t max_tokens) {
+std::unique_ptr<ExpertStep> MakeNpuExperts(
+    PrefillDevice& device, BurstPool& pool,
+    std::vector<gufo_npu::npu::Buffer> arenas, std::size_t arena_experts,
+    std::size_t max_tokens) {
   return std::make_unique<NpuExperts>(device, pool, std::move(arenas),
                                       arena_experts, max_tokens);
 }

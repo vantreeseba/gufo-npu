@@ -32,7 +32,7 @@ public:
   // need on the NPU. The core runs that batch next, together with its own
   // (the next layer's dense matrices), in one visit to the dequant program.
   virtual void Prepare(int il, const ExpertRouting& routing,
-                       npu::Batch& dequant) = 0;
+                       gufo_npu::npu::Batch& dequant) = 0;
 
   // h[t] += the sum over the experts e that take token t of weight(e, t) *
   // expert_e(x[t]), for x the post-attention norm of the pass's tokens

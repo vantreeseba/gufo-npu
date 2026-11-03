@@ -26,8 +26,8 @@
 namespace gufo_npu::qwen36_35b_a3b {
 namespace {
 
-using npu::Batch;
-using npu::Buffer;
+using gufo_npu::npu::Batch;
+using gufo_npu::npu::Buffer;
 using qwen35::Config;
 using qwen35::DecodeState;
 using qwen35::Floats;
