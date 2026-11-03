@@ -7,9 +7,9 @@
 #include "models/qwen35/config.hpp"
 #include "models/qwen35/decoder.hpp"
 #include "models/qwen35/generate.hpp"
-#include "models/qwen35/npu_decoder.hpp"
 #include "models/qwen35/prompt_cache.hpp"
 #include "models/qwen35/state_capture.hpp"
+#include "models/qwen35_2b/npu_decoder.hpp"
 
 // Qwen3.5-2B prompt processing (prefill) on the NPU. A chunk of up to
 // gufo_npu::npu::kGemmMaxChunk prompt tokens goes through each layer at once:
@@ -26,7 +26,6 @@ namespace gufo_npu::qwen35_2b {
 
 using qwen35::Config;
 using qwen35::DecodeState;
-using qwen35::NpuDecoder;
 using qwen35::PromptCacheModel;
 using qwen35::PromptPrefill;
 using qwen35::StateCapture;

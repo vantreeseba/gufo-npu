@@ -9,7 +9,7 @@
 #include <filesystem>
 
 #include "../qwen35/prompt_cache_conversation.hpp"
-#include "models/qwen35/npu_decoder.hpp"
+#include "models/qwen35_2b/npu_decoder.hpp"
 #include "models/qwen35_2b/npu_prefill.hpp"
 
 int main(int argc, char** argv) {
@@ -29,7 +29,7 @@ int main(int argc, char** argv) {
     return 77;
   }
   const auto file = gufo_npu::gguf::File::Open(path);
-  qwen35::NpuDecoder npu(*file, argv[1]);
+  qwen35_2b::NpuDecoder npu(*file, argv[1]);
   qwen35_2b::NpuPrefill prefill(*file, argv[1]);
   prompt_cache_test::Model m;
   m.name = "Qwen3.5-2B";
@@ -58,8 +58,8 @@ int main(int argc, char** argv) {
                    const std::vector<int>& stop,
                    const qwen35::PromptPrefill& hook,
                    qwen35::SpeculativeStats* stats) {
-    return qwen35::SpeculativeGenerate(npu, prompt, max_tokens, stop, true, {},
-                                       stats, hook);
+    return qwen35_2b::SpeculativeGenerate(npu, prompt, max_tokens, stop, true,
+                                          {}, stats, hook);
   };
   m.new_state = [&] { return npu.NewState(); };
   m.new_mtp_state = [&] { return npu.NewMtpState(); };

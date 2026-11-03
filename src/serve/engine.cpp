@@ -21,6 +21,7 @@
 #include "models/qwen35/npu_decoder.hpp"
 #include "models/qwen35/prompt_cache.hpp"
 #include "models/qwen35/reference.hpp"
+#include "models/qwen35_2b/npu_decoder.hpp"
 #include "models/qwen35_2b/npu_prefill.hpp"
 #include "models/qwen35_4b/npu_decoder.hpp"
 #include "models/qwen35_4b/npu_prefill.hpp"
@@ -229,20 +230,20 @@ RunFn MakeRun(P* package, GenerateFn generate, HookFn prefill_hook) {
   };
 }
 
-// Qwen3.5-2B: the family decoder and the family prefill.
+// Qwen3.5-2B: its own decoder and prefill (src/models/qwen35_2b).
 void AttachQwen35_2B(ModelEngine& engine, const fs::path& kernels,
                      int checkpoints) {
-  using P = Package<qwen35::NpuDecoder, qwen35_2b::NpuPrefill>;
-  auto m =
-      std::make_shared<P>(engine, kernels, checkpoints,
-                          [](qwen35::NpuDecoder& d, qwen35_2b::NpuPrefill& p) {
-                            return qwen35_2b::MakePromptCacheModel(d, p);
-                          });
+  using P = Package<qwen35_2b::NpuDecoder, qwen35_2b::NpuPrefill>;
+  auto m = std::make_shared<P>(
+      engine, kernels, checkpoints,
+      [](qwen35_2b::NpuDecoder& d, qwen35_2b::NpuPrefill& p) {
+        return qwen35_2b::MakePromptCacheModel(d, p);
+      });
   const bool can_draft = m->decoder.can_draft();
   RunFn run = MakeRun(
       m.get(),
       [](auto&&... args) {
-        return qwen35::SpeculativeGenerate(
+        return qwen35_2b::SpeculativeGenerate(
             std::forward<decltype(args)>(args)...);
       },
       [](P& p) { return qwen35_2b::PrefillPrompt(p.prefill); });

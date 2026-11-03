@@ -7,7 +7,7 @@
 #include "core/gguf.hpp"
 #include "core/tokenizer.hpp"
 #include "models/qwen35/chat.hpp"
-#include "models/qwen35/npu_decoder.hpp"
+#include "models/qwen35_2b/npu_decoder.hpp"
 
 // Qwen3.5-2B: sampled output with MTP drafts follows the same distribution as
 // without them (tests/models/qwen35/sampling_check.hpp).
@@ -29,17 +29,18 @@ int main(int argc, char** argv) {
     return 77;
   }
   namespace qwen35 = gufo_npu::qwen35;
+  namespace qwen35_2b = gufo_npu::qwen35_2b;
   const auto file = gufo_npu::gguf::File::Open(model);
   const gufo_npu::Tokenizer tokenizer(*file);
   const auto prompt = tokenizer.Encode(qwen35::RenderChat(
       {{"user", "Write a short poem about the sea."}}, false));
-  qwen35::NpuDecoder npu(*file, argv[1]);
+  qwen35_2b::NpuDecoder npu(*file, argv[1]);
   const int runs = argc == 3 ? std::atoi(argv[2]) : 400;
   const auto sample = [&](bool draft, int tokens,
                           const gufo_npu::SamplingParams& sampling,
                           qwen35::SpeculativeStats* stats) {
-    return qwen35::SpeculativeGenerate(npu, prompt, tokens, {}, draft, {},
-                                       stats, {}, sampling);
+    return qwen35_2b::SpeculativeGenerate(npu, prompt, tokens, {}, draft, {},
+                                          stats, {}, sampling);
   };
   const int failures =
       qwen35::testing::CheckSpeculativeSampling(sample, runs, 5);
