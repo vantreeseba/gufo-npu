@@ -152,6 +152,10 @@ int main(int argc, char** argv) {
   const std::size_t hidden_bytes = hidden * sizeof(float);
   const std::size_t slotted = npu::kGemvSlot * sizeof(float) + hidden_bytes;
   const std::size_t b1 = geo::kBlockBytes;
+  // Where the gate + up output's padding starts: token t's compact bf16
+  // values sit at t * (kMaxDim / 2) words.
+  const std::size_t kFfnYPad =
+      geo::kBlockFfnY + geo::kTokens * (geo::kMaxDim / 2) * sizeof(float);
   auto first_difference = [](const std::uint8_t* a, const std::uint8_t* b) {
     std::size_t i = 0;
     while (a[i] == b[i]) {
@@ -271,6 +275,13 @@ int main(int argc, char** argv) {
       u.chain->Run();
       per_call.FromDevice();
       chained.FromDevice();
+      // The gate + up output's padding (24 of every 32 words of each core's
+      // output, past both tokens' values) is junk the design discards:
+      // clear it in both copies before comparing.
+      for (Buffer* b : {&per_call, &chained}) {
+        std::memset(b->as<std::uint8_t>() + kFfnYPad, 0,
+                    geo::kBlockFfnY + geo::kFfnYBytes - kFfnYPad);
+      }
       const auto* p = per_call.as<std::uint8_t>();
       const auto* c = chained.as<std::uint8_t>();
       if (std::memcmp(c, p, acts_bytes) != 0 && ++mismatched_runs <= 5) {
