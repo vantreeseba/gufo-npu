@@ -75,6 +75,29 @@ anew.
 - Device buffers: 19.0 GiB (19,416 MiB, the MTP block's arena and dense
   matrices included), anonymous memory ~0.6 GB. Load 20.2–21.2 s.
 
+### The mixer output projection on the CPU (2026-11-04)
+
+Each MoE layer's mixer output projection (ssm_out / attn_output, 4096 →
+2048, 4.85 MB of q4nx) runs on the CPU (`CpuGemv`, AVX-512 BF16, on the
+routing pool, reading the NPU weight buffer in place) instead of as its own
+NPU submission: one submission per layer instead of two. Interleaved against
+main (5aa2d5d), warm, three runs each, `--max-tokens 128`:
+
+| Prompt | main | CPU out projection | |
+|---|---|---|---|
+| Fibonacci, `--draft none` | 21.77, 21.29, 21.78 tok/s | **24.08, 23.94, 24.08** | +10% |
+| Fibonacci, `--draft mtp` | 32.02, 32.05, 32.01 tok/s | **34.37, 34.41, 34.80** | +7.5% |
+| Sky, `--draft none` (step) | 45.8–46.1 ms | **41.5–42.7 ms** | −8.5% |
+| Sky, `--draft mtp` (step) | 57.8–58.0 ms | **53.0–53.3 ms** | −8% |
+
+- The Fibonacci reply is unchanged (`fc2f2574`, 97% of drafts kept). The
+  sky reply changes at a near tie (`2c9f87d3`, 60 tokens → `c4d7f8e2`, 100
+  tokens, the reply the search fit first gave); its speed is compared per
+  step: 23.6–24.2 tok/s without a draft, 32.0–32.2 with MTP (77% kept).
+- The CPU projection takes ~90 µs per layer in the decoder (65–72 µs mean
+  alone, rotating over 40 matrices from DRAM) against ~194 µs for the NPU
+  submission.
+
 ### One chain sequence per MoE layer, gather scales per round (2026-11-04)
 
 Each MoE layer's second submission (gate + up gather, down gather, next

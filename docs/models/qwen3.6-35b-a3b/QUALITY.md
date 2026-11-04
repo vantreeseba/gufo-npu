@@ -409,6 +409,22 @@ run, apart from the gate + up output's padding, which the design discards.
 `q4nx_moe_gather_test` checks the same gathers against the CPU (worst
 relative error 4.8e-4 to 7.9e-4).
 
+### The mixer output projection on the CPU (2026-11-04)
+
+The MoE layers' mixer output projection runs on the CPU (`CpuGemv`): x
+rounded to bf16 (nearest even), per 32-input group the integer codes times
+x summed in fp32 (VDPBF16PS), then the group's scale and minimum and the
+block's d and dmin, as the NPU core does; only the NPU's split of partial
+sums into bf16 hi + lo before each scale multiply is not reproduced.
+`qwen36_cpu_gemv_test` (no NPU): 1.7e-7 relative error against a
+double-precision product over the same weights and bf16 x (limit 1e-4);
+the AVX-512 and portable paths agree bit for bit. With it the decoder still
+passes `qwen36_npu_decode_test`, `qwen36_npu_sampling_test` and
+`qwen36_npu_prefill_test`. Greedy replies can change at near ties: the
+Fibonacci reply is unchanged, the sky reply becomes the 100-token answer
+(`c4d7f8e2`) the search fit first gave, which reads correctly ("The sky
+appears blue because of a phenomenon called Rayleigh scattering…").
+
 ## NPU prefill
 
 `qwen36_35b_a3b::NpuPrefill` (src/models/qwen36_35b_a3b): every prompt
