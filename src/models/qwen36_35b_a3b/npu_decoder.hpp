@@ -27,10 +27,10 @@
 // gate + up with SwiGLU scaled by the router weights, then one down over all
 // of them, and the next layer's input projection in one instruction
 // sequence (a chain sequence, npu::ChainSequence). Two submissions per
-// layer, on regions of one activation buffer. A two-token step reads the union of both tokens' experts once;
-// each token weighs the experts it did not choose 0. (The dense FFN path
-// kept from the family's decoder is unused: the 35B's program has no dense
-// FFN shapes.)
+// layer, on regions of one activation buffer. A two-token step reads the union
+// of both tokens' experts once; each token weighs the experts it did not choose
+// 0. (The dense FFN path kept from the family's decoder is unused: the 35B's
+// program has no dense FFN shapes.)
 //
 // A step takes one or two tokens; the weights are read once for both. The
 // second token of a pair can be a speculative draft: Resolve() keeps it or

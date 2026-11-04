@@ -187,7 +187,7 @@ struct NpuDecoder::Impl {
   std::vector<Block> layers;
   std::unique_ptr<Q4nxGemv> lm;
   std::unique_ptr<Buffer> lm_x, lm_y, lm_r, scratch;
-  std::unique_ptr<Buffer> bare_weights;  // a bare chain's unused argument
+  std::unique_ptr<Buffer> bare_weights;      // a bare chain's unused argument
   std::unique_ptr<Chain> first[kMaxTokens];  // layer 0's input projection
   std::unique_ptr<Chain> lm_only;            // the LM head on lm_x alone
 
@@ -461,8 +461,8 @@ struct NpuDecoder::Impl {
     const std::size_t mtp_base = lm_base + head_bytes(ChainNext::kLmHead);
     const std::size_t draft_base = mtp_base + npu::kBlockBytes;
     acts = std::make_unique<Buffer>(
-        runtime, has_mtp ? draft_base + head_bytes(ChainNext::kDraftHead)
-                         : mtp_base);
+        runtime,
+        has_mtp ? draft_base + head_bytes(ChainNext::kDraftHead) : mtp_base);
     for (int il = 0; il < c.layers; ++il) {
       layers.push_back(
           MakeBlock(file, il, static_cast<std::size_t>(il) * npu::kBlockBytes));
@@ -555,10 +555,10 @@ struct NpuDecoder::Impl {
   // MoE block b, `count` tokens: per token the router in fp32 on the
   // residual after the mixer (ffn_x: H + D), as the CPU decoder routes; then
   // the chain sequence into `next` pointed at the union of the tokens'
-  // experts in ascending id order, and the shared expert last. A token weighs the experts only the
-  // other token chose 0, and they add exact zeros, so its result does not
-  // depend on what the other token chose. Returns the index of the chain for
-  // the union's size (n - kGatherExperts).
+  // experts in ascending id order, and the shared expert last. A token weighs
+  // the experts only the other token chose 0, and they add exact zeros, so its
+  // result does not depend on what the other token chose. Returns the index of
+  // the chain for the union's size (n - kGatherExperts).
   std::size_t RouteExperts(Block& b, int count, ChainNext next) {
     const auto start = std::chrono::steady_clock::now();
     const Config& c = config;
