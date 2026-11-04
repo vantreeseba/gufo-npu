@@ -27,6 +27,13 @@ add_test(NAME qwen35_decoder_test COMMAND qwen35_decoder_test)
 set_tests_properties(qwen35_decoder_test PROPERTIES SKIP_RETURN_CODE 77
                      LABELS "qwen35_2b;model")
 
+# The fused DeltaNet decode step against Mixer::Linear, bit for bit (CPU).
+add_executable(qwen35_deltanet_test deltanet_test.cpp)
+target_link_libraries(qwen35_deltanet_test PRIVATE gufo_npu_qwen35_2b)
+add_test(NAME qwen35_deltanet_test COMMAND qwen35_deltanet_test)
+set_tests_properties(qwen35_deltanet_test PROPERTIES SKIP_RETURN_CODE 77
+                     LABELS "qwen35_2b;model")
+
 if(GUFO_NPU_ENABLE_XRT AND GUFO_NPU_BUILD_KERNELS)
   set(kernels "${CMAKE_BINARY_DIR}/kernels")
 

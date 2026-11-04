@@ -11,6 +11,10 @@
 #include "models/qwen35/config.hpp"
 #include "models/qwen35/projections.hpp"
 
+namespace gufo_npu {
+class SpinPool;
+}
+
 // Fast single-token decode for Qwen3.5 / Qwen3.6, dense or MoE, in fp32: the
 // reference's math, one token per step. The reference (reference.hpp) stays
 // the oracle; these are tested against it.
@@ -83,6 +87,10 @@ public:
   // attn_output to `ctx`.
   void Attention(int layer, float* in, int position, DecodeState::Layer& state,
                  float* ctx);
+
+  // The workers the mixers' jobs run on, for a model's own CPU steps between
+  // them (one set of spinning workers per decode loop).
+  SpinPool& pool();
 
 private:
   struct Weights;

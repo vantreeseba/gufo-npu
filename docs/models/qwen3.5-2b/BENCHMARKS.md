@@ -433,6 +433,94 @@ warm, three runs each (`--max-tokens 256`):
 - One layer chain in a 16-run runlist: 713–716 → 682–684 µs (1 token), of
   which ~605 µs is reading its 33.9 MB at 56 GB/s.
 
+### The host's part of a step (2026-11-04)
+
+The second `[timeline: ...]` line of `generate --device npu` splits the
+host's work inside a step and the time spent submitting. `bench dispatch`
+now also times the submit alone (`start`), a round trip that spins on the
+run's state instead of a blocking wait (`poll`), and a runlist of one run
+(`list1`, how the decoder submits). Measured with the same toolchain
+image, interleaved with main (563fc3e), warm, two sweeps of three runs
+(`--max-tokens 256`). Every reply hashes the same as main's, and the speed
+is unchanged (tok/s, this branch against main): sky without a draft
+41.72–42.26 against 40.13–42.16, Fibonacci 41.58–41.80 against 41.42–41.65,
+sky with MTP 56.35–57.41 against 56.31–57.46, Fibonacci with MTP 68.75–69.05
+against 68.38–69.02.
+
+Per step, in µs (ranges over the six runs):
+
+| | Sky, no draft | Fibonacci, no draft | Sky, MTP (verify step) | Fibonacci, MTP |
+|---|---|---|---|---|
+| Step (inside `Step`) | 23,787–24,093 | 23,887–24,014 | 26,120–26,324 | 26,263–26,369 |
+| Submissions (first + 24 layers) | 281–286 + 24 × 939–945 | 284–285 + 24 × 943–944 | 286–290 + 24 × 995–1,000 | 285–289 + 24 × 997–1,000 |
+| DeltaNet on the CPU (18 layers) | 648–782 | 636–712 | 1,382–1,655 | 1,400–1,534 |
+| Attention on the CPU (6 layers) | 132–191 | 183–209 | 244–267 | 391–408 |
+| Buffer syncs (25 to, 44 from: 0.8 and 3.7 MB) | 62–64 | 61–63 | 69–74 | 71–73 |
+| Logits and final residuals out | 30–32 | 30–33 | 66–75 | 70–77 |
+| Embeddings, other | 3, 48–54 | 3, 48–51 | 4–5, 84–89 | 5, 84–86 |
+| Inside a layer submission, the submit itself | 3.0–3.4 | 3.3–3.6 | 3.9–5.1 | 4.7–5.1 |
+
+`bench dispatch --rounds 2000 --depths 1`, the smoke kernel, four runs:
+
+| Mode | µs per dispatch |
+|---|---|
+| sync (start, blocking wait) | 65.8–70.3 |
+| start (the submit alone) | 1.2–1.3 |
+| poll (start, spin on the state) | 64.2–66.1 |
+| list1 (a runlist of one run) | 67.7–69.4 |
+
+- **The ~65 µs round trip of a submission is on the NPU's side** (the
+  firmware's command dispatch and completion), not the host's. Submitting
+  takes 1–5 µs, polling instead of the blocking wait saves 2–6 µs, and a
+  one-run runlist costs at most ~2 µs over a plain run. Changing the host's
+  submit-and-wait path could save at most ~0.1–0.2 ms per token (25
+  submissions).
+- **The host's work between submissions is ~0.9–1.0 ms per token** (~4%
+  of the step) and ~2.0 ms per MTP verify step (~7.5%). The CPU DeltaNet is
+  most of it: 35–43 µs per layer for one token, 77–92 µs for two (each
+  token makes its own two pool dispatches and two passes over the 1 MiB
+  state).
+  The syncs (~1 µs each, set by their count more than their bytes) and the
+  logits copy are under 0.1 ms each.
+
+### Fused DeltaNet decode step (2026-11-04)
+
+The CPU DeltaNet of a decode step was most of the host's time between
+submissions: per layer, a pool dispatch for the conv, another for the
+heads, the alpha/beta rows on the calling thread, and both again for the
+second token of a pair. `qwen35_2b::DeltaNetStep` runs a layer in one pool
+dispatch: each value head's job computes its alpha/beta rows, the conv,
+SiLU and L2 norms of its q, k and v channels, the delta rule and the gated
+norm, and applies both tokens of a pair to each 32-column block of its state
+while the block is in L1 (AVX-512 on Zen 5). It is bit-identical to
+`Mixer::Linear` (`qwen35_deltanet_test`: every DeltaNet layer, 120 one- and
+two-token steps with drafts kept and rolled back, with and without
+AVX-512).
+
+Main (563fc3e) against this change, the same toolchain image, interleaved,
+warm, a warm-up round and then two sweeps of three runs
+(`--max-tokens 256`), ranges over the six runs:
+
+| Prompt | main | fused DeltaNet step | |
+|---|---|---|---|
+| Sky, `--draft none` | 41.76–42.52 tok/s | **42.68–43.30** | +1.5% |
+| Fibonacci, `--draft none` | 41.61–41.96 (39.37 once, disturbed) | **41.36–42.73** | +1.1% |
+| Sky, `--draft mtp` | 56.81–58.15 tok/s | **58.18–58.73** | +2.1% |
+| Fibonacci, `--draft mtp` | 67.80–69.78 tok/s | **70.09–70.44** | +2.0% |
+
+- Every reply hashes the same as main's (sky `a49f1c4c`, Fibonacci
+  `fdb595fb`, with and without MTP).
+- A step (timeline): sky without a draft 23.6–24.1 → 23.2–23.5 ms; an MTP
+  verify step 25.8–26.8 → 25.5–25.8 ms. Layer submissions are unchanged
+  (924–1,009 µs), so the time saved is the host's.
+- `qwen35_npu_decode_test` prints the same as on main (argmax against the
+  q4nx CPU decoder 72/73, the same logit errors, speculative decode equal to
+  plain greedy for 48 tokens); `qwen35_npu_sampling_test`,
+  `qwen35_npu_prefill_test`, `qwen35_prompt_cache_test` and
+  `qwen35_decoder_test` pass.
+- The host-time table in "The host's part of a step" above was measured
+  before this step: its DeltaNet row is the old path's.
+
 ## NPU prefill (Phase 4)
 
 `gufo-npu generate --device npu` now runs every prompt token but the last

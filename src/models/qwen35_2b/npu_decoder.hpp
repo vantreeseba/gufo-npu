@@ -114,19 +114,40 @@ public:
   double cpu_seconds() const;
 
   // Where decode time goes, since construction: per kind of NPU submission
-  // its count and wall time (submit to completion), the host's buffer syncs
-  // (inside the mixers and around the submissions), and the wall time inside
-  // Step().
+  // its count and wall time (submit to completion) and the part spent
+  // submitting, the host's buffer syncs (inside the mixers and around the
+  // submissions), the host's work inside Step() by kind, and the wall time
+  // inside Step().
   struct Timeline {
     struct Submissions {
       long count = 0;
       double seconds = 0;
+      // Of `seconds`, the time inside Chain::Start (the runlist's execute:
+      // the submit itself); the rest is the wait for completion.
+      double submit_seconds = 0;
+    };
+    // Buffer syncs in one direction: how many, their wall time and bytes.
+    struct Syncs {
+      long count = 0;
+      double seconds = 0;
+      double bytes = 0;
+    };
+    // The host's work inside Step() between its submissions (the MTP head's
+    // is in `mtp` and outside Step).
+    struct StepHost {
+      double embed_seconds = 0;      // token embeddings into layer 0's input
+      double deltanet_seconds = 0;   // alpha/beta rows and the delta rule
+      double attention_seconds = 0;  // attention over the K/V cache
+      double logits_seconds = 0;     // copying logits and final residuals out
+      Syncs to_device;
+      Syncs from_device;
     };
     Submissions first;   // layer 0's input projection
     Submissions layers;  // a layer's FFN into the next projection or LM head
     Submissions head;    // the LM head alone (Logits)
     Submissions mtp;     // the MTP head's
     double sync_seconds = 0;
+    StepHost in_step;
     long steps = 0;
     double step_seconds = 0;
   };

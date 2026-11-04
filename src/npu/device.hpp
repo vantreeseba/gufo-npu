@@ -33,6 +33,9 @@ SmokeResult RunSmoke(const std::filesystem::path& kernel_dir, int iterations);
 
 // Per-dispatch cost of the smoke kernel when issued three ways:
 //   sync     dispatch, wait, repeat (the host waits on every call)
+//   start    the time inside the dispatch (run.start()) of that loop alone
+//   poll     dispatch, spin on the run's state until it completes, repeat
+//   list1    a runlist of one run, execute and wait (a decoder submission)
 //   async    `depth` independent dispatches in flight before waiting
 //   runlist  `depth` dependent dispatches (each reads the previous output)
 //            chained in one xrt::runlist and submitted once
