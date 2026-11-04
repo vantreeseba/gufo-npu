@@ -73,7 +73,7 @@ if(GUFO_NPU_ENABLE_XRT AND GUFO_NPU_BUILD_KERNELS)
            COMMAND qwen35_decode_gemv_chain_test "${kernels}")
   set_tests_properties(qwen35_decode_gemv_chain_test PROPERTIES
                        LABELS "qwen35_2b;npu;kernels" SKIP_RETURN_CODE 77
-                       TIMEOUT 600)
+                       TIMEOUT 900)
 
   add_executable(qwen35_prefill_gemm_test prefill_gemm_test.cpp)
   target_link_libraries(qwen35_prefill_gemm_test PRIVATE gufo_npu_runtime)

@@ -125,8 +125,10 @@ Buffer Buffer::Sub(std::size_t offset, std::size_t bytes) const {
   if (offset % 64 != 0 || offset + bytes > impl_->bytes) {
     throw std::invalid_argument("npu buffer: sub-buffer out of range");
   }
+  const xrt::bo& root = impl_->root ? *impl_->root : impl_->bo;
+  const std::size_t at = impl_->offset + offset;
   return Buffer(
-      std::make_shared<Impl>(Impl{xrt::bo(impl_->bo, bytes, offset), bytes}));
+      std::make_shared<Impl>(Impl{xrt::bo(root, bytes, at), bytes, root, at}));
 }
 
 void* Buffer::data() {
@@ -156,8 +158,15 @@ struct Q4nxGemv::Impl {
   std::optional<Buffer> residual;
   std::optional<xrt::run> run;
 
-  Impl(GemvRuntime::Impl& r, const q4nx::Matrix& m, Prologue p, Epilogue e)
-      : rt(r), w_bytes(m.bytes.size()), w(rt.hw.Buffer(w_bytes)) {
+  // `storage`: where the weights go, or null for a buffer of their own.
+  Impl(GemvRuntime::Impl& r, const q4nx::Matrix& m, Prologue p, Epilogue e,
+       const Buffer* storage)
+      : rt(r),
+        w_bytes(m.bytes.size()),
+        w(storage != nullptr ? storage->impl().bo : rt.hw.Buffer(w_bytes)) {
+    if (storage != nullptr && storage->size() < w_bytes) {
+      throw std::invalid_argument("q4nx GEMV: weight storage too small");
+    }
     for (std::size_t t = 0; t < kGemvTokens; ++t) {
       sequences[t] =
           Q4nxGemvSequence(m.dim, m.padded_rows, p, e, t + 1, rt.design.name);
@@ -179,8 +188,16 @@ struct Q4nxGemv::Impl {
 
 Q4nxGemv::Q4nxGemv(GemvRuntime& runtime, const q4nx::Matrix& weights,
                    Prologue prologue, Epilogue epilogue)
-    : impl_(
-          std::make_unique<Impl>(runtime.impl(), weights, prologue, epilogue)),
+    : Q4nxGemv(runtime, weights, prologue, epilogue, nullptr) {}
+
+Q4nxGemv::Q4nxGemv(GemvRuntime& runtime, const q4nx::Matrix& weights,
+                   Prologue prologue, Epilogue epilogue, const Buffer& storage)
+    : Q4nxGemv(runtime, weights, prologue, epilogue, &storage) {}
+
+Q4nxGemv::Q4nxGemv(GemvRuntime& runtime, const q4nx::Matrix& weights,
+                   Prologue prologue, Epilogue epilogue, const Buffer* storage)
+    : impl_(std::make_unique<Impl>(runtime.impl(), weights, prologue, epilogue,
+                                   storage)),
       dim_(weights.dim),
       rows_(weights.rows),
       padded_rows_(weights.padded_rows),
@@ -488,13 +505,14 @@ std::size_t Q4nxGather::tokens() const {
 }
 
 struct Chain::Impl {
+  GemvRuntime::Impl& rt;
   xrt::runlist runlist;
   std::vector<xrt::run> runs;
 };
 
 Chain::Chain(GemvRuntime& runtime)
-    : impl_(std::make_unique<Impl>(
-          Impl{xrt::runlist(*runtime.impl().hw.context), {}})) {}
+    : impl_(std::make_unique<Impl>(Impl{
+          runtime.impl(), xrt::runlist(*runtime.impl().hw.context), {}})) {}
 
 Chain::~Chain() = default;
 
@@ -513,6 +531,14 @@ void Chain::Add(Q4nxGather& gather, Buffer& x, Buffer& arena, Buffer& y,
   impl_->runs.push_back(g.instructions->Run(
       *g.rt.kernel,
       {&x.impl().bo, &arena.impl().bo, &y.impl().bo, &residual.impl().bo}));
+  impl_->runlist.add(impl_->runs.back());
+}
+
+void Chain::Add(const std::string& sequence, Buffer& a0, Buffer& a1, Buffer& a2,
+                Buffer& a3) {
+  impl_->rt.Require(sequence);
+  impl_->runs.push_back(impl_->rt.Run(
+      sequence, {&a0.impl().bo, &a1.impl().bo, &a2.impl().bo, &a3.impl().bo}));
   impl_->runlist.add(impl_->runs.back());
 }
 

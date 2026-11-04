@@ -148,7 +148,23 @@ proposed; acceptance per prompt and vocabulary size is in BENCHMARKS.md.
 Greedy output on the NPU must be the same on every run.
 `qwen35_decode_gemv_chain_test` (label `npu`) runs one decoder layer's chain of
 GEMVs 60,000 times with the same inputs, alternating 1 and 2 tokens, and
-requires every output to be bit-identical.
+requires every output to be bit-identical. It runs the layer two ways on two
+copies of the activation buffer, each GEMV as its own call and as the chain
+sequence the decoder submits, and requires both to match bit for bit after
+every run. It checks every chain the decoder runs: into the next layer's
+DeltaNet input (60,000 runs) or attention input (10,000), the LM head (300),
+the MTP draft head (3,000), and the bare chain that stops after down
+(10,000).
+
+2026-11-03: with the chain sequences, the decoder's output moved (argmax
+63/73 against the q4nx CPU decoder, MTP accepting no drafts) while every
+chain sequence still matched the per-call chain. The decoder's regions had
+become sub-buffers of one activation buffer, and the decoder made
+sub-buffers of those. Syncing an XRT sub-buffer made from a sub-buffer did
+not keep the CPU's and the NPU's views of it the same (the exact XRT cause
+was not traced). `npu::Buffer::Sub` now always makes the XRT sub-buffer
+from the root buffer: the decode, prefill and sampling tests pass and
+replies hash the same as before the change.
 
 2026-10-27: about one sweep run in ten (long prompts: one call in ~30,000)
 gave a different reply. The chain test (200,000 runs) found 6 runs whose

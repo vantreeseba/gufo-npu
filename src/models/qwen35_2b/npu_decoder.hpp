@@ -19,7 +19,8 @@
 // in the q4nx GEMV (its resnorm input stage and SwiGLU output stage); the
 // residual stream stays on the device. Each GEMV writes into the input region
 // of the next, so the calls from one layer's mixer output to the next layer's
-// input projection (out, gate + up, down, next in) run as one chain. The CPU
+// input projection (out, gate + up, down, next in) run as one chain sequence:
+// one call, on regions of one activation buffer (npu/gemv.hpp). The CPU
 // runs the token mixers (Gated DeltaNet, attention) and the DeltaNet alpha/beta
 // rows: 25 NPU submissions per step.
 //
@@ -105,6 +106,25 @@ public:
   double npu_seconds() const;
   long submissions() const;
   double cpu_seconds() const;
+
+  // Where decode time goes, since construction: per kind of NPU submission
+  // its count and wall time (submit to completion), the host's buffer syncs
+  // (inside the mixers and around the submissions), and the wall time inside
+  // Step().
+  struct Timeline {
+    struct Submissions {
+      long count = 0;
+      double seconds = 0;
+    };
+    Submissions first;   // layer 0's input projection
+    Submissions layers;  // a layer's FFN into the next projection or LM head
+    Submissions head;    // the LM head alone (Logits)
+    Submissions mtp;     // the MTP head's
+    double sync_seconds = 0;
+    long steps = 0;
+    double step_seconds = 0;
+  };
+  const Timeline& timeline() const;
 
 private:
   struct Impl;
