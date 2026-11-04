@@ -39,8 +39,7 @@ inline constexpr std::size_t kInputBytes = gufo_npu::npu::kGemvInputBytes;
 inline constexpr std::size_t kInYBytes = kTokens * 12288 * sizeof(float);
 inline constexpr std::size_t kFfnYBytes = 8 * (kMaxDim / 2) * sizeof(float);
 // A residual argument nobody reads (calls that write none).
-inline constexpr std::size_t kScratchBytes =
-    gufo_npu::npu::kGemvResidualBytes;
+inline constexpr std::size_t kScratchBytes = gufo_npu::npu::kGemvResidualBytes;
 inline constexpr std::size_t kBlockInX = 0;
 inline constexpr std::size_t kBlockFfnX = kInputBytes;
 inline constexpr std::size_t kBlockInY = 2 * kInputBytes;
