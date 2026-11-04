@@ -369,26 +369,49 @@ struct NpuDecoder::Impl {
     final_hidden.resize(kMaxTokens * hidden);
   }
 
+  // Whether Step() is running: its host work goes to timeline.in_step.
+  bool stepping = false;
+
   void Submit(Chain& chain, NpuDecoder::Timeline::Submissions& kind) {
     const auto start = std::chrono::steady_clock::now();
-    chain.Run();
+    chain.Start();
+    const auto submitted = std::chrono::steady_clock::now();
+    chain.Wait();
     const double seconds = SecondsSince(start);
     npu_seconds += seconds;
     ++submissions;
     kind.seconds += seconds;
+    kind.submit_seconds +=
+        std::chrono::duration<double>(submitted - start).count();
     ++kind.count;
   }
 
   // Host <-> device syncs, timed for the timeline.
+  void Synced(NpuDecoder::Timeline::Syncs& syncs, const Buffer& b,
+              std::chrono::steady_clock::time_point start) {
+    const double seconds = SecondsSince(start);
+    timeline.sync_seconds += seconds;
+    if (stepping) {
+      ++syncs.count;
+      syncs.seconds += seconds;
+      syncs.bytes += static_cast<double>(b.size());
+    }
+  }
   void ToDevice(Buffer& b) {
     const auto start = std::chrono::steady_clock::now();
     b.ToDevice();
-    timeline.sync_seconds += SecondsSince(start);
+    Synced(timeline.in_step.to_device, b, start);
   }
   void FromDevice(Buffer& b) {
     const auto start = std::chrono::steady_clock::now();
     b.FromDevice();
-    timeline.sync_seconds += SecondsSince(start);
+    Synced(timeline.in_step.from_device, b, start);
+  }
+  // Adds the time since `start` to a StepHost field while Step() runs.
+  void StepWork(double& seconds, std::chrono::steady_clock::time_point start) {
+    if (stepping) {
+      seconds += SecondsSince(start);
+    }
   }
 
   // The CPU part of block `b` (blk `il`) for `count` tokens: reads its input
@@ -424,8 +447,10 @@ struct NpuDecoder::Impl {
       std::memcpy(in_t, b.in_y->as<float>() + t * b.in->y_token_stride(),
                   rows * sizeof(float));
       float* y = out_x.as<float>() + t * npu::kSlot;
+      const auto mix_start = std::chrono::steady_clock::now();
       if (b.attention) {
         mixer.Attention(il, in_t, position + t, st, y);
+        StepWork(timeline.in_step.attention_seconds, mix_start);
         continue;
       }
       // alpha and beta from the token's normalized input: its residual is
@@ -446,6 +471,7 @@ struct NpuDecoder::Impl {
       } else {
         mixer.Linear(il, in_t, st, y);
       }
+      StepWork(timeline.in_step.deltanet_seconds, mix_start);
     }
     ToDevice(out_x);
   }
@@ -560,13 +586,17 @@ const float* NpuDecoder::Step(const int* tokens, int count, DecodeState& state,
   // Counts the step's wall time however it returns.
   struct StepTimer {
     NpuDecoder::Timeline& timeline;
+    bool& stepping;
     std::chrono::steady_clock::time_point start;
     ~StepTimer() {
+      stepping = false;
       ++timeline.steps;
       timeline.step_seconds += SecondsSince(start);
     }
-  } step_timer{m.timeline, std::chrono::steady_clock::now()};
+  } step_timer{m.timeline, m.stepping, std::chrono::steady_clock::now()};
+  m.stepping = true;
   {
+    const auto embed_start = std::chrono::steady_clock::now();
     Buffer h = m.layers[0].in_x->Sub(kH, kSlottedBytes);
     for (int t = 0; t < count; ++t) {
       if (tokens[t] < 0 || tokens[t] >= c.vocab) {
@@ -577,6 +607,7 @@ const float* NpuDecoder::Step(const int* tokens, int count, DecodeState& state,
                                             quant::RowBytes(m.embed->type, d),
                         h.as<float>() + t * npu::kSlot, d);
     }
+    m.StepWork(m.timeline.in_step.embed_seconds, embed_start);
     m.ToDevice(h);
   }
   m.Submit(*m.first[count - 1], m.timeline.first);
@@ -591,6 +622,7 @@ const float* NpuDecoder::Step(const int* tokens, int count, DecodeState& state,
     // The final residual H + D from the LM head's input region, the same
     // fp32 sum its input stage writes to lm_r.
     m.FromDevice(*m.lm_x);
+    const auto copy_start = std::chrono::steady_clock::now();
     for (int t = 0; t < count; ++t) {
       const float* slot = m.lm_x->as<float>() + t * npu::kSlot;
       float* out = m.final_hidden.data() + static_cast<std::size_t>(t) * d;
@@ -598,10 +630,12 @@ const float* NpuDecoder::Step(const int* tokens, int count, DecodeState& state,
         out[i] = slot[i] + slot[npu::kHidden + i];
       }
     }
+    m.StepWork(m.timeline.in_step.logits_seconds, copy_start);
     return nullptr;
   }
   m.FromDevice(*m.lm_y);
   m.FromDevice(*m.lm_r);
+  const auto copy_start = std::chrono::steady_clock::now();
   for (int t = 0; t < count; ++t) {
     std::memcpy(m.logits.data() + static_cast<std::size_t>(t) * c.vocab,
                 m.lm_y->as<float>() + t * m.lm->y_token_stride(),
@@ -609,6 +643,7 @@ const float* NpuDecoder::Step(const int* tokens, int count, DecodeState& state,
     std::memcpy(m.final_hidden.data() + static_cast<std::size_t>(t) * d,
                 m.lm_r->as<float>() + t * npu::kSlot, d * sizeof(float));
   }
+  m.StepWork(m.timeline.in_step.logits_seconds, copy_start);
   return m.logits.data();
 }
 

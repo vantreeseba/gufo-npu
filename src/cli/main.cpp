@@ -981,6 +981,34 @@ int GenerateOnNpu(const gufo_npu::gguf::File& file,
                  tl.first.count, mean_us(tl.layers), tl.layers.count,
                  mean_us(tl.head), tl.head.count, mean_us(tl.mtp), tl.mtp.count,
                  1e6 * tl.sync_seconds / steps);
+    // Decoders that split a step's host work: what runs between its
+    // submissions, per step, and how much of a submission is the submit
+    // itself. "other" is the step's wall time none of these account for.
+    if constexpr (requires { tl.in_step; }) {
+      const auto& h = tl.in_step;
+      const double per_step = 1e6 / steps;
+      const double accounted = tl.first.seconds + tl.layers.seconds +
+                               h.embed_seconds + h.deltanet_seconds +
+                               h.attention_seconds + h.logits_seconds +
+                               h.to_device.seconds + h.from_device.seconds;
+      const auto submit_us = [](const auto& s) {
+        return s.count ? 1e6 * s.submit_seconds / s.count : 0.0;
+      };
+      std::fprintf(
+          stderr,
+          "[timeline: host per step: embed %.0f us, DeltaNet %.0f us, "
+          "attention %.0f us, logits out %.0f us, syncs to the NPU %.0f us "
+          "(%.1f, %.0f KB), from it %.0f us (%.1f, %.0f KB), other %.0f us; "
+          "submitting: first %.1f us, layer %.1f us, head %.1f us, MTP %.1f "
+          "us]\n",
+          per_step * h.embed_seconds, per_step * h.deltanet_seconds,
+          per_step * h.attention_seconds, per_step * h.logits_seconds,
+          per_step * h.to_device.seconds, h.to_device.count / steps,
+          h.to_device.bytes / steps / 1024.0, per_step * h.from_device.seconds,
+          h.from_device.count / steps, h.from_device.bytes / steps / 1024.0,
+          per_step * (tl.step_seconds - accounted), submit_us(tl.first),
+          submit_us(tl.layers), submit_us(tl.head), submit_us(tl.mtp));
+    }
     // MoE decoders: the mixer output projection on the CPU and the CPU
     // router before each layer's chain.
     if constexpr (requires { tl.out_projection; }) {
