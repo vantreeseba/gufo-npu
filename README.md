@@ -89,8 +89,8 @@ flowchart TB
   end
   pp --> dl
   subgraph dl ["Decode loop: 1 or 2 tokens per pass"]
-    gemv["Every weight matrix: q4nx GEMVs,<br/>chained into a few submissions"]:::npu
-    mixd["DeltaNet + attention step<br/>(35B: expert router)"]:::cpu
+    gemv["Every weight matrix: q4nx GEMVs,<br/>chained into a few submissions<br/>(2B: 25 submissions, 22.9 ms per token)"]:::npu
+    mixd["DeltaNet + attention step<br/>(35B: expert router)<br/>(2B: ~0.9 ms per token)"]:::cpu
     mtp["MTP head drafts the next token"]:::npu
     samp["Sample; keep or drop the draft"]:::cpu
   end
@@ -99,13 +99,13 @@ flowchart TB
   classDef cpu fill:#74c0fc,stroke:#1864ab,color:#000
 ```
 
-*The CPU does the small, state-heavy work (mixers, routing, sampling); the NPU streams the weights. Prompts under 6–7 tokens go straight to the decode loop.*
+*The CPU does the small, state-heavy work (mixers, routing, sampling); the NPU streams the weights. Prompts under 6–7 tokens go straight to the decode loop. Qwen3.5-2B, one token without a draft: a 23.8–24.1 ms step, of which ~19.8 ms is reading weights, ~3.1 ms NPU call and submission overhead, and ~1.0 ms host work. The breakdown is in [its README](docs/models/qwen3.5-2b/README.md#how-a-token-runs).*
 
 How one decode GEMV uses the NPU array (`src/models/qwen35_2b/kernels/decode_gemv.py`; each model has its own copy):
 
 ```mermaid
 flowchart TB
-  ddr[("DDR: weights in q4nx,<br/>4.625 bits per weight")] --> shim["8 shim DMAs, one per column,<br/>each streams its own weight slice"]:::npu
+  ddr[("DDR: weights in q4nx,<br/>4.625 bits per weight")] -- "~56 GB/s<br/>(2B: 33.9 MB per layer chain in ~605 µs)" --> shim["8 shim DMAs, one per column,<br/>each streams its own weight slice"]:::npu
   tokin[("Token(s) + norm weight")] --> bc["Broadcast to every core"]:::npu
   shim --> mem["Memtiles split each column's<br/>slice across its 4 cores"]:::npu
   mem --> cores["4 x 8 = 32 compute cores: unpack q4nx to bf16,<br/>dot with 1 or 2 tokens, 32 output rows each per round"]:::npu

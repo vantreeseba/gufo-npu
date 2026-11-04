@@ -113,5 +113,7 @@ void Chain::Add(Q4nxGather&, Buffer&, Buffer&, Buffer&, Buffer&) {}
 void Chain::Add(Q4nxGatherChain&, Buffer&, Buffer&, Buffer&) {}
 void Chain::Add(const std::string&, Buffer&, Buffer&, Buffer&, Buffer&) {}
 void Chain::Run() {}
+void Chain::Start() {}
+void Chain::Wait() {}
 
 }  // namespace gufo_npu::npu

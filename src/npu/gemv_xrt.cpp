@@ -649,7 +649,15 @@ void Chain::Add(const std::string& sequence, Buffer& a0, Buffer& a1, Buffer& a2,
 }
 
 void Chain::Run() {
+  Start();
+  Wait();
+}
+
+void Chain::Start() {
   impl_->runlist.execute();
+}
+
+void Chain::Wait() {
   impl_->runlist.wait();
 }
 
