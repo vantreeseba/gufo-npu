@@ -49,6 +49,15 @@ add_test(NAME qwen36_cpu_experts_test COMMAND qwen36_cpu_experts_test)
 set_tests_properties(qwen36_cpu_experts_test PROPERTIES
                      LABELS "qwen36_35b_a3b;kernels" TIMEOUT 600)
 
+# The CPU q4nx GEMV the decoder runs the mixer output projection with (no
+# NPU, no model).
+add_executable(qwen36_cpu_gemv_test cpu_gemv_test.cpp)
+target_link_libraries(qwen36_cpu_gemv_test PRIVATE gufo_npu_qwen36_35b_a3b)
+target_compile_options(qwen36_cpu_gemv_test PRIVATE -O2)
+add_test(NAME qwen36_cpu_gemv_test COMMAND qwen36_cpu_gemv_test)
+set_tests_properties(qwen36_cpu_gemv_test PROPERTIES
+                     LABELS "qwen36_35b_a3b;kernels" TIMEOUT 600)
+
 if(GUFO_NPU_ENABLE_XRT AND GUFO_NPU_BUILD_KERNELS)
   set(kernels "${CMAKE_BINARY_DIR}/kernels")
 
