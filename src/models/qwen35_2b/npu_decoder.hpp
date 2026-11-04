@@ -83,12 +83,18 @@ public:
   // layer's cache in `state` (an MtpState) and returns the draft for the
   // position after the last: the MTP head's argmax over the draft
   // vocabulary (DraftVocab()).
+  // With `from_mtp`, each hidden[i] is the MTP block's own final residual
+  // (mtp_hidden(), a draft fed back for the next draft) and goes through
+  // shared_head_norm instead of output_norm.
   int Draft(const float* const* hidden, const int* tokens, int count,
-            int position, DecodeState& state);
+            int position, DecodeState& state, bool from_mtp = false);
   // Draft() without the draft: only appends the pairs to the MTP layer's
   // cache (for prompt positions).
   void FillMtp(const float* const* hidden, const int* tokens, int count,
-               int position, DecodeState& state);
+               int position, DecodeState& state, bool from_mtp = false);
+  // The MTP block's final residual (before shared_head_norm) for token t of
+  // the last Draft(); valid until the next call.
+  const float* mtp_hidden(int t = 0);
   DecodeState NewMtpState() const;
 
   // States for a generation from the decoder's pool (StatePool): equal to

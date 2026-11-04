@@ -413,6 +413,26 @@ gufo-npu generate --device npu --model "$GUFO_NPU_QWEN35_2B_Q4_GGUF" \
 ctest --preset npu -R 'qwen35_decode_gemv_chain_test|qwen35_decode_gemv_test|qwen35_npu_decode_test|qwen35_npu_sampling_test|qwen35_npu_prefill_test'
 ```
 
+### Fewer RTP writes and early weight fills in the chains (2026-11-04)
+
+Each call's shape is one RTP word per core (640 → 160 writes per layer
+chain), and a chain queues each call's weight fills as soon as the previous
+call's are queued. Interleaved against 6f1c45d, the same toolchain image,
+warm, three runs each (`--max-tokens 256`):
+
+| Prompt | 6f1c45d | this change | |
+|---|---|---|---|
+| Sky, `--draft none` | 40.63, 40.81, 40.88 tok/s | **42.17, 42.22, 42.27** | +3.5% |
+| Sky, `--draft mtp` | 55.60, 55.61, 55.61 tok/s | **57.27, 57.20, 57.29** | +3.0% |
+| Fibonacci, `--draft none` | 40.31, 40.15, 40.21 tok/s | **41.62, 41.58, 41.55** | +3.3% |
+| Fibonacci, `--draft mtp` | 66.68, 66.71, 66.77 tok/s | **68.59, 68.59, 68.66** | +2.8% |
+
+- Replies hash the same (sky `a49f1c4c`, Fibonacci `fdb595fb`).
+- Layer chain submission (timeline) 973–977 → 942–946 µs; a step
+  24.6–24.9 → 23.8–24.0 ms.
+- One layer chain in a 16-run runlist: 713–716 → 682–684 µs (1 token), of
+  which ~605 µs is reading its 33.9 MB at 56 GB/s.
+
 ## NPU prefill (Phase 4)
 
 `gufo-npu generate --device npu` now runs every prompt token but the last

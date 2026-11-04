@@ -89,9 +89,40 @@ KERNEL_SOURCE = HERE / "aie" / "decode_gemv.cc"
 XCLBIN = V.NAME
 
 bf16 = np.dtype[bfloat16]
-# k blocks, rounds, input stage, output stage, residual pieces, core row,
-# tokens.
-RTP_TY = np.ndarray[(7,), np.dtype[np.int32]]
+# Word 0: the call's shape packed into fields (SHAPE_FIELDS), so a call
+# writes one word per core (each RTP write costs the sequence ~66 ns, 32
+# cores per word); word 1: the core's row, written once per sequence.
+RTP_TY = np.ndarray[(2,), np.dtype[np.int32]]
+# (name, bits) of RTP word 0, lowest bits first.
+SHAPE_FIELDS = (
+    ("k_blocks", 6),
+    ("rounds", 8),
+    ("prologue", 2),
+    ("epilogue", 2),
+    ("res_pieces", 5),
+    ("tokens", 2),
+)
+
+
+def _pack_shape(**fields):
+    """RTP word 0 for a call (SHAPE_FIELDS)."""
+    word, shift = 0, 0
+    for name, bits in SHAPE_FIELDS:
+        value = fields[name]
+        assert 0 <= value < 1 << bits, (name, value)
+        word += value << shift
+        shift += bits
+    return word
+
+
+def _unpack_shape(word):
+    """SHAPE_FIELDS of RTP word 0 on the core (powers of two: shifts and
+    masks once lowered)."""
+    fields, scale = {}, 1
+    for name, bits in SHAPE_FIELDS:
+        fields[name] = (word // scale) % (1 << bits)
+        scale <<= bits
+    return fields
 
 PROLOGUES = {"plain": 0, "resnorm": 1, "act": 2}
 EPILOGUES = {"store": 0, "swiglu": 1}
@@ -178,30 +209,32 @@ class _Array:
         y_col_ty = np.ndarray[(ROWS, TOKENS * M_TILE), np.dtype[np.float32]]
         shims = [Tile(j, 0) for j in range(COLS)]
 
-        def body(x, w_in, y_out, k_zero, k_block, k_store, y_acc, sums, rtp):
-            for _ in range_(rtp[1]):
+        def body(x, w_in, y_out, k_zero, k_block, k_store, y_acc, sums, f):
+            for _ in range_(f["rounds"]):
                 k_zero(y_acc)
-                for kb in range_(rtp[0]):
+                for kb in range_(f["k_blocks"]):
                     w = w_in.acquire(1)
-                    k_block(w, x, y_acc, sums, kb, rtp[2], rtp[6])
+                    k_block(w, x, y_acc, sums, kb, f["prologue"], f["tokens"])
                     w_in.release(1)
                 y = y_out.acquire(1)
-                k_store(y, y_acc, rtp[3])
+                k_store(y, y_acc, f["epilogue"])
                 y_out.release(1)
 
         # The sequence writes the RTP before it sends the token, so it is
-        # current once the token arrives.
+        # current once the token arrives; a core reads it once per call,
+        # right after taking the token.
         def core_fn(
             x_in, w_in, y_out, k_residual, k_prep, k_zero, k_block, k_store, y_acc, sums, rtp
         ):
             x = x_in.acquire(1)
-            k_residual(x, rtp[0], rtp[2], rtp[6])
-            k_prep(x, sums, rtp[0], rtp[2], rtp[6])
-            body(x, w_in, y_out, k_zero, k_block, k_store, y_acc, sums, rtp)
+            f = _unpack_shape(rtp[0])
+            k_residual(x, f["k_blocks"], f["prologue"], f["tokens"])
+            k_prep(x, sums, f["k_blocks"], f["prologue"], f["tokens"])
+            body(x, w_in, y_out, k_zero, k_block, k_store, y_acc, sums, f)
             x_in.release(1)
 
-        # The residual column's cores first send their quarter of H + D (RTP
-        # word 4 pieces; 0 when the input stage is not resnorm).
+        # The residual column's cores first send their quarter of H + D (the
+        # res_pieces field pieces; 0 when the input stage is not resnorm).
         def residual_core_fn(
             x_in,
             w_in,
@@ -217,13 +250,14 @@ class _Array:
             rtp,
         ):
             x = x_in.acquire(1)
-            k_residual(x, rtp[0], rtp[2], rtp[6])
-            for piece in range_(rtp[4]):
+            f = _unpack_shape(rtp[0])
+            k_residual(x, f["k_blocks"], f["prologue"], f["tokens"])
+            for piece in range_(f["res_pieces"]):
                 y = y_out.acquire(1)
-                k_residual_out(y, x, rtp[5], piece)
+                k_residual_out(y, x, rtp[1], piece)
                 y_out.release(1)
-            k_prep(x, sums, rtp[0], rtp[2], rtp[6])
-            body(x, w_in, y_out, k_zero, k_block, k_store, y_acc, sums, rtp)
+            k_prep(x, sums, f["k_blocks"], f["prologue"], f["tokens"])
+            body(x, w_in, y_out, k_zero, k_block, k_store, y_acc, sums, f)
             x_in.release(1)
 
         of_x = ObjectFifo(x_ty, name="x", depth=1)
@@ -282,8 +316,41 @@ class _Region:
         self.tensor, self.words, self.offset = tensor, words, offset
 
 
+def _weight_taps(shape, W):
+    """One weight task per column covers every round: column c's slice of
+    round r starts at (r * COLS + c) * words_per_col. The slice is split
+    into CHUNK-word runs to fit the BD's inner size field. A short
+    instruction stream also keeps the LM head's (243 rounds) small."""
+    dim, n_out = shape[0], shape[1]
+    rounds = n_out // OUT_PER_ROUND
+    words_per_col = _matrix_words(dim, n_out) // (rounds * COLS)
+    chunk = _chunk(words_per_col)
+    return [
+        TensorAccessPattern(
+            (1, W.words),
+            W.offset + col * words_per_col,
+            [1, rounds, words_per_col // chunk, chunk],
+            [0, COLS * words_per_col, chunk, 1],
+        )
+        for col in range(COLS)
+    ]
+
+
+def _queue_weights(shape, W, w_prods):
+    """Queues a call's weight fills (one per column) in a new task group and
+    returns it. Weight fills read only W, so a chain queues the next call's
+    while this call still streams: each column's channel moves on to them as
+    soon as this call's are sent, and they wait in the weight FIFOs until
+    the cores take the next call's token."""
+    group = TaskGroup()
+    for col, tap in enumerate(_weight_taps(shape, W)):
+        w_prods[col].fill(W.tensor, tap, wait=False, group=group)
+    return group
+
+
 def _emit_call(
-    shape, tokens, X, W, Y, R, x_prod, w_prods, y_conses, rtps, rtp_rows, written
+    shape, tokens, X, W, Y, R, x_prod, w_prods, y_conses, rtps, rtp_rows, written,
+    weights=None, after_weights=None,
 ):
     """One GEMV call's part of a runtime sequence: X, W, Y and R are
     _Regions. `written` holds each core's RTP words as the sequence last
@@ -294,31 +361,20 @@ def _emit_call(
     the same sequence starts on idle channels: its waits come in queue order
     per channel as a single call's do, and its RTP writes come after every
     core has sent its last output of this call, which is the last time a
-    core reads its RTP before it takes the next token."""
+    core reads its RTP before it takes the next token.
+
+    `weights`: the task group of this call's weight fills when the sequence
+    queued them already (_queue_weights); otherwise they are queued here.
+    `after_weights` runs once this call's weight fills are queued (a chain
+    queues the next call's fills there)."""
     dim, n_out, prologue, epilogue, y_stride = shape
     _check_shape(dim, n_out, prologue)
     rounds = n_out // OUT_PER_ROUND
     k_blocks = dim // K_TILE
-    w_words = _matrix_words(dim, n_out)
-    words_per_col = w_words // (rounds * COLS)
     if epilogue == "swiglu":
         # Token t's compact bf16 values at t * y_stride words; the padding of
         # each core's output (24 of every 32 words) goes past both tokens.
         pad_stride = TOKENS * y_stride
-    # One weight task per column covers every round: column c's slice of
-    # round r starts at (r * COLS + c) * words_per_col. The slice is split
-    # into CHUNK-word runs to fit the BD's inner size field. A short
-    # instruction stream also keeps the LM head's (243 rounds) small.
-    chunk = _chunk(words_per_col)
-    w_taps = [
-        TensorAccessPattern(
-            (1, W.words),
-            W.offset + col * words_per_col,
-            [1, rounds, words_per_col // chunk, chunk],
-            [0, COLS * words_per_col, chunk, 1],
-        )
-        for col in range(COLS)
-    ]
 
     def y_tap(i):
         """Column object i (round * COLS + col): ROWS cores x TOKENS x M_TILE."""
@@ -356,15 +412,16 @@ def _emit_call(
         [M_TILE, HIDDEN // ROWS, SLOT, 1],
     )
 
-    shape_words = (
-        k_blocks,
-        rounds,
-        PROLOGUES[prologue],
-        EPILOGUES[epilogue],
-        RES_PIECES if prologue == "resnorm" else 0,
+    shape_word = _pack_shape(
+        k_blocks=k_blocks,
+        rounds=rounds,
+        prologue=PROLOGUES[prologue],
+        epilogue=EPILOGUES[epilogue],
+        res_pieces=RES_PIECES if prologue == "resnorm" else 0,
+        tokens=tokens,
     )
     for c, (rtp, row) in enumerate(zip(rtps, rtp_rows)):
-        words = shape_words + (row, tokens)
+        words = (shape_word, row)
         for word, value in enumerate(words):
             if written[c] is None or written[c][word] != value:
                 rtp[word] = value
@@ -391,9 +448,9 @@ def _emit_call(
             r_group.finish()
             r_group = None
 
-    tg = TaskGroup()
-    for col in range(COLS):
-        w_prods[col].fill(W.tensor, w_taps[col], wait=False, group=tg)
+    tg = weights if weights is not None else _queue_weights(shape, W, w_prods)
+    if after_weights is not None:
+        after_weights()
     if epilogue == "swiglu":
         # Five dimensions per column: one drain per round and column.
         window = []
@@ -485,44 +542,62 @@ def chain_program(dev, next_name, tokens):
         def a(offset_bytes):
             return _Region(A, a_words, word(offset_bytes))
 
-        def call(shape, X, W, Y, R):
+        scratch = _Region(S, s_words)
+        # (shape, X, W, Y, R) of each call in order.
+        calls = [
+            # out: the mixer output -> the FFN input's D slots.
+            (
+                out,
+                a(V.WINDOW_OUT_X),
+                _Region(WL, wl_words, 0),
+                a(V.WINDOW_FFN_X + V.D_OFFSET),
+                scratch,
+            ),
+            # gate + up with SwiGLU; its residual H + D -> the next input's H.
+            (
+                ffn,
+                a(V.WINDOW_FFN_X),
+                _Region(WL, wl_words, calls_words[0]),
+                a(V.WINDOW_FFN_Y),
+                a(V.WINDOW_NEXT),
+            ),
+            # down -> the next input's D slots.
+            (
+                down,
+                a(V.WINDOW_FFN_Y),
+                _Region(WL, wl_words, calls_words[0] + calls_words[1]),
+                a(V.WINDOW_NEXT + V.D_OFFSET),
+                scratch,
+            ),
+        ]
+        if next_shape is not None:
+            calls.append(
+                (
+                    next_shape,
+                    a(V.WINDOW_NEXT),
+                    _Region(WN, wn_words),
+                    a(V.WINDOW_NEXT_Y),
+                    a(V.WINDOW_NEXT_R),
+                )
+            )
+        # Call i + 1's weight fills are queued as soon as call i's are, so
+        # each column's weight channel streams on across the boundary while
+        # call i's outputs drain and call i + 1's RTPs and token wait for
+        # them.
+        weights = [None] * len(calls)
+
+        def prefetch(i):
+            def queue():
+                if i + 1 < len(calls):
+                    shape, _, W, _, _ = calls[i + 1]
+                    weights[i + 1] = _queue_weights(shape, W, w_prods)
+
+            return queue
+
+        for i, (shape, X, W, Y, R) in enumerate(calls):
             _emit_call(
                 shape, tokens, X, W, Y, R, x_prod, w_prods, y_conses, rtps,
-                arr.rtp_rows, written,
-            )
-
-        scratch = _Region(S, s_words)
-        # out: the mixer output -> the FFN input's D slots.
-        call(
-            out,
-            a(V.WINDOW_OUT_X),
-            _Region(WL, wl_words, 0),
-            a(V.WINDOW_FFN_X + V.D_OFFSET),
-            scratch,
-        )
-        # gate + up with SwiGLU; its residual H + D -> the next input's H.
-        call(
-            ffn,
-            a(V.WINDOW_FFN_X),
-            _Region(WL, wl_words, calls_words[0]),
-            a(V.WINDOW_FFN_Y),
-            a(V.WINDOW_NEXT),
-        )
-        # down -> the next input's D slots.
-        call(
-            down,
-            a(V.WINDOW_FFN_Y),
-            _Region(WL, wl_words, calls_words[0] + calls_words[1]),
-            a(V.WINDOW_NEXT + V.D_OFFSET),
-            scratch,
-        )
-        if next_shape is not None:
-            call(
-                next_shape,
-                a(V.WINDOW_NEXT),
-                _Region(WN, wn_words),
-                a(V.WINDOW_NEXT_Y),
-                a(V.WINDOW_NEXT_R),
+                arr.rtp_rows, written, weights[i], prefetch(i),
             )
 
     arg_types = [
