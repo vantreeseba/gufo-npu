@@ -8,6 +8,7 @@
 
 #include "core/q4nx.hpp"
 #include "core/simd.hpp"
+#include "models/qwen36_35b_a3b/q4nx_tile.hpp"
 #include "npu/gemv.hpp"
 
 #if defined(__x86_64__)
@@ -19,13 +20,21 @@ namespace gufo_npu::qwen36_35b_a3b {
 namespace {
 
 using gufo_npu::npu::ExpertArena;
+using q4nx_tile::Bf16At;
+using q4nx_tile::BlockAt;
+using q4nx_tile::HasFast;
+using q4nx_tile::kCodes;
+using q4nx_tile::kD;
+using q4nx_tile::kDmin;
+using q4nx_tile::kGroups;
+using q4nx_tile::kHalf;
+using q4nx_tile::kKTile;
+using q4nx_tile::kMn;
+using q4nx_tile::kSc;
+using q4nx_tile::kTile;
 
 constexpr std::size_t kHidden = 2048;
 constexpr std::size_t kFfn = 512;
-constexpr std::size_t kTile = q4nx::kMTile;  // rows per tile
-constexpr std::size_t kHalf = kTile / 2;
-constexpr std::size_t kKTile = q4nx::kKTile;
-constexpr std::size_t kGroups = kKTile / q4nx::kGroup;
 constexpr std::size_t kUpKBlocks = kHidden / kKTile;
 constexpr std::size_t kDownKBlocks = kFfn / kKTile;
 constexpr std::size_t kUpTiles = 2 * kFfn / kTile;
@@ -39,31 +48,10 @@ constexpr std::size_t kDownPairs = kFfn / 2;
 // up job.
 constexpr std::size_t kTokens = 8;
 constexpr std::size_t kRun = 256;
-// Byte offsets in a q4nx block (src/core/q4nx.hpp).
-constexpr std::size_t kD = 0;
-constexpr std::size_t kDmin = kD + kTile * 2;
-constexpr std::size_t kSc = kDmin + kTile * 2;
-constexpr std::size_t kMn = kSc + kGroups * kTile;
-constexpr std::size_t kCodes = kMn + kGroups * kTile;
-static_assert(kCodes + kTile * kKTile / 2 == q4nx::kBlockBytes);
 static_assert(ExpertArena::kUpBytes ==
               kUpTiles * kUpKBlocks * q4nx::kBlockBytes);
 static_assert(ExpertArena::kDownBytes ==
               kDownTiles * kDownKBlocks * q4nx::kBlockBytes);
-
-// The block of row tile `tile` and k block `kb` (q4nx's GEMV order).
-const std::uint8_t* BlockAt(const std::uint8_t* matrix, std::size_t k_blocks,
-                            std::size_t tile, std::size_t kb) {
-  const std::size_t index =
-      ((tile / q4nx::kRows) * k_blocks + kb) * q4nx::kRows + tile % q4nx::kRows;
-  return matrix + index * q4nx::kBlockBytes;
-}
-
-float Bf16At(const std::uint8_t* p) {
-  std::uint16_t v;
-  std::memcpy(&v, p, sizeof(v));
-  return simd::FromBf16(v);
-}
 
 // Row tile `tile` of a q4nx matrix of `k_blocks` k blocks into `wt` (bf16
 // pairs, k_blocks * kKTile / 2 pairs of kPairBf16): w = dmin * mn + d * sc *
@@ -116,35 +104,6 @@ void DotsPortable(const std::uint16_t* wt, std::size_t pairs,
 #define GUFO_FAST_ISA "avx512f,avx512bw,avx512vl,avx512vbmi,avx512bf16,fma"
 #define GUFO_FAST __attribute__((target(GUFO_FAST_ISA)))
 
-bool HasFast() {
-  static const bool has = __builtin_cpu_supports("avx512f") &&
-                          __builtin_cpu_supports("avx512bw") &&
-                          __builtin_cpu_supports("avx512vbmi") &&
-                          __builtin_cpu_supports("avx512bf16");
-  return has;
-}
-
-// Byte permutations from a 64-byte run of codes (8 inputs l of one half and
-// group: low nibbles in `lo`, high in `hi`; lo[l * 8 + b] is row 2b's code,
-// hi[l * 8 + b] row 2b + 1's) to pairs (l, l + 1) per row: byte
-// q * 32 + r * 2 + s is row r's code of input 2q + s, for pairs q = 0, 1
-// (kPermLow) and 2, 3 (kPermHigh).
-struct Perms {
-  alignas(64) std::uint8_t low[64];
-  alignas(64) std::uint8_t high[64];
-  Perms() {
-    for (int q = 0; q < 4; ++q) {
-      for (int r = 0; r < 16; ++r) {
-        for (int s = 0; s < 2; ++s) {
-          const int value = ((r & 1) != 0 ? 64 : 0) + (2 * q + s) * 8 + r / 2;
-          const int byte = (q % 2) * 32 + r * 2 + s;
-          (q < 2 ? low : high)[byte] = static_cast<std::uint8_t>(value);
-        }
-      }
-    }
-  }
-};
-
 // One pair's 16 rows: `codes` 32 bytes (row r's two codes at 2r, 2r + 1) to
 // bf16 pairs at `dst`.
 GUFO_FAST inline void StorePair(__m128i codes_a, __m128i codes_b, __m512 step_a,
@@ -159,7 +118,7 @@ GUFO_FAST inline void StorePair(__m128i codes_a, __m128i codes_b, __m512 step_a,
 
 GUFO_FAST void UnpackTileFast(const std::uint8_t* matrix, std::size_t k_blocks,
                               std::size_t tile, std::uint16_t* wt) {
-  static const Perms perms;
+  static const q4nx_tile::Perms perms;
   const __m512i perm_low = _mm512_load_si512(perms.low);
   const __m512i perm_high = _mm512_load_si512(perms.high);
   const __m512i nibble = _mm512_set1_epi8(0x0F);
@@ -278,10 +237,6 @@ GUFO_FAST void DotsFast(const std::uint16_t* wt, std::size_t pairs,
 }
 #undef GUFO_FAST
 #undef GUFO_FAST_ISA
-#else
-bool HasFast() {
-  return false;
-}
 #endif
 
 class CpuExperts : public ExpertStep {
