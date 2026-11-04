@@ -318,8 +318,12 @@ public:
   // Throws when the sequence was not compiled.
   void Add(const std::string& sequence, Buffer& a0, Buffer& a1, Buffer& a2,
            Buffer& a3);
-  // Runs every call in order and waits for the last.
+  // Runs every call in order and waits for the last: Start(), then Wait().
   void Run();
+  // Submits the calls (the runlist's execute) without waiting.
+  void Start();
+  // Waits for the calls of the last Start().
+  void Wait();
 
 private:
   struct Impl;

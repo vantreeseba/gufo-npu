@@ -137,6 +137,65 @@ DispatchBenchResult BenchDispatch(const std::filesystem::path& kernel_dir,
           {"sync", 1, rounds, MicrosSince(start) / rounds});
     }
 
+    // start: the same loop, timing only run.start() (the submit).
+    // poll: start, then spin on the run's state until it leaves the
+    // in-flight states, then wait (which returns at once): the round trip a
+    // busy-polling host sees, against sync's blocking wait.
+    {
+      auto output = smoke.Buffer(kSmokeBytes);
+      auto run = SmokeRun(smoke, input, output);
+      double start_us = 0;
+      for (int i = 0; i < rounds; ++i) {
+        const auto start = Clock::now();
+        run.start();
+        start_us += MicrosSince(start);
+        run.wait();
+      }
+      result.timings.push_back({"start", 1, rounds, start_us / rounds});
+
+      const auto in_flight = [](ert_cmd_state s) {
+        return s == ERT_CMD_STATE_NEW || s == ERT_CMD_STATE_QUEUED ||
+               s == ERT_CMD_STATE_RUNNING || s == ERT_CMD_STATE_SUBMITTED;
+      };
+      // A run whose state does not move without wait() would spin forever:
+      // give up after a second.
+      constexpr double kGiveUpUs = 1e6;
+      const auto start = Clock::now();
+      for (int i = 0; i < rounds; ++i) {
+        const auto issued = Clock::now();
+        run.start();
+        while (in_flight(run.state())) {
+          if (MicrosSince(issued) > kGiveUpUs) {
+            result.error = "poll: the run's state did not change without wait";
+            return result;
+          }
+        }
+        run.wait();
+      }
+      result.timings.push_back(
+          {"poll", 1, rounds, MicrosSince(start) / rounds});
+      if (auto error = Verify(input, output, 1); !error.empty()) {
+        result.error = "poll: " + error;
+        return result;
+      }
+    }
+
+    // list1: a runlist of one run, execute + wait: how a decoder submits
+    // each chain sequence.
+    {
+      auto output = smoke.Buffer(kSmokeBytes);
+      auto run = SmokeRun(smoke, input, output);
+      xrt::runlist runlist = smoke.Runlist();
+      runlist.add(run);
+      const auto start = Clock::now();
+      for (int i = 0; i < rounds; ++i) {
+        runlist.execute();
+        runlist.wait();
+      }
+      result.timings.push_back(
+          {"list1", 1, rounds, MicrosSince(start) / rounds});
+    }
+
     for (const int depth : depths) {
       if (depth < 1) {
         continue;
