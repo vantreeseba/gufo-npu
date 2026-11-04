@@ -162,17 +162,30 @@ void accumulate(const q4nx_block<M, N> *A, const bf16 *const *B,
   }
 }
 
-// Input stage modes (RTP word 2).
+// Input stage modes (shape field prologue).
 constexpr int PROLOGUE_PLAIN = 0;    // slot: dim fp32
 constexpr int PROLOGUE_RESNORM = 1;  // slot: [H | D] fp32; w bf16 after slots
 constexpr int PROLOGUE_ACT = 2;      // dim bf16 per token, MAX_DIM apart
-// Output stage modes (RTP word 3).
+// Output stage modes (shape field epilogue).
 constexpr int EPILOGUE_STORE = 0;   // per token: M_TILE fp32
 constexpr int EPILOGUE_SWIGLU = 1;  // per token: 16 bf16 silu(g) * u, then pad
 constexpr int EPILOGUE_SWIGLU_SCALED = 2;  // the same times a per-round scale
-// RTP words (decode_gemv.py): the output stage, and the first of
-// the swiglu_scaled scales (round-major, then token).
-constexpr int RTP_EPILOGUE = 3;
+// RTP word 0 packs a call's shape: each field's first bit and width
+// (decode_gemv.py SHAPE_FIELDS), unpacked by gemv_shape in this order.
+struct ShapeField {
+  int first;
+  int bits;
+};
+constexpr ShapeField SHAPE_FIELDS[] = {
+    {GEMV_SHAPE_K_BLOCKS},   {GEMV_SHAPE_ROUNDS}, {GEMV_SHAPE_PROLOGUE},
+    {GEMV_SHAPE_EPILOGUE},   {GEMV_SHAPE_RES_PIECES}, {GEMV_SHAPE_ROW},
+    {GEMV_SHAPE_TOKENS},
+};
+constexpr int SHAPE_EPILOGUE = 3;  // index of the epilogue field
+constexpr int Field(int32_t word, ShapeField f) {
+  return (word >> f.first) & ((1 << f.bits) - 1);
+}
+// The first RTP word of the swiglu_scaled scales (round-major, then token).
 constexpr int RTP_SCALES = 7;
 
 constexpr float RMS_EPS = GEMV_RMS_EPS;
@@ -352,6 +365,15 @@ void gemv_block(const q4nx_block_t *w, float *raw, float *y_acc,
   event1();
 }
 
+// The call's shape, unpacked from RTP word 0 into SHAPE_FIELDS' order, once
+// per call (after the token arrives, so the word is current).
+void gemv_shape(const int32_t *rtp, int32_t *shape) {
+  const int32_t word = rtp[0];
+  for (int i = 0; i < int(sizeof(SHAPE_FIELDS) / sizeof(SHAPE_FIELDS[0])); i++) {
+    shape[i] = Field(word, SHAPE_FIELDS[i]);
+  }
+}
+
 // After each round's k loop, per token. EPILOGUE_STORE writes the fp32 sums;
 // with EPILOGUE_SWIGLU the core's rows are 16 gate rows then their 16 up
 // rows, and it writes silu(gate) * up as 16 bf16 at the start of the token's
@@ -360,7 +382,7 @@ void gemv_block(const q4nx_block_t *w, float *raw, float *y_acc,
 // RTP_SCALES + round * TOKENS + t (an MoE router weight; round = expert).
 void gemv_store(float *y, const float *y_acc, const int32_t *rtp, int round) {
   event0();
-  const int epilogue = rtp[RTP_EPILOGUE];
+  const int epilogue = Field(rtp[0], SHAPE_FIELDS[SHAPE_EPILOGUE]);
   for (int t = 0; t < TOKENS; t++) {
     float *yt = y + t * M_TILE;
     const float *acc = y_acc + t * M_TILE;

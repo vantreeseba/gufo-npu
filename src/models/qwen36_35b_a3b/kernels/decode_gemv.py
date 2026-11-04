@@ -116,6 +116,21 @@ GATHER_GROUP = 3
 UP_DEPTH = 1
 UP_GROUP = 3
 MAX_EXPERTS = MAX_DIM // EXPERT_FFN  # experts a down gather can concatenate
+# RTP word 0 holds a call's whole shape, packed (SHAPE_FIELDS: name, first
+# bit, bits), so a call rewrites one word per core instead of seven: each RTP
+# write costs ~64 ns of the sequence's critical path (32 cores per word). The
+# core unpacks it once per call (gemv_shape) into SHAPE_WORDS local words,
+# in this order. Words 1-6 are unused.
+SHAPE_FIELDS = [
+    ("k_blocks", 0, 6),
+    ("rounds", 6, 8),
+    ("prologue", 14, 2),
+    ("epilogue", 16, 2),
+    ("res_pieces", 18, 5),
+    ("row", 23, 2),
+    ("tokens", 25, 2),
+]
+SHAPE_WORDS = 8
 RTP_SCALES = 7  # first RTP word of the swiglu_scaled scales
 RTP_WORDS = RTP_SCALES + MAX_EXPERTS * TOKENS
 # Placeholder RTP values for the scales, which the host finds and rewrites:
@@ -126,9 +141,22 @@ STACK_SIZE = 8 * 1024
 KERNEL_SOURCE = Path(__file__).resolve().parent / "aie" / "decode_gemv.cc"
 
 bf16 = np.dtype[bfloat16]
-# k blocks, rounds, input stage, output stage, residual pieces, core row,
-# tokens, then the swiglu_scaled scales.
+# The packed shape (word 0), then the swiglu_scaled scales from RTP_SCALES.
 RTP_TY = np.ndarray[(RTP_WORDS,), np.dtype[np.int32]]
+SHAPE_TY = np.ndarray[(SHAPE_WORDS,), np.dtype[np.int32]]
+SHAPE = {name: i for i, (name, _, _) in enumerate(SHAPE_FIELDS)}
+assert SHAPE["epilogue"] == 3 and len(SHAPE) <= SHAPE_WORDS  # decode_gemv.cc
+
+
+def _shape_word(**fields):
+    """A call's shape packed into RTP word 0 (SHAPE_FIELDS)."""
+    word = 0
+    for name, first, bits in SHAPE_FIELDS:
+        value = fields[name]
+        if not 0 <= value < (1 << bits):
+            raise ValueError(f"shape field {name}={value} does not fit {bits} bits")
+        word |= value << first
+    return word
 
 PROLOGUES = {"plain": 0, "resnorm": 1, "act": 2}
 EPILOGUES = {"store": 0, "swiglu": 1, "swiglu_scaled": 2}
@@ -159,6 +187,10 @@ def _kernels():
             f"-DGEMV_HIDDEN={HIDDEN}",
             f"-DGEMV_TOKENS={TOKENS}",
             f"-DGEMV_SLOT={SLOT}",
+            *(
+                f"-DGEMV_SHAPE_{name.upper()}={first},{bits}"
+                for name, first, bits in SHAPE_FIELDS
+            ),
             # Without it the bf16 mmul emulation runs about 8x slower.
             "-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16",
         ],
@@ -169,7 +201,9 @@ def _kernels():
     residual_out = bind("gemv_residual_out", [y_ty, x_ty, np.int32, np.int32])
     zero = bind("gemv_zero", [y_acc_ty])
     store = bind("gemv_store", [y_ty, y_acc_ty, RTP_TY, np.int32])
+    shape = bind("gemv_shape", [RTP_TY, SHAPE_TY])
     kernels = dict(
+        shape=shape,
         block=block,
         prep=prep,
         residual=residual,
@@ -221,26 +255,40 @@ class _Array:
         y_col_ty = np.ndarray[(ROWS, TOKENS * M_TILE), np.dtype[np.float32]]
         shims = [Tile(j, 0) for j in range(COLS)]
 
-        def body(x, w_in, y_out, k_zero, k_block, k_store, y_acc, sums, rtp):
-            for rnd in range_(rtp[1]):
+        def body(x, w_in, y_out, k_zero, k_block, k_store, y_acc, sums, rtp, shape):
+            for rnd in range_(shape[SHAPE["rounds"]]):
                 k_zero(y_acc)
-                for kb in range_(rtp[0]):
+                for kb in range_(shape[SHAPE["k_blocks"]]):
                     w = w_in.acquire(1)
-                    k_block(w, x, y_acc, sums, kb, rtp[2], rtp[6])
+                    k_block(w, x, y_acc, sums, kb, shape[SHAPE["prologue"]], shape[SHAPE["tokens"]])
                     w_in.release(1)
                 y = y_out.acquire(1)
                 k_store(y, y_acc, rtp, rnd)
                 y_out.release(1)
 
         # The sequence writes the RTP before it sends the token, so it is
-        # current once the token arrives.
+        # current once the token arrives; the core unpacks the call's shape
+        # from word 0 then (gemv_shape).
         def core_fn(
-            x_in, w_in, y_out, k_residual, k_prep, k_zero, k_block, k_store, y_acc, sums, rtp
+            x_in,
+            w_in,
+            y_out,
+            k_shape,
+            k_residual,
+            k_prep,
+            k_zero,
+            k_block,
+            k_store,
+            y_acc,
+            sums,
+            rtp,
+            shape,
         ):
             x = x_in.acquire(1)
-            k_residual(x, rtp[0], rtp[2], rtp[6])
-            k_prep(x, sums, rtp[0], rtp[2], rtp[6])
-            body(x, w_in, y_out, k_zero, k_block, k_store, y_acc, sums, rtp)
+            k_shape(rtp, shape)
+            k_residual(x, shape[SHAPE["k_blocks"]], shape[SHAPE["prologue"]], shape[SHAPE["tokens"]])
+            k_prep(x, sums, shape[SHAPE["k_blocks"]], shape[SHAPE["prologue"]], shape[SHAPE["tokens"]])
+            body(x, w_in, y_out, k_zero, k_block, k_store, y_acc, sums, rtp, shape)
             x_in.release(1)
 
         # The residual column's cores first send their quarter of H + D (RTP
@@ -249,6 +297,7 @@ class _Array:
             x_in,
             w_in,
             y_out,
+            k_shape,
             k_residual,
             k_residual_out,
             k_prep,
@@ -258,15 +307,17 @@ class _Array:
             y_acc,
             sums,
             rtp,
+            shape,
         ):
             x = x_in.acquire(1)
-            k_residual(x, rtp[0], rtp[2], rtp[6])
-            for piece in range_(rtp[4]):
+            k_shape(rtp, shape)
+            k_residual(x, shape[SHAPE["k_blocks"]], shape[SHAPE["prologue"]], shape[SHAPE["tokens"]])
+            for piece in range_(shape[SHAPE["res_pieces"]]):
                 y = y_out.acquire(1)
-                k_residual_out(y, x, rtp[5], piece)
+                k_residual_out(y, x, shape[SHAPE["row"]], piece)
                 y_out.release(1)
-            k_prep(x, sums, rtp[0], rtp[2], rtp[6])
-            body(x, w_in, y_out, k_zero, k_block, k_store, y_acc, sums, rtp)
+            k_prep(x, sums, shape[SHAPE["k_blocks"]], shape[SHAPE["prologue"]], shape[SHAPE["tokens"]])
+            body(x, w_in, y_out, k_zero, k_block, k_store, y_acc, sums, rtp, shape)
             x_in.release(1)
 
         of_x = ObjectFifo(x_ty, name="x", depth=1)
@@ -296,9 +347,16 @@ class _Array:
                     Buffer(type=y_acc_ty, name=f"yacc_{i}_{j}"),
                     Buffer(type=sums_ty, name=f"sums_{i}_{j}"),
                     rtp,
+                    Buffer(type=SHAPE_TY, name=f"shape_{i}_{j}"),
                 ]
                 kernels = [k["prep"], k["zero"], k["block"], k["store"]]
-                args = [of_x.cons(), w_cores[i].cons(), y_cores[i].prod(), k["residual"]]
+                args = [
+                    of_x.cons(),
+                    w_cores[i].cons(),
+                    y_cores[i].prod(),
+                    k["shape"],
+                    k["residual"],
+                ]
                 if j == RES_COL:
                     fn = residual_core_fn
                     args.append(k["residual_out"])
@@ -328,9 +386,9 @@ class _Region:
 def _emit_call(call, tokens, X, W, Y, R, arr, written):
     """One call's part of a runtime sequence: X, W, Y and R are _Regions,
     `call` a variant's (dim, rows, input, output, Y token stride, gather,
-    experts). `written` holds each core's RTP words 0-6 as the sequence last
-    wrote them (None before the first call); only the words that change are
-    written, and `written` is updated. A swiglu_scaled call always writes its
+    experts). `written` holds each core's packed shape word (RTP word 0) as
+    the sequence last wrote it (None before the first call); it is written
+    only when it changes, and `written` is updated. A swiglu_scaled call always writes its
     scale placeholders (the host rewrites them per call).
 
     Every call ends with all its tasks awaited, so a call that follows in
@@ -480,19 +538,19 @@ def _emit_call(call, tokens, X, W, Y, R, arr, written):
         for g in window:
             g.finish()
 
-    words = (
-        k_blocks,
-        rounds,
-        PROLOGUES[prologue],
-        EPILOGUES[epilogue],
-        RES_PIECES if prologue == "resnorm" else 0,
-    )
     for c, (rtp, row) in enumerate(zip(arr.rtps, arr.rtp_rows)):
-        core_words = words + (row, tokens)
-        for word, value in enumerate(core_words):
-            if written[c] is None or written[c][word] != value:
-                rtp[word] = value
-        written[c] = core_words
+        word = _shape_word(
+            k_blocks=k_blocks,
+            rounds=rounds,
+            prologue=PROLOGUES[prologue],
+            epilogue=EPILOGUES[epilogue],
+            res_pieces=RES_PIECES if prologue == "resnorm" else 0,
+            row=row,
+            tokens=tokens,
+        )
+        if written[c] != word:
+            rtp[0] = word
+        written[c] = word
         # A rounds gather writes each round's scales itself, just before
         # that round's weights (gather_sequence).
         if epilogue == "swiglu_scaled" and gather != "rounds":
