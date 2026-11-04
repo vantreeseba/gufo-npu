@@ -6,14 +6,16 @@
 #include "core/gguf.hpp"
 #include "models/qwen35/config.hpp"
 #include "models/qwen35/decoder.hpp"
-#include "models/qwen35/npu_decoder.hpp"
+#include "models/qwen35/generate.hpp"
 #include "models/qwen35/prompt_cache.hpp"
 #include "models/qwen35/state_capture.hpp"
+#include "models/qwen35_2b/npu_decoder.hpp"
 
-// Qwen3.5 prompt processing (prefill) on the NPU. A chunk of up to
-// npu::kGemmChunk prompt tokens goes through each layer at once: its matrix
-// products run as bfp16 GEMMs on the NPU (kernels/designs/bfp16_gemm.py; the
-// weights are read once per chunk), and the CPU runs the norms, residual adds
+// Qwen3.5-2B prompt processing (prefill) on the NPU, on the 2B's own GEMM
+// program (src/models/qwen35_2b/kernels/prefill_gemm.py). A chunk of up to
+// gufo_npu::npu::kGemmMaxChunk prompt tokens goes through each layer at once:
+// its matrix products run as bfp16 GEMMs on the NPU (the weights are read
+// once per chunk), and the CPU runs the norms, residual adds
 // and SwiGLU, the DeltaNet conv and recurrence over the chunk (value heads in
 // parallel) and causal attention over the cache plus the chunk (heads and
 // query blocks in parallel). The weights are the decoder's q4nx weights,
@@ -21,11 +23,18 @@
 //
 // It fills the same DecodeState NpuDecoder decodes from (conv windows,
 // DeltaNet states, KV caches, position), and the MTP layer's cache.
-namespace gufo_npu::qwen35 {
+namespace gufo_npu::qwen35_2b {
+
+using qwen35::Config;
+using qwen35::DecodeState;
+using qwen35::PromptCacheModel;
+using qwen35::PromptPrefill;
+using qwen35::StateCapture;
 
 class NpuPrefill {
 public:
-  // Keeps pointers into `file`, which must outlive it.
+  // Keeps pointers into `file`, which must outlive it. Loads the 2B's
+  // prefill program (npu::kPrefillName) from kernel_dir.
   NpuPrefill(const gguf::File& file, const std::filesystem::path& kernel_dir);
   ~NpuPrefill();
   NpuPrefill(const NpuPrefill&) = delete;
@@ -78,4 +87,4 @@ PromptPrefill PrefillPrompt(NpuPrefill& prefill);
 // `prefill` from kMinPrefillPrompt tokens, `decoder` below that.
 PromptCacheModel MakePromptCacheModel(NpuDecoder& decoder, NpuPrefill& prefill);
 
-}  // namespace gufo_npu::qwen35
+}  // namespace gufo_npu::qwen35_2b

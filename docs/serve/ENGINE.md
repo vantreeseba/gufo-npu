@@ -12,9 +12,9 @@ architecture and shapes:
 
 | GGUF | Package | Decoder | Prompt processing |
 |---|---|---|---|
-| `qwen35`, hidden 2,048 | Qwen3.5-2B | family `qwen35::NpuDecoder` | family `qwen35::NpuPrefill` |
+| `qwen35`, hidden 2,048 | Qwen3.5-2B | `qwen35_2b::NpuDecoder` | `qwen35_2b::NpuPrefill` |
 | `qwen35`, hidden 2,560 | Qwen3.5-4B | `qwen35_4b::NpuDecoder` | `qwen35_4b::NpuPrefill` |
-| `qwen35moe`, hidden 2,048 | Qwen3.6-35B-A3B | family `qwen35::NpuDecoder` (MoE) | `qwen36_35b_a3b::NpuPrefill` (experts on the CPU) |
+| `qwen35moe`, hidden 2,048 | Qwen3.6-35B-A3B | `qwen36_35b_a3b::NpuDecoder` | `qwen36_35b_a3b::NpuPrefill` (experts on the CPU) |
 
 Other GGUFs are refused on the NPU (`--device cpu` runs any model the CPU
 reference reads, greedy and slow; it is there for tests).

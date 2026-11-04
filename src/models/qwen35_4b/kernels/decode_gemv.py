@@ -1,7 +1,8 @@
 """Qwen3.5-4B's q4nx decode GEMV on the whole array: y (rows) = W (rows x dim)
 x, for one or two tokens per weight read (two verify a speculative draft).
 
-Copied from kernels/designs/q4nx_gemv.py (Qwen3.5-2B) and built with the 4B's
+Copied from the 2B's q4nx GEMV design (now
+src/models/qwen35_2b/kernels/decode_gemv.py) and built with the 4B's
 geometry (decode_gemv_variants.py: hidden 2560, longest input 9216) into its own xclbin,
 so changes here cannot reach the 2B's NPU program. Differences: the geometry,
 a smaller core stack (the 4B's token buffer is 46 KB), and partial last

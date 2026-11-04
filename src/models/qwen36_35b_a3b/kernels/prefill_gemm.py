@@ -2,7 +2,7 @@
 weights as bfp16ebs8 in flm.GEMM's packed order, written per prompt by the
 dequant design (prefill_dequant.py) from the decoder's q4nx buffers.
 
-The same configuration as the 2B's kernels/designs/bfp16_gemm.py (IRON's
+The same configuration as the 2B's prefill GEMM (src/models/qwen35_2b/kernels/prefill_gemm.py) (IRON's
 flm.GEMM and the fused_mm kernel, Apache-2.0: 4 rows x 8 columns, 64 x 64
 output tiles, k tiles of 512 held 128 at a time), in its own xclbin
 (qwen36_35b_a3b_prefill) with the 35B's shapes (prefill_gemm_variants.py).

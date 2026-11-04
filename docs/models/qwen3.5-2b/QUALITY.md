@@ -29,7 +29,7 @@ prompts (chat template, code, prose; 73 tokens). Measured 2026-10-27.
 
 ## NPU op tests
 
-`q4nx_gemv_test` (CTest label `npu`): every GEMV variant with random weights
+`qwen35_decode_gemv_test` (CTest label `npu`): every GEMV variant with random weights
 and inputs in the input/output stages it is built for, against a
 double-precision reference over the same packed weights and the same bf16
 operand; then all of them again chained in one runlist. Pass: relative L2
@@ -146,7 +146,7 @@ proposed; acceptance per prompt and vocabulary size is in BENCHMARKS.md.
 ## Determinism
 
 Greedy output on the NPU must be the same on every run.
-`q4nx_gemv_chain_test` (label `npu`) runs one decoder layer's chain of
+`qwen35_decode_gemv_chain_test` (label `npu`) runs one decoder layer's chain of
 GEMVs 60,000 times with the same inputs, alternating 1 and 2 tokens, and
 requires every output to be bit-identical.
 
@@ -163,7 +163,7 @@ not change the output (175 runs).
 
 ## NPU prefill (Phase 4)
 
-`bfp16_gemm_test` (label `npu`): the prefill GEMM at every projection shape
+`qwen35_prefill_gemm_test` (label `npu`): the prefill GEMM at every projection shape
 of the 2B and every chunk size (256, 512, 1024 prompt tokens per call), with
 random q4nx weights and bf16 activations, against a double-precision product
 on the CPU. Pass: relative L2 error < 1e-2 against the q4nx weights (the

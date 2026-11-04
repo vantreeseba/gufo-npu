@@ -26,14 +26,14 @@
 namespace gufo_npu::qwen36_35b_a3b {
 namespace {
 
-using npu::Batch;
-using npu::Buffer;
+using gufo_npu::npu::Batch;
+using gufo_npu::npu::Buffer;
 using qwen35::Config;
 using qwen35::DecodeState;
 using qwen35::Floats;
 using qwen35::PrefillMixer;
 using qwen35::PrefillMixerWeights;
-using DeviceMatrix = qwen35::NpuDecoder::DeviceMatrix;
+using DeviceMatrix = NpuDecoder::DeviceMatrix;
 using vec::Dot;
 using vec::RmsNorm;
 
@@ -150,7 +150,7 @@ struct NpuPrefill::Impl {
   int differences = 0;
   double gap = 0;
 
-  Impl(const gguf::File& file, qwen35::NpuDecoder& decoder,
+  Impl(const gguf::File& file, NpuDecoder& decoder,
        const std::filesystem::path& kernel_dir, ExpertBackend experts_on)
       : config(decoder.config()),
         device(kernel_dir, profile),
@@ -621,7 +621,7 @@ struct NpuPrefill::Impl {
   }
 };
 
-NpuPrefill::NpuPrefill(const gguf::File& file, qwen35::NpuDecoder& decoder,
+NpuPrefill::NpuPrefill(const gguf::File& file, NpuDecoder& decoder,
                        const std::filesystem::path& kernel_dir,
                        ExpertBackend experts)
     : impl_(std::make_unique<Impl>(file, decoder, kernel_dir, experts)) {}
@@ -693,7 +693,7 @@ qwen35::PromptPrefill PrefillPrompt(NpuPrefill& prefill) {
   };
 }
 
-qwen35::PromptCacheModel MakePromptCacheModel(qwen35::NpuDecoder& decoder,
+qwen35::PromptCacheModel MakePromptCacheModel(NpuDecoder& decoder,
                                               NpuPrefill& prefill) {
   const Config& c = prefill.config();
   const int min_prefill = MinPrefillPrompt(prefill.experts());

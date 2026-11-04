@@ -18,13 +18,12 @@
 // down GEMM, and the sum into the residual on the CPU.
 namespace gufo_npu::qwen36_35b_a3b {
 
-// `arenas`: per layer, the decoder's expert arena (npu::ExpertArena of
-// `arena_experts` experts, the shared one last). `max_tokens`: the most
+// `arenas`: per layer, the decoder's expert arena (gufo_npu::npu::ExpertArena
+// of `arena_experts` experts, the shared one last). `max_tokens`: the most
 // tokens a pass has. The device, the pool and the arenas must outlive it.
-std::unique_ptr<ExpertStep> MakeNpuExperts(PrefillDevice& device,
-                                           BurstPool& pool,
-                                           std::vector<npu::Buffer> arenas,
-                                           std::size_t arena_experts,
-                                           std::size_t max_tokens);
+std::unique_ptr<ExpertStep> MakeNpuExperts(
+    PrefillDevice& device, BurstPool& pool,
+    std::vector<gufo_npu::npu::Buffer> arenas, std::size_t arena_experts,
+    std::size_t max_tokens);
 
 }  // namespace gufo_npu::qwen36_35b_a3b

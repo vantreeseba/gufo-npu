@@ -9,11 +9,12 @@
 #include <filesystem>
 
 #include "../qwen35/prompt_cache_conversation.hpp"
-#include "models/qwen35/npu_decoder.hpp"
-#include "models/qwen35/npu_prefill.hpp"
+#include "models/qwen35_2b/npu_decoder.hpp"
+#include "models/qwen35_2b/npu_prefill.hpp"
 
 int main(int argc, char** argv) {
   namespace qwen35 = gufo_npu::qwen35;
+  namespace qwen35_2b = gufo_npu::qwen35_2b;
   if (argc != 2) {
     std::fprintf(stderr, "usage: qwen35_prompt_cache_test <kernel-dir>\n");
     return 2;
@@ -28,15 +29,15 @@ int main(int argc, char** argv) {
     return 77;
   }
   const auto file = gufo_npu::gguf::File::Open(path);
-  qwen35::NpuDecoder npu(*file, argv[1]);
-  qwen35::NpuPrefill prefill(*file, argv[1]);
+  qwen35_2b::NpuDecoder npu(*file, argv[1]);
+  qwen35_2b::NpuPrefill prefill(*file, argv[1]);
   prompt_cache_test::Model m;
   m.name = "Qwen3.5-2B";
   m.file = file.get();
   m.layers = npu.config().layers;
   m.hidden = npu.config().hidden;
-  m.cache_model = [&] { return qwen35::MakePromptCacheModel(npu, prefill); };
-  m.plain = qwen35::PrefillPrompt(prefill);
+  m.cache_model = [&] { return qwen35_2b::MakePromptCacheModel(npu, prefill); };
+  m.plain = qwen35_2b::PrefillPrompt(prefill);
   m.decode_path = [&](const std::vector<int>& p, qwen35::DecodeState& s,
                       qwen35::DecodeState* mtp, float* hidden) {
     const int k = static_cast<int>(p.size()) - 0;
@@ -57,8 +58,8 @@ int main(int argc, char** argv) {
                    const std::vector<int>& stop,
                    const qwen35::PromptPrefill& hook,
                    qwen35::SpeculativeStats* stats) {
-    return qwen35::SpeculativeGenerate(npu, prompt, max_tokens, stop, true, {},
-                                       stats, hook);
+    return qwen35_2b::SpeculativeGenerate(npu, prompt, max_tokens, stop, true,
+                                          {}, stats, hook);
   };
   m.new_state = [&] { return npu.NewState(); };
   m.new_mtp_state = [&] { return npu.NewMtpState(); };

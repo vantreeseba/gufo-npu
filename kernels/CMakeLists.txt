@@ -17,19 +17,10 @@ gufo_npu_add_kernel(NAME smoke_add_one DESIGN designs/smoke_add_one.py MODEL com
 gufo_npu_add_kernel(NAME bw_memcpy DESIGN designs/bw_memcpy.py MODEL common)
 gufo_npu_add_kernel(NAME bw_read DESIGN designs/bw_read.py MODEL common)
 
-# Decode GEMVs: one core program and xclbin for the 2B's and the 35B's calls,
-# including the 35B's MoE gathers (designs/q4nx_gemv_variants.py lists the
-# shapes; each sequence as an instruction ELF and as raw instruction words).
-gufo_npu_add_kernel(NAME q4nx_gemv DESIGN designs/q4nx_gemv.py
-                    SOURCES aie/q4nx_gemv.cc
-                    MODEL qwen35_2b qwen36_35b_a3b)
-
-# Prefill GEMMs (Qwen3.5-2B; designs/bfp16_gemm_variants.py).
-gufo_npu_add_kernel(NAME bfp16_gemm DESIGN designs/bfp16_gemm.py
-                    MODEL qwen35_2b)
-
 # Per-model kernel packages (src/models/<model>/kernels), registered in this
 # scope so they share the settings above.
+add_subdirectory("${PROJECT_SOURCE_DIR}/src/models/qwen35_2b/kernels"
+                 "${CMAKE_CURRENT_BINARY_DIR}/qwen35_2b")
 add_subdirectory("${PROJECT_SOURCE_DIR}/src/models/qwen35_4b/kernels"
                  "${CMAKE_CURRENT_BINARY_DIR}/qwen35_4b")
 add_subdirectory("${PROJECT_SOURCE_DIR}/src/models/qwen36_35b_a3b/kernels"

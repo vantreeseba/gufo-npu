@@ -114,7 +114,7 @@ int main(int argc, char** argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   const std::string dir = argv[1];
   const int n_experts = argc > 2 ? std::atoi(argv[2]) : 16;
-  npu::HwContext hw(dir, "q4nx_gemv");
+  npu::HwContext hw(dir, "qwen36_35b_a3b_decode");
   xrt::kernel legacy(*hw.context, hw.kernel_name);
   std::mt19937 rng(5);
   std::normal_distribution<float> wd(0.f, 0.02f), ad(0.f, 1.f);
@@ -183,9 +183,9 @@ int main(int argc, char** argv) {
   Gather up(
       hw, legacy,
       dir +
-          "/q4nx_gemv_k2048_n9216_resnorm_swiglu_scaled_rounds9_t1.insts.bin");
+          "/qwen36_35b_a3b_decode_k2048_n9216_resnorm_swiglu_scaled_rounds9_t1.insts.bin");
   Gather down(hw, legacy,
-              dir + "/q4nx_gemv_k4608_n2048_act_store_k9_t1.insts.bin");
+              dir + "/qwen36_35b_a3b_decode_k4608_n2048_act_store_k9_t1.insts.bin");
   std::printf(
       "gate+up gather: %zu words, %zu weight sites, %zu scale words; down "
       "gather: %zu words, %zu sites\n",
@@ -323,10 +323,10 @@ int main(int argc, char** argv) {
     for (int l = 0; l < 40; ++l) {
       ups40.emplace_back(hw, legacy,
                          dir +
-                             "/q4nx_gemv_k2048_n9216_resnorm_swiglu_scaled_"
+                             "/qwen36_35b_a3b_decode_k2048_n9216_resnorm_swiglu_scaled_"
                              "rounds9_t1.insts.bin");
       downs40.emplace_back(
-          hw, legacy, dir + "/q4nx_gemv_k4608_n2048_act_store_k9_t1.insts.bin");
+          hw, legacy, dir + "/qwen36_35b_a3b_decode_k4608_n2048_act_store_k9_t1.insts.bin");
       all.add(run_of(ups40.back(), x, act, r));
       all.add(run_of(downs40.back(), act, y, scratch));
     }
@@ -369,9 +369,10 @@ int main(int argc, char** argv) {
       d.instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
       return d;
     };
-    Dense in8192 = dense_of("q4nx_gemv_k2048_n8192_resnorm_store_t1");
-    xrt::bo w_in = hw.Buffer(size_t(8192) * 2048 / 256 * 4736 / 32);
-    xrt::bo y_in = hw.Buffer((npu::kGemvSlot + 8192) * 4 + 8192 * 4);
+    Dense in12288 =
+        dense_of("qwen36_35b_a3b_decode_k2048_n12288_resnorm_store_t1");
+    xrt::bo w_in = hw.Buffer(size_t(12288) * 2048 / 256 * 4736 / 32);
+    xrt::bo y_in = hw.Buffer((npu::kGemvSlot + 12288) * 4 + 12288 * 4);
     auto dense_run = [&](Dense& d) {
       xrt::run run(legacy);
       run.set_arg(0, npu::kOpcodeRun);
@@ -390,30 +391,30 @@ int main(int argc, char** argv) {
     for (int l = 0; l < 40; ++l) {
       gu.emplace_back(hw, legacy,
                       dir +
-                          "/q4nx_gemv_k2048_n9216_resnorm_swiglu_scaled_"
+                          "/qwen36_35b_a3b_decode_k2048_n9216_resnorm_swiglu_scaled_"
                           "rounds9_t1.insts.bin");
       gd.emplace_back(hw, legacy,
-                      dir + "/q4nx_gemv_k4608_n2048_act_store_k9_t1.insts.bin");
+                      dir + "/qwen36_35b_a3b_decode_k4608_n2048_act_store_k9_t1.insts.bin");
       if (l == 0) {
         one.add(run_of(gu.back(), x, act, r));
         one.add(run_of(gd.back(), act, y, scratch));
-        one.add(dense_run(in8192));
+        one.add(dense_run(in12288));
       }
       forty.add(run_of(gu.back(), x, act, r));
       forty.add(run_of(gd.back(), act, y, scratch));
-      forty.add(dense_run(in8192));
+      forty.add(dense_run(in12288));
     }
     std::printf(
-        "chain [gate+up gather, down gather, dense 8192x2048 resnorm], legacy "
+        "chain [gate+up gather, down gather, dense 12288x2048 resnorm], legacy "
         "flow: one submission %.1f us; "
         "40 in one runlist %.2f ms (%.1f us per layer)\n",
         per(one), per(forty) / 1e3, per(forty) / 40);
     Gather u2(hw, legacy,
               dir +
-                  "/q4nx_gemv_k2048_n9216_resnorm_swiglu_scaled_rounds9_t2."
+                  "/qwen36_35b_a3b_decode_k2048_n9216_resnorm_swiglu_scaled_rounds9_t2."
                   "insts.bin");
     Gather d2(hw, legacy,
-              dir + "/q4nx_gemv_k4608_n2048_act_store_k9_t2.insts.bin");
+              dir + "/qwen36_35b_a3b_decode_k4608_n2048_act_store_k9_t2.insts.bin");
     xrt::runlist two(*hw.context);
     two.add(run_of(u2, x, act, r));
     two.add(run_of(d2, act, y, scratch));
@@ -442,10 +443,10 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 20; ++i) {
       gu.emplace_back(hw, legacy,
                       dir +
-                          "/q4nx_gemv_k2048_n9216_resnorm_swiglu_scaled_"
+                          "/qwen36_35b_a3b_decode_k2048_n9216_resnorm_swiglu_scaled_"
                           "rounds9_t1.insts.bin");
       gd.emplace_back(hw, legacy,
-                      dir + "/q4nx_gemv_k4608_n2048_act_store_k9_t1.insts.bin");
+                      dir + "/qwen36_35b_a3b_decode_k4608_n2048_act_store_k9_t1.insts.bin");
       lu.add(run_of(gu.back(), x, act, r));
       ld.add(run_of(gd.back(), act, y, scratch));
     }
@@ -454,9 +455,9 @@ int main(int argc, char** argv) {
         "gate+up gather: %.1f us per call (%.1f GB/s); down gather: %.1f us "
         "(%.1f GB/s)\n",
         tu, 9 * up_bytes / tu / 1e3, td, 9 * down_bytes / td / 1e3);
-    for (const char* name : {"q4nx_gemv_k2048_n8192_resnorm_store_t1",
-                             "q4nx_gemv_k6144_n2048_act_store_t1",
-                             "q4nx_gemv_k2048_n2048_plain_store_t1"}) {
+    for (const char* name :
+         {"qwen36_35b_a3b_decode_k2048_n12288_resnorm_store_t1",
+          "qwen36_35b_a3b_decode_k4096_n2048_plain_store_t1"}) {
       npu::Sequence s(hw, dir, name);
       std::string n = name;
       const size_t dim = std::stoul(n.substr(n.find("_k") + 2)),
@@ -479,8 +480,8 @@ int main(int argc, char** argv) {
 
   // (a) one ELF run per expert matrix, 9 + 9 per layer, sub-BO weights.
   {
-    npu::Sequence su(hw, dir, "q4nx_gemv_k2048_n1024_resnorm_swiglu_t1");
-    npu::Sequence sd(hw, dir, "q4nx_gemv_k512_n2048_act_store_t1");
+    npu::Sequence su(hw, dir, "qwen36_35b_a3b_decode_k2048_n1024_resnorm_swiglu_t1");
+    npu::Sequence sd(hw, dir, "qwen36_35b_a3b_decode_k512_n2048_act_store_t1");
     std::vector<xrt::bo> subs;
     for (int e = 0; e < n_experts; ++e) {
       subs.emplace_back(arena, up_bytes, up_at(e));

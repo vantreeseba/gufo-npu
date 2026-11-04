@@ -18,7 +18,7 @@
 namespace gufo_npu::qwen36_35b_a3b {
 namespace {
 
-using npu::ExpertArena;
+using gufo_npu::npu::ExpertArena;
 
 constexpr std::size_t kHidden = 2048;
 constexpr std::size_t kFfn = 512;
@@ -298,7 +298,7 @@ public:
     act_.resize(max_tokens * std::min<std::size_t>(arena_experts, 9) * kFfn);
   }
 
-  void Prepare(int, const ExpertRouting&, npu::Batch&) override {}
+  void Prepare(int, const ExpertRouting&, gufo_npu::npu::Batch&) override {}
 
   void Run(int il, const ExpertRouting& routing, const std::uint16_t* x,
            float* h) override {

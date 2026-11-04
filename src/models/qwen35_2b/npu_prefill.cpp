@@ -1,4 +1,4 @@
-#include "models/qwen35/npu_prefill.hpp"
+#include "models/qwen35_2b/npu_prefill.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -22,25 +22,28 @@
 #include "core/simd.hpp"
 #include "core/vec.hpp"
 #include "models/qwen35/prefill_mixer.hpp"
+#include "models/qwen35_2b/npu/gemv.hpp"
 #include "npu/gemm.hpp"
 
-namespace gufo_npu::qwen35 {
+namespace gufo_npu::qwen35_2b {
+
+using namespace qwen35;  // NOLINT(google-build-using-namespace)
 namespace {
 
-using npu::Bfp16Gemm;
-using npu::GemmBuffer;
+using gufo_npu::npu::Bfp16Gemm;
+using gufo_npu::npu::GemmBuffer;
 using vec::Dot;
 using vec::RmsNorm;
 
-constexpr int kMaxChunk = static_cast<int>(npu::kGemmMaxChunk);
+constexpr int kMaxChunk = static_cast<int>(gufo_npu::npu::kGemmMaxChunk);
 
 // The model the chunk plan is chosen with, measured on the 2B (BENCHMARKS.md,
 // "Prefill GEMM" and "Where the time goes"): the GEMMs' throughput at each
-// chunk size of npu::kGemmChunks (a 256-row call runs at ~11 TFLOPS, a
-// 1,024-row one at ~17), and the CPU's time per token between them (~0.14 ms
+// chunk size of gufo_npu::npu::kGemmChunks (a 256-row call runs at ~11 TFLOPS,
+// a 1,024-row one at ~17), and the CPU's time per token between them (~0.14 ms
 // at 1k tokens: mixers, norms, conversions).
 constexpr double kGemmTflops[] = {11.0, 14.5, 17.0};
-static_assert(std::size(kGemmTflops) == std::size(npu::kGemmChunks));
+static_assert(std::size(kGemmTflops) == std::size(gufo_npu::npu::kGemmChunks));
 constexpr double kCpuSecondsPerToken = 0.14e-3;
 
 // One pass of a prefill: `lanes` chunks of `m` GEMM rows over `tokens`
@@ -60,7 +63,7 @@ struct Pass {
 std::vector<Pass> PlanPasses(int count, int max_lanes, double flops,
                              double cpu) {
   const auto npu = [&](std::size_t chunk) {
-    return flops * static_cast<double>(npu::kGemmChunks[chunk]) /
+    return flops * static_cast<double>(gufo_npu::npu::kGemmChunks[chunk]) /
            (kGemmTflops[chunk] * 1e12);
   };
   // best[r]: least time for the last r tokens, and the pass that starts it.
@@ -68,8 +71,8 @@ std::vector<Pass> PlanPasses(int count, int max_lanes, double flops,
   std::vector<Pass> first(static_cast<std::size_t>(count) + 1);
   for (int r = 1; r <= count; ++r) {
     best[r] = INFINITY;
-    for (std::size_t c = 0; c < std::size(npu::kGemmChunks); ++c) {
-      const int m = static_cast<int>(npu::kGemmChunks[c]);
+    for (std::size_t c = 0; c < std::size(gufo_npu::npu::kGemmChunks); ++c) {
+      const int m = static_cast<int>(gufo_npu::npu::kGemmChunks[c]);
       for (int lanes = 1; lanes <= max_lanes; ++lanes) {
         if (lanes > 1 && r <= (lanes - 1) * m) {
           continue;  // a lane would be empty
@@ -126,7 +129,7 @@ struct NpuPrefill::Impl {
   };
 
   Config config;
-  npu::GemmRuntime runtime;
+  gufo_npu::npu::GemmRuntime runtime;
   const gguf::TensorInfo* embed = nullptr;
   std::vector<Layer> layers;
 
@@ -145,7 +148,7 @@ struct NpuPrefill::Impl {
     int m = 0;         // GEMM rows (n padded to a chunk size)
     int position = 0;  // of the first
     std::unique_ptr<GemmBuffer> a, c;
-    npu::GemmCall call;
+    gufo_npu::npu::GemmCall call;
     std::size_t c_sync = 0;  // bytes of C to sync once the call is done
     Floats h;                // residual stream
     Floats normed;           // RMS(h) * attn_norm, for the DeltaNet gates
@@ -214,7 +217,7 @@ struct NpuPrefill::Impl {
   }
 
   Impl(const gguf::File& file, const std::filesystem::path& kernel_dir)
-      : config(ReadConfig(file)), runtime(kernel_dir) {
+      : config(ReadConfig(file)), runtime(kernel_dir, npu::kPrefillName) {
     const Config& cfg = config;
     if (cfg.experts != 0 || !cfg.tied_embeddings) {
       throw std::runtime_error(
@@ -252,8 +255,8 @@ struct NpuPrefill::Impl {
     std::size_t c_bytes = 0;
     auto grow = [&](const std::unique_ptr<Bfp16Gemm>& g) {
       if (g) {
-        a_bytes = std::max(a_bytes, g->a_bytes(npu::kGemmMaxChunk));
-        c_bytes = std::max(c_bytes, g->c_bytes(npu::kGemmMaxChunk));
+        a_bytes = std::max(a_bytes, g->a_bytes(gufo_npu::npu::kGemmMaxChunk));
+        c_bytes = std::max(c_bytes, g->c_bytes(gufo_npu::npu::kGemmMaxChunk));
       }
     };
     std::size_t in_rows = 0;
@@ -620,4 +623,4 @@ PromptCacheModel MakePromptCacheModel(NpuDecoder& decoder,
   return m;
 }
 
-}  // namespace gufo_npu::qwen35
+}  // namespace gufo_npu::qwen35_2b

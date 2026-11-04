@@ -1,11 +1,18 @@
 # Qwen3.5-2B
 
-Fast side-task model and bring-up target for the shared Qwen3.5/3.6 kernels.
-Dense hybrid: 24 layers (18 Gated DeltaNet + 6 gated full-attention, GQA 8/2,
+Fast side-task model and the family's bring-up target. Dense hybrid: 24 layers (18 Gated DeltaNet + 6 gated full-attention, GQA 8/2,
 head dim 256; DeltaNet 16 key / 16 value heads), hidden 2048, FFN 6144, vocab
 248,320, tied embeddings, one MTP layer
 ([config](https://huggingface.co/Qwen/Qwen3.5-2B/blob/main/config.json)).
 Est. ~1.1 GB of weights read per decoded token at ~4.5 bits per weight.
+
+It runs on its own NPU programs in its own package, `src/models/qwen35_2b/`:
+the decode GEMV `qwen35_2b_decode` (`kernels/decode_gemv.py`, a copy of the
+q4nx GEMV with only the 2B's shapes), the prefill GEMM `qwen35_2b_prefill`
+(`kernels/prefill_gemm.py`, IRON's `flm.GEMM`), and the NPU decoder and
+prefill wired to them. The CPU side (config, reference, `Decoder`/`Mixer`,
+prefill mixers, tokenizer, chat template, MTP draft vocabulary) is the
+Qwen3.5 family's shared code in `src/models/qwen35/`.
 
 Weights: Unsloth `Qwen3.5-2B-MTP-GGUF`, UD-Q4_K_XL, revision
 `e05864f8066d874d5f85aaff007ae57a2a7d1efe` (the BF16 file of the same

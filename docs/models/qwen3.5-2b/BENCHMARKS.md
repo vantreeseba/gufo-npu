@@ -382,7 +382,7 @@ gives the first logits, and decodes on from the filled state. Prompts under
 7 tokens skip prefill (see below).
 
 **Requirements.** `generate --device npu` now also loads
-`bfp16_gemm.xclbin` (built and installed with the other kernels) into a
+`qwen35_2b_prefill.xclbin` (built and installed with the other kernels) into a
 second hardware context, and keeps a bfp16 copy of the projection weights
 next to the decoder's q4nx copy: about **1.56 GB more pinned host memory**
 (memlock unlimited, as before) and ~2.7 s more at load.
@@ -397,10 +397,11 @@ Details in QUALITY.md.
 
 ### Prefill GEMM
 
-IRON's `flm.GEMM` design (`kernels/designs/bfp16_gemm.py`; A bf16, B the
+IRON's `flm.GEMM` design (`src/models/qwen35_2b/kernels/prefill_gemm.py`; A bf16, B the
 decoder's q4nx weights rounded to bfp16 and resident, C bf16), one xclbin in
 its own hardware context, one instruction sequence per (M, K, N).
-`bfp16_gemm_test`, best of 50 warm calls, alone on the NPU, 2026-10-27:
+`bfp16_gemm_test` (now `qwen35_prefill_gemm_test`), best of 50 warm calls,
+alone on the NPU, 2026-10-27:
 
 | Projection | K → N | M = 256 | M = 512 | M = 1024 |
 |---|---|---|---|---|

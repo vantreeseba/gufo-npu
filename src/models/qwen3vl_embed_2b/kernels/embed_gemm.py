@@ -1,8 +1,9 @@
 """Qwen3-VL-Embedding-2B's GEMM, a copy of the Qwen3.5-4B's prefill GEMM
-(src/models/qwen35_4b/kernels/prefill_gemm.py, itself kernels/designs/
-bfp16_gemm.py) built with this model's shapes (embed_gemm_variants.py) into
-its own xclbin (qwen3vl_embed_2b_gemm). The core program is the same; only
-the names and the instruction sequences differ.
+(src/models/qwen35_4b/kernels/prefill_gemm.py, itself a copy of
+src/models/qwen35_2b/kernels/prefill_gemm.py) built with this model's shapes
+(embed_gemm_variants.py) into its own xclbin (qwen3vl_embed_2b_gemm). The
+core program is the same; only the names and the instruction sequences
+differ.
 
 GEMM on the whole array: C (M x N, bf16) = A (M x K, bf16) x B, with B
 (K x N) the weights as bfp16ebs8 (9 bytes per 8 values), packed on the host

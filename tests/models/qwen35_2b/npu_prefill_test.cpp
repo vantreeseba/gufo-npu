@@ -1,4 +1,4 @@
-#include "models/qwen35/npu_prefill.hpp"
+#include "models/qwen35_2b/npu_prefill.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -16,7 +16,7 @@
 
 #include "core/gguf.hpp"
 #include "core/vec.hpp"
-#include "models/qwen35/npu_decoder.hpp"
+#include "models/qwen35_2b/npu_decoder.hpp"
 
 // Qwen3.5-2B prompt processing on the NPU (NpuPrefill: bfp16 GEMMs, batched
 // CPU mixers) against the decode path (NpuDecoder, two tokens per pass) over
@@ -45,6 +45,7 @@ namespace {
 
 namespace fs = std::filesystem;
 namespace qwen35 = gufo_npu::qwen35;
+namespace qwen35_2b = gufo_npu::qwen35_2b;
 using gufo_npu::qwen35::DecodeState;
 
 constexpr int kSteps = 16;  // teacher-forced decode steps after the prompt
@@ -179,7 +180,7 @@ FirstToken CompareFirst(const float* got, const float* want, int vocab,
   return f;
 }
 
-void Compare(qwen35::NpuDecoder& npu, qwen35::NpuPrefill& prefill,
+void Compare(qwen35_2b::NpuDecoder& npu, qwen35_2b::NpuPrefill& prefill,
              const std::string& name, const std::vector<int>& ids,
              Totals& totals) {
   const auto& c = npu.config();
@@ -306,12 +307,12 @@ int main(int argc, char** argv) {
   }
   const auto file = gufo_npu::gguf::File::Open(model);
   auto start = std::chrono::steady_clock::now();
-  qwen35::NpuDecoder npu(*file, argv[1]);
+  qwen35_2b::NpuDecoder npu(*file, argv[1]);
   const double decoder_s =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
           .count();
   start = std::chrono::steady_clock::now();
-  qwen35::NpuPrefill prefill(*file, argv[1]);
+  qwen35_2b::NpuPrefill prefill(*file, argv[1]);
   std::printf(
       "loaded the NPU decoder in %.1f s and the prefill weights in %.1f s\n",
       decoder_s,
@@ -361,14 +362,14 @@ int main(int argc, char** argv) {
     const auto prompt = ReadIds(fs::path(oracle) / "chat.ids.json");
     const std::vector<int> stop;  // none: always max_tokens
     constexpr int kTokens = 48;
-    const auto hook = qwen35::PrefillPrompt(prefill);
+    const auto hook = qwen35_2b::PrefillPrompt(prefill);
     qwen35::SpeculativeStats spec_stats;
-    const auto plain = qwen35::SpeculativeGenerate(npu, prompt, kTokens, stop,
-                                                   false, {}, nullptr, hook);
-    const auto spec = qwen35::SpeculativeGenerate(npu, prompt, kTokens, stop,
-                                                  true, {}, &spec_stats, hook);
+    const auto plain = qwen35_2b::SpeculativeGenerate(
+        npu, prompt, kTokens, stop, false, {}, nullptr, hook);
+    const auto spec = qwen35_2b::SpeculativeGenerate(
+        npu, prompt, kTokens, stop, true, {}, &spec_stats, hook);
     const auto unprefilled =
-        qwen35::SpeculativeGenerate(npu, prompt, kTokens, stop, false, {});
+        qwen35_2b::SpeculativeGenerate(npu, prompt, kTokens, stop, false, {});
     const bool same = plain == spec;
     std::size_t common = 0;
     while (common < plain.size() && common < unprefilled.size() &&

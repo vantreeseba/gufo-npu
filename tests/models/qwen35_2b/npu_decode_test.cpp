@@ -13,8 +13,8 @@
 
 #include "core/gguf.hpp"
 #include "models/qwen35/decoder.hpp"
-#include "models/qwen35/npu_decoder.hpp"
 #include "models/qwen35/q4nx_projections.hpp"
+#include "models/qwen35_2b/npu_decoder.hpp"
 
 // Qwen3.5-2B decoded on the NPU (NpuDecoder: chained GEMVs with norms,
 // residuals and SwiGLU on the device), teacher-forced on the oracle prompts,
@@ -27,6 +27,7 @@ namespace {
 
 namespace fs = std::filesystem;
 namespace qwen35 = gufo_npu::qwen35;
+namespace qwen35_2b = gufo_npu::qwen35_2b;
 
 // NPU vs the same q4nx weights on the CPU: top-1 agreement over all prompts,
 // and logits per prompt (the gap is mostly the bf16 rounding of each GEMV's
@@ -81,7 +82,7 @@ int main(int argc, char** argv) {
   }
   const auto file = gufo_npu::gguf::File::Open(model);
   const auto start = std::chrono::steady_clock::now();
-  qwen35::NpuDecoder npu(*file, argv[1]);
+  qwen35_2b::NpuDecoder npu(*file, argv[1]);
   std::printf(
       "packed and uploaded the NPU decoder in %.1f s\n",
       std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
@@ -140,10 +141,10 @@ int main(int argc, char** argv) {
     constexpr int kTokens = 48;
     qwen35::SpeculativeStats plain_stats;
     qwen35::SpeculativeStats spec_stats;
-    const auto plain = qwen35::SpeculativeGenerate(npu, prompt, kTokens, stop,
-                                                   false, {}, &plain_stats);
-    const auto spec = qwen35::SpeculativeGenerate(npu, prompt, kTokens, stop,
-                                                  true, {}, &spec_stats);
+    const auto plain = qwen35_2b::SpeculativeGenerate(
+        npu, prompt, kTokens, stop, false, {}, &plain_stats);
+    const auto spec = qwen35_2b::SpeculativeGenerate(npu, prompt, kTokens, stop,
+                                                     true, {}, &spec_stats);
     const bool same = plain == spec;
     failures += same ? 0 : 1;
     std::printf(

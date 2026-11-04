@@ -1,7 +1,7 @@
-"""Qwen3.5-4B's prefill GEMM, a copy of kernels/designs/bfp16_gemm.py (the
-2B's) built with the 4B's shapes (prefill_gemm_variants.py) into its own xclbin
-(qwen35_4b_prefill). The core program is the same; only the names and the
-instruction sequences differ.
+"""Qwen3.5-4B's prefill GEMM, a copy of the 2B's
+(src/models/qwen35_2b/kernels/prefill_gemm.py) built with the 4B's shapes
+(prefill_gemm_variants.py) into its own xclbin (qwen35_4b_prefill). The core
+program is the same; only the names and the instruction sequences differ.
 
 Prefill GEMM on the whole array: C (M x N, bf16) = A (M x K, bf16) x B, with
 B (K x N) the weights as bfp16ebs8 (9 bytes per 8 values), packed on the host

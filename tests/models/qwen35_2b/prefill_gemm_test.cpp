@@ -10,6 +10,7 @@
 #include "core/parallel.hpp"
 #include "core/q4nx.hpp"
 #include "core/quant.hpp"
+#include "models/qwen35_2b/npu/gemv.hpp"
 #include "npu/gemm.hpp"
 
 // The prefill GEMM on the NPU at every compiled shape, against a
@@ -23,6 +24,7 @@
 namespace {
 
 namespace bfp16 = gufo_npu::bfp16;
+namespace model = gufo_npu::qwen35_2b::npu;
 namespace npu = gufo_npu::npu;
 namespace q4nx = gufo_npu::q4nx;
 namespace quant = gufo_npu::quant;
@@ -34,7 +36,7 @@ struct Shape {
   std::size_t rows;
 };
 
-// Must match SHAPES in kernels/designs/bfp16_gemm.py.
+// Must match SHAPES in src/models/qwen35_2b/kernels/prefill_gemm_variants.py.
 constexpr Shape kShapes[] = {
     {2048, 8192},  {2048, 5120}, {2048, 2048},
     {2048, 12288}, {6144, 2048}, {4096, 2048},
@@ -125,7 +127,8 @@ int Check(npu::GemmRuntime& rt, const Shape& s, std::mt19937& rng) {
     std::printf(
         "%s %s: kernel error %.2e, total %.2e; mean %.0f us, best %.0f us "
         "(%.1f TFLOPS at best)\n",
-        ok ? "ok  " : "FAIL", npu::Bfp16GemmSequence(m, s.dim, s.rows).c_str(),
+        ok ? "ok  " : "FAIL",
+        npu::Bfp16GemmSequence(m, s.dim, s.rows, model::kPrefillName).c_str(),
         kernel_err, total_err, t.mean_us, t.best_us, flop / t.best_us / 1e6);
   }
   return failures;
@@ -135,7 +138,7 @@ int Check(npu::GemmRuntime& rt, const Shape& s, std::mt19937& rng) {
 
 int main(int argc, char** argv) {
   if (argc != 2) {
-    std::fprintf(stderr, "usage: bfp16_gemm_test <kernel-dir>\n");
+    std::fprintf(stderr, "usage: qwen35_prefill_gemm_test <kernel-dir>\n");
     return 2;
   }
   if (!std::filesystem::exists("/dev/accel/accel0")) {
@@ -143,7 +146,7 @@ int main(int argc, char** argv) {
     return 77;
   }
   std::mt19937 rng(4321);
-  npu::GemmRuntime runtime(argv[1]);
+  npu::GemmRuntime runtime(argv[1], model::kPrefillName);
   int failures = 0;
   for (const auto& s : kShapes) {
     failures += Check(runtime, s, rng);

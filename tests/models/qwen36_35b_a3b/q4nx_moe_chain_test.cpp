@@ -10,6 +10,7 @@
 
 #include "core/q4nx.hpp"
 #include "core/quant.hpp"
+#include "models/qwen36_35b_a3b/npu/gemv.hpp"
 #include "npu/gemv.hpp"
 
 // Determinism of an MoE layer's calls, wired as NpuDecoder wires a
@@ -56,7 +57,8 @@ int main(int argc, char** argv) {
     return 77;
   }
   const long iterations = argc > 2 ? std::atol(argv[2]) : kDefaultIterations;
-  npu::GemvRuntime rt(argv[1], npu::Flow::kInstructionBuffer);
+  npu::GemvRuntime rt(argv[1], npu::Flow::kInstructionBuffer,
+                      gufo_npu::qwen36_35b_a3b::npu::DecodeDesign());
   std::mt19937 rng(3);
   std::normal_distribution<float> weight(0.0f, 0.02f);
   std::normal_distribution<float> act(0.0f, 1.0f);

@@ -1,4 +1,4 @@
-#include "models/qwen35/npu_decoder.hpp"
+#include "models/qwen36_35b_a3b/npu_decoder.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -16,18 +16,30 @@
 #include "core/vec.hpp"
 #include "models/qwen35/draft_vocab.hpp"
 #include "models/qwen35/moe.hpp"
+#include "models/qwen36_35b_a3b/npu/gemv.hpp"
 #include "npu/gemv.hpp"
 
-namespace gufo_npu::qwen35 {
+namespace gufo_npu::qwen36_35b_a3b {
 namespace {
 
-using npu::Buffer;
-using npu::Chain;
-using npu::Epilogue;
-using npu::ExpertArena;
-using npu::Prologue;
-using npu::Q4nxGather;
-using npu::Q4nxGemv;
+using qwen35::DraftVocab;
+using qwen35::HasMtpLayer;
+using qwen35::Mixer;
+using qwen35::Q4nxFit;
+using qwen35::ReadConfig;
+using qwen35::Route;
+using qwen35::SharedExpertScale;
+using qwen35::Stage;
+using qwen35::StageOutputs;
+using qwen35::StatePool;
+
+using gufo_npu::npu::Buffer;
+using gufo_npu::npu::Chain;
+using gufo_npu::npu::Epilogue;
+using gufo_npu::npu::ExpertArena;
+using gufo_npu::npu::Prologue;
+using gufo_npu::npu::Q4nxGather;
+using gufo_npu::npu::Q4nxGemv;
 using vec::Dot;
 using vec::RmsNorm;
 
@@ -45,18 +57,20 @@ q4nx::Segment RowsOf(const gguf::TensorInfo& t, std::size_t first,
 
 // The shapes the NPU path supports; throws otherwise.
 Config CheckShapes(Config c) {
-  if (static_cast<std::size_t>(c.hidden) != npu::kGemvHidden) {
+  if (static_cast<std::size_t>(c.hidden) != gufo_npu::npu::kGemvHidden) {
     throw std::runtime_error("npu decoder: hidden size must be " +
-                             std::to_string(npu::kGemvHidden));
+                             std::to_string(gufo_npu::npu::kGemvHidden));
   }
   if (c.IsMoe() &&
-      (static_cast<std::size_t>(c.experts_used) + 1 != npu::kGatherExperts ||
-       static_cast<std::size_t>(c.expert_ffn) != npu::kExpertFfn ||
-       static_cast<std::size_t>(c.shared_expert_ffn) != npu::kExpertFfn)) {
+      (static_cast<std::size_t>(c.experts_used) + 1 !=
+           gufo_npu::npu::kGatherExperts ||
+       static_cast<std::size_t>(c.expert_ffn) != gufo_npu::npu::kExpertFfn ||
+       static_cast<std::size_t>(c.shared_expert_ffn) !=
+           gufo_npu::npu::kExpertFfn)) {
     throw std::runtime_error("npu decoder: MoE layers need " +
-                             std::to_string(npu::kGatherExperts - 1) +
+                             std::to_string(gufo_npu::npu::kGatherExperts - 1) +
                              " routed experts and a shared expert of width " +
-                             std::to_string(npu::kExpertFfn) +
+                             std::to_string(gufo_npu::npu::kExpertFfn) +
                              " (the gather design)");
   }
   return c;
@@ -80,13 +94,13 @@ q4nx::Matrix PackOne(const gguf::TensorInfo& t, q4nx::Fit fit) {
 // resnorm input), then the norm weight. Outputs that feed it are written
 // from H or D with token stride kGemvSlot.
 constexpr std::size_t kH = 0;
-constexpr std::size_t kD = npu::kGemvHidden * sizeof(float);
-constexpr std::size_t kW = npu::kGemvNormOffset;
-constexpr std::size_t kHiddenBytes = npu::kGemvHidden * sizeof(float);
-constexpr std::size_t kSlotBytes = npu::kGemvSlot * sizeof(float);
+constexpr std::size_t kD = gufo_npu::npu::kGemvHidden * sizeof(float);
+constexpr std::size_t kW = gufo_npu::npu::kGemvNormOffset;
+constexpr std::size_t kHiddenBytes = gufo_npu::npu::kGemvHidden * sizeof(float);
+constexpr std::size_t kSlotBytes = gufo_npu::npu::kGemvSlot * sizeof(float);
 // Both tokens' worth of a hidden vector in a slotted region.
 constexpr std::size_t kSlottedBytes = kSlotBytes + kHiddenBytes;
-constexpr int kMaxTokens = static_cast<int>(npu::kGemvTokens);
+constexpr int kMaxTokens = static_cast<int>(gufo_npu::npu::kGemvTokens);
 
 // Writes a norm weight (bf16) into the w slot of a resnorm input region.
 void SetNormWeight(Buffer& region, const gguf::TensorInfo& t) {
@@ -146,7 +160,7 @@ struct NpuDecoder::Impl {
   // Reused across generations (AcquireState, PromptHidden).
   StatePool states{[this] { return mixer.NewState(); }};
   std::vector<float> prompt_hidden;
-  npu::GemvRuntime runtime;
+  gufo_npu::npu::GemvRuntime runtime;
   // MoE routing: per token the router logits (experts, then the shared
   // gate), its normed input, and its experts and weights; the union of the
   // step's experts and their per-token scales.
@@ -226,10 +240,10 @@ struct NpuDecoder::Impl {
                                           Prologue::kAct, Epilogue::kStore);
       ffn_y_bytes = b.ffn->y_bytes();
     }
-    b.in_x = std::make_unique<Buffer>(runtime, npu::kGemvInputBytes);
+    b.in_x = std::make_unique<Buffer>(runtime, gufo_npu::npu::kGemvInputBytes);
     b.in_y = std::make_unique<Buffer>(runtime, b.in->y_bytes());
-    b.out_x = std::make_unique<Buffer>(runtime, npu::kGemvInputBytes);
-    b.ffn_x = std::make_unique<Buffer>(runtime, npu::kGemvInputBytes);
+    b.out_x = std::make_unique<Buffer>(runtime, gufo_npu::npu::kGemvInputBytes);
+    b.ffn_x = std::make_unique<Buffer>(runtime, gufo_npu::npu::kGemvInputBytes);
     b.ffn_y = std::make_unique<Buffer>(runtime, ffn_y_bytes);
     SetNormWeight(*b.in_x, t("attn_norm.weight"));
     SetNormWeight(*b.ffn_x, t("post_attention_norm.weight"));
@@ -352,18 +366,22 @@ struct NpuDecoder::Impl {
         mixer(file),
         // The gathers rewrite their instruction streams per call. Dense
         // models keep the ELF flow, ~2% faster on Qwen3.5-2B decode.
-        runtime(kernel_dir, config.IsMoe() ? npu::Flow::kInstructionBuffer
-                                           : npu::Flow::kElf) {
+        runtime(kernel_dir,
+                config.IsMoe() ? gufo_npu::npu::Flow::kInstructionBuffer
+                               : gufo_npu::npu::Flow::kElf,
+                npu::DecodeDesign()) {
     const Config& c = config;
     const auto hidden = static_cast<std::size_t>(c.hidden);
     embed = &file.Tensor("token_embd.weight");
-    scratch = std::make_unique<Buffer>(runtime, npu::kGemvResidualBytes);
+    scratch =
+        std::make_unique<Buffer>(runtime, gufo_npu::npu::kGemvResidualBytes);
     if (c.IsMoe()) {
       const ExpertArena arena{static_cast<std::size_t>(c.experts) + 1};
-      for (std::size_t tokens = 1; tokens <= npu::kGemvTokens; ++tokens) {
-        const std::size_t most =
-            tokens == 1 ? npu::kGatherExperts : npu::kMaxGatherExperts;
-        for (std::size_t n = npu::kGatherExperts; n <= most; ++n) {
+      for (std::size_t tokens = 1; tokens <= gufo_npu::npu::kGemvTokens;
+           ++tokens) {
+        const std::size_t most = tokens == 1 ? gufo_npu::npu::kGatherExperts
+                                             : gufo_npu::npu::kMaxGatherExperts;
+        for (std::size_t n = gufo_npu::npu::kGatherExperts; n <= most; ++n) {
           gathers[tokens - 1].push_back(
               {std::make_unique<Q4nxGather>(runtime, Q4nxGather::Kind::kGateUp,
                                             arena, n, tokens),
@@ -386,9 +404,9 @@ struct NpuDecoder::Impl {
     lm = std::make_unique<Q4nxGemv>(
         runtime, q4nx::Pack(head.type, head.data, head.Rows(), hidden, fit),
         Prologue::kResNorm, Epilogue::kStore);
-    lm_x = std::make_unique<Buffer>(runtime, npu::kGemvInputBytes);
+    lm_x = std::make_unique<Buffer>(runtime, gufo_npu::npu::kGemvInputBytes);
     lm_y = std::make_unique<Buffer>(runtime, lm->y_bytes());
-    lm_r = std::make_unique<Buffer>(runtime, npu::kGemvResidualBytes);
+    lm_r = std::make_unique<Buffer>(runtime, gufo_npu::npu::kGemvResidualBytes);
     output_norm = ToFloats(file.Tensor("output_norm.weight"));
     SetNormWeight(*lm_x, file.Tensor("output_norm.weight"));
     lm_only = std::make_unique<Chain>(runtime);
@@ -424,7 +442,7 @@ struct NpuDecoder::Impl {
       eh_proj = std::make_unique<Q4nxGemv>(
           runtime, PackOne(file.Tensor(p + "nextn.eh_proj.weight"), fit),
           Prologue::kPlain, Epilogue::kStore);
-      eh_x = std::make_unique<Buffer>(runtime, npu::kGemvInputBytes);
+      eh_x = std::make_unique<Buffer>(runtime, gufo_npu::npu::kGemvInputBytes);
       draft_ids = DraftVocab(c.vocab);
       // The draft vocabulary's rows of the LM head.
       std::vector<q4nx::Segment> draft_rows;
@@ -438,7 +456,8 @@ struct NpuDecoder::Impl {
       draft_lm = std::make_unique<Q4nxGemv>(
           runtime, q4nx::PackRows(draft_rows, hidden, fit), Prologue::kResNorm,
           Epilogue::kStore);
-      mtp_lm_x = std::make_unique<Buffer>(runtime, npu::kGemvInputBytes);
+      mtp_lm_x =
+          std::make_unique<Buffer>(runtime, gufo_npu::npu::kGemvInputBytes);
       mtp_lm_y = std::make_unique<Buffer>(runtime, draft_lm->y_bytes());
       SetNormWeight(*mtp_lm_x,
                     file.Tensor(p + "nextn.shared_head_norm.weight"));
@@ -479,7 +498,7 @@ struct NpuDecoder::Impl {
     Buffer slots = b.ffn_x->Sub(0, count * kSlotBytes);
     slots.FromDevice();
     for (int t = 0; t < count; ++t) {
-      const float* h = slots.as<float>() + t * npu::kGemvSlot;
+      const float* h = slots.as<float>() + t * gufo_npu::npu::kGemvSlot;
       auto& x = router_x[t];
       for (int i = 0; i < d; ++i) {
         x[i] = h[i] + h[d + i];
@@ -523,7 +542,7 @@ struct NpuDecoder::Impl {
       union_scales[(ids.size() - 1) * count + t] =
           SharedExpertScale(router_logits[t][c.experts]);
     }
-    const std::size_t index = ids.size() - npu::kGatherExperts;
+    const std::size_t index = ids.size() - gufo_npu::npu::kGatherExperts;
     auto& g = gathers[count - 1].at(index);
     g.gate_up->Select(ids.data(), union_scales.data());
     g.down->Select(ids.data());
@@ -573,14 +592,14 @@ struct NpuDecoder::Impl {
       float* in_t = in.data() + t * in_stride;
       std::memcpy(in_t, b.in_y->as<float>() + t * b.in->y_token_stride(),
                   rows * sizeof(float));
-      float* y = out_x.as<float>() + t * npu::kGemvSlot;
+      float* y = out_x.as<float>() + t * gufo_npu::npu::kGemvSlot;
       if (b.attention) {
         mixer.Attention(il, in_t, position + t, st, y);
         continue;
       }
       // alpha and beta from the token's normalized input: its residual is
       // what the input projection wrote to ffn_x.H.
-      const float* hv = h->as<float>() + t * npu::kGemvSlot;
+      const float* hv = h->as<float>() + t * gufo_npu::npu::kGemvSlot;
       RmsNorm(hv, b.attn_norm.data(), d, c.rms_eps, normed.data());
       const int heads = c.linear_value_heads;
       float* ab = in_t + rows;
@@ -637,7 +656,7 @@ float* NpuDecoder::PromptHidden(std::size_t floats) {
 }
 
 NpuDecoder::DeviceWeights NpuDecoder::device_weights() const {
-  auto matrix = [](const npu::Q4nxGemv& g) {
+  auto matrix = [](const gufo_npu::npu::Q4nxGemv& g) {
     return DeviceMatrix{g.weights(), g.padded_rows(), g.dim()};
   };
   DeviceWeights w;
@@ -698,7 +717,8 @@ const float* NpuDecoder::Logits(const float* hidden) {
   Buffer slot = m.lm_x->Sub(0, kSlotBytes);
   float* x = slot.as<float>();
   std::memcpy(x, hidden, static_cast<std::size_t>(d) * sizeof(float));
-  std::fill(x + npu::kGemvHidden, x + npu::kGemvHidden + d, 0.0f);
+  std::fill(x + gufo_npu::npu::kGemvHidden, x + gufo_npu::npu::kGemvHidden + d,
+            0.0f);
   slot.ToDevice();
   m.Submit(*m.lm_only);
   m.lm_y->FromDevice();
@@ -732,7 +752,7 @@ const float* NpuDecoder::Step(const int* tokens, int count, DecodeState& state,
       quant::Dequantize(m.embed->type,
                         m.embed->data + static_cast<std::size_t>(tokens[t]) *
                                             quant::RowBytes(m.embed->type, d),
-                        h.as<float>() + t * npu::kGemvSlot, d);
+                        h.as<float>() + t * gufo_npu::npu::kGemvSlot, d);
     }
     h.ToDevice();
   }
@@ -749,10 +769,10 @@ const float* NpuDecoder::Step(const int* tokens, int count, DecodeState& state,
     // fp32 sum its input stage writes to lm_r.
     m.lm_x->FromDevice();
     for (int t = 0; t < count; ++t) {
-      const float* slot = m.lm_x->as<float>() + t * npu::kGemvSlot;
+      const float* slot = m.lm_x->as<float>() + t * gufo_npu::npu::kGemvSlot;
       float* out = m.final_hidden.data() + static_cast<std::size_t>(t) * d;
       for (int i = 0; i < d; ++i) {
-        out[i] = slot[i] + slot[npu::kGemvHidden + i];
+        out[i] = slot[i] + slot[gufo_npu::npu::kGemvHidden + i];
       }
     }
     return nullptr;
@@ -764,7 +784,8 @@ const float* NpuDecoder::Step(const int* tokens, int count, DecodeState& state,
                 m.lm_y->as<float>() + t * m.lm->y_token_stride(),
                 c.vocab * sizeof(float));
     std::memcpy(m.final_hidden.data() + static_cast<std::size_t>(t) * d,
-                m.lm_r->as<float>() + t * npu::kGemvSlot, d * sizeof(float));
+                m.lm_r->as<float>() + t * gufo_npu::npu::kGemvSlot,
+                d * sizeof(float));
   }
   return m.logits.data();
 }
@@ -807,7 +828,7 @@ void NpuDecoder::FillMtp(const float* const* hidden, const int* tokens,
   // eh_proj's input is 2 * hidden per token: both slots in full.
   Buffer x = m.eh_x->Sub(0, kMaxTokens * kSlotBytes);
   for (int t = 0; t < count; ++t) {
-    float* slot = x.as<float>() + t * npu::kGemvSlot;
+    float* slot = x.as<float>() + t * gufo_npu::npu::kGemvSlot;
     quant::Dequantize(m.embed->type,
                       m.embed->data + static_cast<std::size_t>(tokens[t]) *
                                           quant::RowBytes(m.embed->type, d),
@@ -990,4 +1011,4 @@ std::vector<int> SpeculativeGenerate(
   return out;
 }
 
-}  // namespace gufo_npu::qwen35
+}  // namespace gufo_npu::qwen36_35b_a3b

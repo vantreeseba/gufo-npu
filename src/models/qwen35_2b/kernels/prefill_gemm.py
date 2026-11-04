@@ -1,6 +1,6 @@
-"""Prefill GEMM on the whole array: C (M x N, bf16) = A (M x K, bf16) x B, with
-B (K x N) the weights as bfp16ebs8 (9 bytes per 8 values), packed on the host
-in the order the cores read it (src/core/bfp16.hpp).
+"""Qwen3.5-2B's prefill GEMM on the whole array: C (M x N, bf16) = A (M x K,
+bf16) x B, with B (K x N) the weights as bfp16ebs8 (9 bytes per 8 values),
+packed on the host in the order the cores read it (src/core/bfp16.hpp).
 
 This is IRON's flm.GEMM design (iron.operators.flm.gemm.design and the
 mlir-aie fused_mm kernel, Apache-2.0) at one fixed configuration: 4 rows x 8
@@ -11,9 +11,11 @@ bfp16 and runs the 8x8x8 bfp16 mmul with an fp32 accumulator; the output is
 rounded to bf16 (round to nearest even).
 
 M, K and N reach the cores as runtime parameters, so every shape shares one
-xclbin (bfp16_gemm.xclbin, in its own hardware context) and differs only in
-its instruction sequence, one ELF per (M, K, N). M is the prompt chunk (a
-multiple of 256 tokens); K and N are the 2B's projections.
+xclbin (qwen35_2b_prefill.xclbin, in its own hardware context) and differs
+only in its instruction sequence, one ELF per (M, K, N). M is the prompt
+chunk (a multiple of 256 tokens); K and N are the 2B's projections
+(prefill_gemm_variants.py). Other models' prefill GEMMs are copies of this
+design with their own shapes.
 
 Runtime arguments: A (bf16, M x K row-major), B (packed bfp16), C (bf16,
 M x N row-major).
@@ -34,7 +36,7 @@ from aie.utils.compile.utils import (
 from iron.operators.flm.gemm import design as flm
 
 # Shapes, sequence names and outputs: pure data, also read by CMake.
-from bfp16_gemm_variants import CHUNKS, OUTPUTS, SHAPES, XCLBIN, sequence_name, sequences  # noqa: E402,F401
+from prefill_gemm_variants import CHUNKS, OUTPUTS, SHAPES, XCLBIN, sequence_name, sequences  # noqa: E402,F401
 
 TILE_N = 64
 K_TILE = flm.K_TILE

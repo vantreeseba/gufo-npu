@@ -1,5 +1,7 @@
-// q4nx matrix-vector product for decode: y = W x for one or two tokens per
-// weight read (two verify a speculative draft).
+// Qwen3.5-2B's q4nx matrix-vector product for decode: y = W x for one or two
+// tokens per weight read (two verify a speculative draft). A copy of the
+// core program it shared with the 35B (now the 35B's aie/decode_gemv.cc) without the MoE scaled SwiGLU, built by
+// ../decode_gemv.py into the 2B's own NPU program.
 //
 // Each core owns Q4NX_M_TILE out-features per round and streams their q4nx
 // blocks (Q4NX_M_TILE x Q4NX_K_TILE) past the tokens. The k block count, the
@@ -32,7 +34,7 @@
 #if !defined(Q4NX_M_TILE) || !defined(Q4NX_K_TILE) || !defined(Q4NX_GROUP) || \
     !defined(GEMV_MAX_DIM) || !defined(GEMV_RMS_EPS) ||                      \
     !defined(GEMV_HIDDEN) || !defined(GEMV_TOKENS) || !defined(GEMV_SLOT)
-#error "q4nx_gemv.cc needs its geometry -D defined"
+#error "decode_gemv.cc needs its geometry -D defined"
 #endif
 
 // One M by N block. Per row: d and dmin (bf16). Per row and 32 inputs,
@@ -169,11 +171,6 @@ constexpr int PROLOGUE_ACT = 2;      // dim bf16 per token, MAX_DIM apart
 // Output stage modes (RTP word 3).
 constexpr int EPILOGUE_STORE = 0;   // per token: M_TILE fp32
 constexpr int EPILOGUE_SWIGLU = 1;  // per token: 16 bf16 silu(g) * u, then pad
-constexpr int EPILOGUE_SWIGLU_SCALED = 2;  // the same times a per-round scale
-// RTP words (kernels/designs/q4nx_gemv.py): the output stage, and the first of
-// the swiglu_scaled scales (round-major, then token).
-constexpr int RTP_EPILOGUE = 3;
-constexpr int RTP_SCALES = 7;
 
 constexpr float RMS_EPS = GEMV_RMS_EPS;
 constexpr int HIDDEN = GEMV_HIDDEN;
@@ -356,23 +353,15 @@ void gemv_block(const q4nx_block_t *w, float *raw, float *y_acc,
 // with EPILOGUE_SWIGLU the core's rows are 16 gate rows then their 16 up
 // rows, and it writes silu(gate) * up as 16 bf16 at the start of the token's
 // M_TILE values (the rest is padding the sequence discards).
-// EPILOGUE_SWIGLU_SCALED also multiplies by the fp32 scale in RTP word
-// RTP_SCALES + round * TOKENS + t (an MoE router weight; round = expert).
-void gemv_store(float *y, const float *y_acc, const int32_t *rtp, int round) {
+void gemv_store(float *y, const float *y_acc, int epilogue) {
   event0();
-  const int epilogue = rtp[RTP_EPILOGUE];
   for (int t = 0; t < TOKENS; t++) {
     float *yt = y + t * M_TILE;
     const float *acc = y_acc + t * M_TILE;
-    if (epilogue == EPILOGUE_SWIGLU || epilogue == EPILOGUE_SWIGLU_SCALED) {
+    if (epilogue == EPILOGUE_SWIGLU) {
       static_assert(M_TILE == 32, "SwiGLU pairs 16 gate rows with 16 up rows");
       aie::vector<float, 16> g = aie::load_v<16>(acc);
       aie::vector<float, 16> u = aie::load_v<16>(acc + 16);
-      if (epilogue == EPILOGUE_SWIGLU_SCALED) {
-        u = aie::mul(u, __builtin_bit_cast(
-                            float, rtp[RTP_SCALES + round * TOKENS + t]))
-                .template to_vector<float>();
-      }
       const aie::vector<float, 16> sig = sigmoid(g);
       aie::accum<accfloat, 16> out;
       out.from_vector(aie::mul(aie::mul(g, sig).template to_vector<float>(), u)

@@ -7,7 +7,8 @@
 
 #include "core/q4nx.hpp"
 
-// The q4nx GEMV design (kernels/designs/q4nx_gemv.py): one xclbin in one
+// A q4nx GEMV design (each model compiles its own, e.g.
+// src/models/qwen36_35b_a3b/kernels/decode_gemv.py): one xclbin in one
 // hardware context, one instruction sequence per variant (shape, input stage,
 // output stage, 1 or 2 tokens). A Q4nxGemv keeps one matrix resident on the
 // device; its calls read and write device Buffers, so the output of one call
@@ -34,13 +35,11 @@ inline constexpr std::size_t kGemvResidualBytes =
     (kGemvSlot + kGemvHidden) * sizeof(float);
 
 // A compiled GEMV design: its xclbin and sequence-name prefix, and the
-// geometry its core program was built with. The default is
-// kernels/designs/q4nx_gemv.py (Qwen3.5-2B's shapes); a model with another
-// hidden size compiles its own copy (e.g. src/models/qwen35_4b/kernels) and
-// passes its own GemvDesign. The input and residual buffers follow the
-// layout above with `hidden` in place of kGemvHidden.
+// geometry its core program was built with. Each model's package defines
+// its own (e.g. src/models/qwen35_4b/npu/gemv.hpp). The input and residual
+// buffers follow the layout above with `hidden` in place of kGemvHidden.
 struct GemvDesign {
-  std::string name = "q4nx_gemv";
+  std::string name;
   std::size_t hidden = kGemvHidden;
   std::size_t max_dim = kGemvMaxDim;
 
@@ -69,11 +68,10 @@ enum class Epilogue {
 };
 
 // The instruction sequence name, e.g.
-// "q4nx_gemv_k2048_n8192_resnorm_store_t2" (`design` is the prefix).
+// "<design>_k2048_n12288_resnorm_store_t2" (`design` is the prefix).
 std::string Q4nxGemvSequence(std::size_t dim, std::size_t padded_rows,
                              Prologue prologue, Epilogue epilogue,
-                             std::size_t tokens,
-                             const std::string& design = "q4nx_gemv");
+                             std::size_t tokens, const std::string& design);
 
 // How a runtime's calls reach the NPU. kElf runs each variant's instruction
 // ELF. kInstructionBuffer passes the variant's instruction words in a host
@@ -83,11 +81,10 @@ enum class Flow { kElf, kInstructionBuffer };
 
 class GemvRuntime {
 public:
-  // Loads <design.name>.xclbin from `kernel_dir` (the default design is
-  // q4nx_gemv, Qwen3.5-2B's). Throws when it is missing or the NPU cannot be
-  // opened.
-  explicit GemvRuntime(const std::filesystem::path& kernel_dir,
-                       Flow flow = Flow::kElf, GemvDesign design = {});
+  // Loads <design.name>.xclbin from `kernel_dir`. Throws when it is missing
+  // or the NPU cannot be opened.
+  GemvRuntime(const std::filesystem::path& kernel_dir, Flow flow,
+              GemvDesign design);
   ~GemvRuntime();
   GemvRuntime(const GemvRuntime&) = delete;
   GemvRuntime& operator=(const GemvRuntime&) = delete;
@@ -193,7 +190,8 @@ private:
 
 // Experts in a gather call: one token's 8 routed experts and the shared
 // one, up to two tokens' 16 and the shared one (any count in between for two
-// tokens). An expert's FFN width. kernels/designs/q4nx_gemv.py MOE_VARIANTS.
+// tokens). An expert's FFN width. The gather design's MOE_VARIANTS
+// (src/models/qwen36_35b_a3b/kernels/decode_gemv_variants.py).
 inline constexpr std::size_t kGatherExperts = 9;
 inline constexpr std::size_t kMaxGatherExperts = 17;
 inline constexpr std::size_t kExpertFfn = 512;

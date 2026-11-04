@@ -23,8 +23,8 @@
 namespace gufo_npu::qwen36_35b_a3b {
 
 // `arenas`: per layer, the host address of the decoder's expert arena
-// (npu::ExpertArena of `arena_experts` experts, the shared one last), which
-// must outlive it. `max_tokens`: the most tokens a pass has. `portable`
+// (gufo_npu::npu::ExpertArena of `arena_experts` experts, the shared one last),
+// which must outlive it. `max_tokens`: the most tokens a pass has. `portable`
 // forces the portable path (tests); otherwise AVX-512 BF16 is used when the
 // CPU has it.
 std::unique_ptr<ExpertStep> MakeCpuExperts(

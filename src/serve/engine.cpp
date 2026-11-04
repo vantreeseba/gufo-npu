@@ -18,12 +18,13 @@
 #include "core/tokenizer.hpp"
 #include "models/qwen35/config.hpp"
 #include "models/qwen35/generate.hpp"
-#include "models/qwen35/npu_decoder.hpp"
-#include "models/qwen35/npu_prefill.hpp"
 #include "models/qwen35/prompt_cache.hpp"
 #include "models/qwen35/reference.hpp"
+#include "models/qwen35_2b/npu_decoder.hpp"
+#include "models/qwen35_2b/npu_prefill.hpp"
 #include "models/qwen35_4b/npu_decoder.hpp"
 #include "models/qwen35_4b/npu_prefill.hpp"
+#include "models/qwen36_35b_a3b/npu_decoder.hpp"
 #include "models/qwen36_35b_a3b/npu_prefill.hpp"
 #include "models/qwen3vl_embed_2b/config.hpp"
 #include "models/qwen3vl_embed_2b/input.hpp"
@@ -229,23 +230,23 @@ RunFn MakeRun(P* package, GenerateFn generate, HookFn prefill_hook) {
   };
 }
 
-// Qwen3.5-2B: the family decoder and the family prefill.
+// Qwen3.5-2B: its own decoder and prefill (src/models/qwen35_2b).
 void AttachQwen35_2B(ModelEngine& engine, const fs::path& kernels,
                      int checkpoints) {
-  using P = Package<qwen35::NpuDecoder, qwen35::NpuPrefill>;
-  auto m =
-      std::make_shared<P>(engine, kernels, checkpoints,
-                          [](qwen35::NpuDecoder& d, qwen35::NpuPrefill& p) {
-                            return qwen35::MakePromptCacheModel(d, p);
-                          });
+  using P = Package<qwen35_2b::NpuDecoder, qwen35_2b::NpuPrefill>;
+  auto m = std::make_shared<P>(
+      engine, kernels, checkpoints,
+      [](qwen35_2b::NpuDecoder& d, qwen35_2b::NpuPrefill& p) {
+        return qwen35_2b::MakePromptCacheModel(d, p);
+      });
   const bool can_draft = m->decoder.can_draft();
   RunFn run = MakeRun(
       m.get(),
       [](auto&&... args) {
-        return qwen35::SpeculativeGenerate(
+        return qwen35_2b::SpeculativeGenerate(
             std::forward<decltype(args)>(args)...);
       },
-      [](P& p) { return qwen35::PrefillPrompt(p.prefill); });
+      [](P& p) { return qwen35_2b::PrefillPrompt(p.prefill); });
   engine.Attach(std::move(m), std::move(run), can_draft);
 }
 
@@ -269,21 +270,22 @@ void AttachQwen35_4B(ModelEngine& engine, const fs::path& kernels,
   engine.Attach(std::move(m), std::move(run), can_draft);
 }
 
-// Qwen3.6-35B-A3B: the family decoder (MoE) and its own prefill, which
-// reads the decoder's weights in place.
+// Qwen3.6-35B-A3B: its own decoder (MoE) and prefill
+// (src/models/qwen36_35b_a3b); the prefill reads the decoder's weights in
+// place.
 void AttachQwen36_35B_A3B(ModelEngine& engine, const fs::path& kernels,
                           int checkpoints) {
-  using P = Package<qwen35::NpuDecoder, qwen36_35b_a3b::NpuPrefill>;
+  using P = Package<qwen36_35b_a3b::NpuDecoder, qwen36_35b_a3b::NpuPrefill>;
   auto m = std::make_shared<P>(
       engine, kernels, checkpoints,
-      [](qwen35::NpuDecoder& d, qwen36_35b_a3b::NpuPrefill& p) {
+      [](qwen36_35b_a3b::NpuDecoder& d, qwen36_35b_a3b::NpuPrefill& p) {
         return qwen36_35b_a3b::MakePromptCacheModel(d, p);
       });
   const bool can_draft = m->decoder.can_draft();
   RunFn run = MakeRun(
       m.get(),
       [](auto&&... args) {
-        return qwen35::SpeculativeGenerate(
+        return qwen36_35b_a3b::SpeculativeGenerate(
             std::forward<decltype(args)>(args)...);
       },
       [](P& p) { return qwen36_35b_a3b::PrefillPrompt(p.prefill); });

@@ -8,9 +8,11 @@
 
 #include "core/q4nx.hpp"
 #include "core/quant.hpp"
+#include "models/qwen35_2b/npu/gemv.hpp"
 #include "npu/gemv.hpp"
 
-// Determinism of chained q4nx GEMVs: one decoder layer's chain (in, out,
+// Determinism of chained q4nx GEMVs on Qwen3.5-2B's decode program
+// (qwen35_2b_decode): one decoder layer's chain (in, out,
 // gate + up with SwiGLU, down, the next layer's in), wired as NpuDecoder
 // wires it, runs many times with the same inputs, alternating 1 and 2
 // tokens. Every output must be bit-identical to the first run with the same
@@ -21,6 +23,7 @@
 namespace {
 
 namespace npu = gufo_npu::npu;
+namespace geo = gufo_npu::qwen35_2b::npu;
 namespace q4nx = gufo_npu::q4nx;
 namespace quant = gufo_npu::quant;
 using npu::Buffer;
@@ -33,8 +36,9 @@ constexpr long kDefaultIterations = 60000;
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    std::fprintf(stderr,
-                 "usage: q4nx_gemv_chain_test <kernel-dir> [iterations]\n");
+    std::fprintf(
+        stderr,
+        "usage: qwen35_decode_gemv_chain_test <kernel-dir> [iterations]\n");
     return 2;
   }
   if (!std::filesystem::exists("/dev/accel/accel0")) {
@@ -42,7 +46,7 @@ int main(int argc, char** argv) {
     return 77;
   }
   const long iterations = argc > 2 ? std::atol(argv[2]) : kDefaultIterations;
-  npu::GemvRuntime rt(argv[1]);
+  npu::GemvRuntime rt(argv[1], npu::Flow::kElf, geo::DecodeDesign());
   std::mt19937 rng(1);
   std::normal_distribution<float> weight(0.0f, 0.02f);
   std::normal_distribution<float> act(0.0f, 1.0f);
@@ -74,31 +78,31 @@ int main(int argc, char** argv) {
   npu::Q4nxGemv next(rt, matrix(8192, 2048, false), Prologue::kResNorm,
                      Epilogue::kStore);
 
-  const std::size_t hidden = npu::kGemvHidden * sizeof(float);
-  const std::size_t slotted = npu::kGemvSlot * sizeof(float) + hidden;
-  Buffer in_x(rt, npu::kGemvInputBytes);
+  const std::size_t hidden = geo::kHidden * sizeof(float);
+  const std::size_t slotted = geo::kSlot * sizeof(float) + hidden;
+  Buffer in_x(rt, geo::kInputBytes);
   Buffer in_y(rt, in.y_bytes());
-  Buffer out_x(rt, npu::kGemvInputBytes);
-  Buffer ffn_x(rt, npu::kGemvInputBytes);
+  Buffer out_x(rt, geo::kInputBytes);
+  Buffer ffn_x(rt, geo::kInputBytes);
   Buffer ffn_y(rt, ffn.y_bytes());
-  Buffer next_x(rt, npu::kGemvInputBytes);
+  Buffer next_x(rt, geo::kInputBytes);
   Buffer next_y(rt, next.y_bytes());
-  Buffer next_r(rt, npu::kGemvResidualBytes);
-  Buffer scratch(rt, npu::kGemvResidualBytes);
+  Buffer next_r(rt, geo::kResidualBytes);
+  Buffer scratch(rt, geo::kResidualBytes);
   for (Buffer* b : {&in_x, &ffn_x, &next_x}) {
     auto* norm = reinterpret_cast<std::uint16_t*>(b->as<std::uint8_t>() +
-                                                  npu::kGemvNormOffset);
-    for (std::size_t i = 0; i < npu::kGemvHidden; ++i) {
+                                                  geo::kNormOffset);
+    for (std::size_t i = 0; i < geo::kHidden; ++i) {
       norm[i] = quant::FloatToBf16(1.0f + 0.2f * act(rng));
     }
   }
-  for (std::size_t t = 0; t < npu::kGemvTokens; ++t) {
-    float* h = in_x.as<float>() + t * npu::kGemvSlot;  // H and D
-    for (std::size_t i = 0; i < 2 * npu::kGemvHidden; ++i) {
+  for (std::size_t t = 0; t < geo::kTokens; ++t) {
+    float* h = in_x.as<float>() + t * geo::kSlot;  // H and D
+    for (std::size_t i = 0; i < 2 * geo::kHidden; ++i) {
       h[i] = act(rng);
     }
-    float* o = out_x.as<float>() + t * npu::kGemvSlot;
-    for (std::size_t i = 0; i < npu::kGemvHidden; ++i) {
+    float* o = out_x.as<float>() + t * geo::kSlot;
+    for (std::size_t i = 0; i < geo::kHidden; ++i) {
       o[i] = act(rng);
     }
   }
@@ -109,8 +113,8 @@ int main(int argc, char** argv) {
   Buffer ffn_d = ffn_x.Sub(hidden, slotted);
   Buffer next_h = next_x.Sub(0, slotted);
   Buffer next_d = next_x.Sub(hidden, slotted);
-  npu::Chain chains[npu::kGemvTokens] = {npu::Chain(rt), npu::Chain(rt)};
-  for (std::size_t t = 1; t <= npu::kGemvTokens; ++t) {
+  npu::Chain chains[geo::kTokens] = {npu::Chain(rt), npu::Chain(rt)};
+  for (std::size_t t = 1; t <= geo::kTokens; ++t) {
     auto& c = chains[t - 1];
     c.Add(in, in_x, in_y, ffn_h, t);
     c.Add(out, out_x, ffn_d, scratch, t);
@@ -126,10 +130,10 @@ int main(int argc, char** argv) {
   const Watched watched[] = {{"in_y", &in_y},     {"ffn_x", &ffn_x},
                              {"ffn_y", &ffn_y},   {"next_x", &next_x},
                              {"next_y", &next_y}, {"next_r", &next_r}};
-  std::vector<std::vector<std::uint8_t>> want[npu::kGemvTokens];
+  std::vector<std::vector<std::uint8_t>> want[geo::kTokens];
   long bad_runs = 0;
   for (long it = 0; it < iterations; ++it) {
-    const auto t = static_cast<std::size_t>(it) % npu::kGemvTokens;
+    const auto t = static_cast<std::size_t>(it) % geo::kTokens;
     chains[t].Run();
     bool bad = false;
     for (std::size_t w = 0; w < std::size(watched); ++w) {

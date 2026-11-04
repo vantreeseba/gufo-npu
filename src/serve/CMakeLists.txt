@@ -4,6 +4,7 @@
 
 add_library(gufo_npu_serve_engine STATIC engine.cpp model_registry.cpp)
 target_link_libraries(gufo_npu_serve_engine PUBLIC gufo_npu_qwen35_npu
+                      gufo_npu_qwen35_2b
                       gufo_npu_qwen35_4b gufo_npu_qwen36_35b_a3b
                       gufo_npu_qwen3vl_embed_2b_npu)
 

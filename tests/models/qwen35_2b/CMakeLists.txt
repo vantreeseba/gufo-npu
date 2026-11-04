@@ -31,7 +31,7 @@ if(GUFO_NPU_ENABLE_XRT AND GUFO_NPU_BUILD_KERNELS)
   set(kernels "${CMAKE_BINARY_DIR}/kernels")
 
   add_executable(qwen35_npu_decode_test npu_decode_test.cpp)
-  target_link_libraries(qwen35_npu_decode_test PRIVATE gufo_npu_qwen35_npu)
+  target_link_libraries(qwen35_npu_decode_test PRIVATE gufo_npu_qwen35_2b)
   add_test(NAME qwen35_npu_decode_test
            COMMAND qwen35_npu_decode_test "${kernels}")
   set_tests_properties(qwen35_npu_decode_test PROPERTIES
@@ -39,20 +39,20 @@ if(GUFO_NPU_ENABLE_XRT AND GUFO_NPU_BUILD_KERNELS)
 
   # Speculative sampling: MTP drafts keep the sampled distribution.
   add_executable(qwen35_npu_sampling_test npu_sampling_test.cpp)
-  target_link_libraries(qwen35_npu_sampling_test PRIVATE gufo_npu_qwen35_npu)
+  target_link_libraries(qwen35_npu_sampling_test PRIVATE gufo_npu_qwen35_2b)
   add_test(NAME qwen35_npu_sampling_test COMMAND qwen35_npu_sampling_test "${kernels}")
   set_tests_properties(qwen35_npu_sampling_test PROPERTIES
                        LABELS "qwen35_2b;npu;model" SKIP_RETURN_CODE 77 TIMEOUT 3600)
 
   add_executable(qwen35_npu_prefill_test npu_prefill_test.cpp)
-  target_link_libraries(qwen35_npu_prefill_test PRIVATE gufo_npu_qwen35_npu)
+  target_link_libraries(qwen35_npu_prefill_test PRIVATE gufo_npu_qwen35_2b)
   add_test(NAME qwen35_npu_prefill_test
            COMMAND qwen35_npu_prefill_test "${kernels}")
   set_tests_properties(qwen35_npu_prefill_test PROPERTIES
                        LABELS "qwen35_2b;npu;model" SKIP_RETURN_CODE 77)
 
   add_executable(qwen35_prompt_cache_test prompt_cache_test.cpp)
-  target_link_libraries(qwen35_prompt_cache_test PRIVATE gufo_npu_qwen35_npu)
+  target_link_libraries(qwen35_prompt_cache_test PRIVATE gufo_npu_qwen35_2b)
   add_test(NAME qwen35_prompt_cache_test
            COMMAND qwen35_prompt_cache_test "${kernels}")
   set_tests_properties(qwen35_prompt_cache_test PROPERTIES
@@ -60,22 +60,25 @@ if(GUFO_NPU_ENABLE_XRT AND GUFO_NPU_BUILD_KERNELS)
                        TIMEOUT 1800)
 
   # Op tests of the kernels this model runs.
-  add_executable(q4nx_gemv_test q4nx_gemv_test.cpp)
-  target_link_libraries(q4nx_gemv_test PRIVATE gufo_npu_runtime)
-  add_test(NAME q4nx_gemv_test COMMAND q4nx_gemv_test "${kernels}")
-  set_tests_properties(q4nx_gemv_test PROPERTIES
+  add_executable(qwen35_decode_gemv_test decode_gemv_test.cpp)
+  target_link_libraries(qwen35_decode_gemv_test PRIVATE gufo_npu_runtime)
+  add_test(NAME qwen35_decode_gemv_test
+           COMMAND qwen35_decode_gemv_test "${kernels}")
+  set_tests_properties(qwen35_decode_gemv_test PROPERTIES
                        LABELS "qwen35_2b;npu;kernels" SKIP_RETURN_CODE 77)
 
-  add_executable(q4nx_gemv_chain_test q4nx_gemv_chain_test.cpp)
-  target_link_libraries(q4nx_gemv_chain_test PRIVATE gufo_npu_runtime)
-  add_test(NAME q4nx_gemv_chain_test COMMAND q4nx_gemv_chain_test "${kernels}")
-  set_tests_properties(q4nx_gemv_chain_test PROPERTIES
+  add_executable(qwen35_decode_gemv_chain_test decode_gemv_chain_test.cpp)
+  target_link_libraries(qwen35_decode_gemv_chain_test PRIVATE gufo_npu_runtime)
+  add_test(NAME qwen35_decode_gemv_chain_test
+           COMMAND qwen35_decode_gemv_chain_test "${kernels}")
+  set_tests_properties(qwen35_decode_gemv_chain_test PROPERTIES
                        LABELS "qwen35_2b;npu;kernels" SKIP_RETURN_CODE 77
                        TIMEOUT 600)
 
-  add_executable(bfp16_gemm_test bfp16_gemm_test.cpp)
-  target_link_libraries(bfp16_gemm_test PRIVATE gufo_npu_runtime)
-  add_test(NAME bfp16_gemm_test COMMAND bfp16_gemm_test "${kernels}")
-  set_tests_properties(bfp16_gemm_test PROPERTIES
+  add_executable(qwen35_prefill_gemm_test prefill_gemm_test.cpp)
+  target_link_libraries(qwen35_prefill_gemm_test PRIVATE gufo_npu_runtime)
+  add_test(NAME qwen35_prefill_gemm_test
+           COMMAND qwen35_prefill_gemm_test "${kernels}")
+  set_tests_properties(qwen35_prefill_gemm_test PROPERTIES
                        LABELS "qwen35_2b;npu;kernels" SKIP_RETURN_CODE 77)
 endif()

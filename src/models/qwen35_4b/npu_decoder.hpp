@@ -14,7 +14,7 @@
 
 // Qwen3.5-4B decode on the NPU, on the 4B's own decode GEMV program
 // (src/models/qwen35_4b/kernels; hidden 2560). Copied from
-// models/qwen35/npu_decoder (Qwen3.5-2B) with the 4B's geometry; the CPU
+// models/qwen35_2b/npu_decoder (Qwen3.5-2B) with the 4B's geometry; the CPU
 // side (config, Mixer, MTP draft vocabulary) is the family's shared code.
 // Every matrix product, every RMS norm before one,
 // the residual adds and SwiGLU run in the q4nx GEMV (its resnorm input stage
