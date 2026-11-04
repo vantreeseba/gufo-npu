@@ -99,6 +99,10 @@ Mixer::Mixer(const gguf::File& file)
 
 Mixer::~Mixer() = default;
 
+SpinPool& Mixer::pool() {
+  return scratch_->pool;
+}
+
 StatePool::StatePool(std::function<DecodeState()> fresh, std::size_t keep)
     : fresh_(std::move(fresh)), keep_(keep) {}
 

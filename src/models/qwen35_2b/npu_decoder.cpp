@@ -5,7 +5,6 @@
 #include <cmath>
 #include <cstring>
 #include <deque>
-#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -13,6 +12,7 @@
 #include "core/quant.hpp"
 #include "core/vec.hpp"
 #include "models/qwen35/draft_vocab.hpp"
+#include "models/qwen35_2b/deltanet.hpp"
 #include "models/qwen35_2b/npu/gemv.hpp"
 #include "npu/gemv.hpp"
 
@@ -33,7 +33,6 @@ using gufo_npu::npu::Chain;
 using gufo_npu::npu::Epilogue;
 using gufo_npu::npu::Prologue;
 using gufo_npu::npu::Q4nxGemv;
-using vec::Dot;
 using vec::RmsNorm;
 
 double SecondsSince(std::chrono::steady_clock::time_point start) {
@@ -103,9 +102,7 @@ struct NpuDecoder::Impl {
     // out, ffn and down's weights, back to back (a chain's second argument).
     std::unique_ptr<Buffer> ffn_weights;
     std::unique_ptr<Buffer> in_x, in_y, out_x, ffn_x, ffn_y;
-    std::deque<Buffer> views;      // sub-buffers wired between calls (stable)
-    std::vector<float> attn_norm;  // fp32, for alpha/beta on the CPU
-    std::vector<float> alpha, beta;
+    std::deque<Buffer> views;  // sub-buffers wired between calls (stable)
     // Per token count: out, ffn, down, then the next block's in (or the LM
     // head), as one chain sequence.
     std::unique_ptr<Chain> chain[kMaxTokens];
@@ -117,6 +114,8 @@ struct NpuDecoder::Impl {
   Config config;
   q4nx::Fit fit;  // Q4nxFit(config)
   Mixer mixer;
+  // The DeltaNet layers' step, on the mixer's workers.
+  DeltaNetStep deltanet;
   // Reused across generations (AcquireState, PromptHidden).
   StatePool states{[this] { return mixer.NewState(); }};
   std::vector<float> prompt_hidden;
@@ -180,8 +179,6 @@ struct NpuDecoder::Impl {
       in_w = q4nx::PackRows(
           {SegmentOf(t("attn_qkv.weight")), SegmentOf(t("attn_gate.weight"))},
           hidden, fit);
-      b.alpha = ToFloats(t("ssm_alpha.weight"));
-      b.beta = ToFloats(t("ssm_beta.weight"));
       out_t = &t("ssm_out.weight");
     }
     b.in = std::make_unique<Q4nxGemv>(runtime, in_w, Prologue::kResNorm,
@@ -219,7 +216,6 @@ struct NpuDecoder::Impl {
     b.ffn_y = Region(base + npu::kBlockFfnY, b.ffn->y_bytes());
     SetNormWeight(*b.in_x, t("attn_norm.weight"));
     SetNormWeight(*b.ffn_x, t("post_attention_norm.weight"));
-    b.attn_norm = ToFloats(t("attn_norm.weight"));
     return b;
   }
 
@@ -257,6 +253,7 @@ struct NpuDecoder::Impl {
       : config(CheckShapes(ReadConfig(file))),
         fit(Q4nxFit(config)),
         mixer(file),
+        deltanet(file, config, mixer.pool()),
         runtime(kernel_dir, gufo_npu::npu::Flow::kElf, npu::DecodeDesign()) {
     const Config& c = config;
     const auto hidden = static_cast<std::size_t>(c.hidden);
@@ -415,63 +412,46 @@ struct NpuDecoder::Impl {
   }
 
   // The CPU part of block `b` (blk `il`) for `count` tokens: reads its input
-  // projection, runs the mixer per token, writes the mixer outputs into the
-  // out projection's slots. With `speculative`, the second token's DeltaNet
-  // state goes to ssm_spec and the conv window before it to conv_saved.
-  void Mix(Block& b, int il, int count, int position, DecodeState::Layer& st,
-           bool speculative) {
+  // projection, runs the mixer, writes the mixer outputs into the out
+  // projection's slots. A DeltaNet pair's second token stays speculative
+  // (DeltaNetStep::Run).
+  void Mix(Block& b, int il, int count, int position, DecodeState::Layer& st) {
     const auto start = std::chrono::steady_clock::now();
-    MixTimed(b, il, count, position, st, speculative);
+    MixTimed(b, il, count, position, st);
     cpu_seconds +=
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
             .count();
   }
 
   void MixTimed(Block& b, int il, int count, int position,
-                DecodeState::Layer& st, bool speculative) {
+                DecodeState::Layer& st) {
     const Config& c = config;
-    const int d = c.hidden;
     FromDevice(*b.in_y);
-    const std::size_t rows = b.in->rows();
-    const std::size_t in_stride = StageOutputs(
-        c, b.attention ? Stage::kAttentionIn : Stage::kLinearIn, il);
     // The mixer writes up to a whole slot per token: sync both slots.
     Buffer out_x = b.out_x->Sub(0, kMaxTokens * kSlotBytes);
-    std::optional<Buffer> h;
     if (!b.attention) {
-      h.emplace(b.ffn_x->Sub(kH, kSlottedBytes));
-      FromDevice(*h);
+      // alpha and beta come from the token's residual, which the input
+      // projection wrote to ffn_x.H.
+      Buffer h = b.ffn_x->Sub(kH, kSlottedBytes);
+      FromDevice(h);
+      const auto mix_start = std::chrono::steady_clock::now();
+      deltanet.Run(il, count, b.in_y->as<float>(), b.in->y_token_stride(),
+                   h.as<float>(), npu::kSlot, st, out_x.as<float>(),
+                   npu::kSlot);
+      StepWork(timeline.in_step.deltanet_seconds, mix_start);
+      ToDevice(out_x);
+      return;
     }
+    const std::size_t rows = b.in->rows();
+    const std::size_t in_stride = StageOutputs(c, Stage::kAttentionIn, il);
     for (int t = 0; t < count; ++t) {
       float* in_t = in.data() + t * in_stride;
       std::memcpy(in_t, b.in_y->as<float>() + t * b.in->y_token_stride(),
                   rows * sizeof(float));
-      float* y = out_x.as<float>() + t * npu::kSlot;
       const auto mix_start = std::chrono::steady_clock::now();
-      if (b.attention) {
-        mixer.Attention(il, in_t, position + t, st, y);
-        StepWork(timeline.in_step.attention_seconds, mix_start);
-        continue;
-      }
-      // alpha and beta from the token's normalized input: its residual is
-      // what the input projection wrote to ffn_x.H.
-      const float* hv = h->as<float>() + t * npu::kSlot;
-      RmsNorm(hv, b.attn_norm.data(), d, c.rms_eps, normed.data());
-      const int heads = c.linear_value_heads;
-      float* ab = in_t + rows;
-      for (int head = 0; head < 2 * heads; ++head) {
-        const float* w = (head < heads ? b.alpha.data() : b.beta.data()) +
-                         static_cast<std::size_t>(head % heads) * d;
-        ab[head] = Dot(w, normed.data(), d);
-      }
-      if (speculative && t == 1) {
-        st.conv_saved = st.conv;
-        st.ssm_spec.resize(st.ssm.size());
-        mixer.Linear(il, in_t, st, y, st.ssm_spec.data());
-      } else {
-        mixer.Linear(il, in_t, st, y);
-      }
-      StepWork(timeline.in_step.deltanet_seconds, mix_start);
+      mixer.Attention(il, in_t, position + t, st,
+                      out_x.as<float>() + t * npu::kSlot);
+      StepWork(timeline.in_step.attention_seconds, mix_start);
     }
     ToDevice(out_x);
   }
@@ -613,7 +593,7 @@ const float* NpuDecoder::Step(const int* tokens, int count, DecodeState& state,
   m.Submit(*m.first[count - 1], m.timeline.first);
   for (int il = 0; il < c.layers; ++il) {
     auto& layer = m.layers[il];
-    m.Mix(layer, il, count, state.position, state.layers[il], count == 2);
+    m.Mix(layer, il, count, state.position, state.layers[il]);
     m.SubmitFfn(layer, count, m.timeline.layers, !logits && il + 1 == c.layers);
   }
   state.position += count;
@@ -700,7 +680,7 @@ void NpuDecoder::FillMtp(const float* const* hidden, const int* tokens,
   // eh_proj and the block's input projection; the attention appends to the
   // cache.
   m.Submit(*m.mtp_first[count - 1], m.timeline.mtp);
-  m.Mix(m.mtp, c.layers, count, position, state.layers[c.layers], false);
+  m.Mix(m.mtp, c.layers, count, position, state.layers[c.layers]);
 }
 
 int NpuDecoder::Draft(const float* const* hidden, const int* tokens, int count,

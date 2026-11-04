@@ -2,10 +2,14 @@
 # wired to them. The CPU side (config, reference, Mixer, the prefill mixers)
 # is the family's shared gufo_npu_qwen35(_npu).
 
-add_library(gufo_npu_qwen35_2b STATIC npu_decoder.cpp npu_prefill.cpp)
+add_library(gufo_npu_qwen35_2b STATIC npu_decoder.cpp npu_prefill.cpp
+                                      deltanet.cpp)
 target_link_libraries(gufo_npu_qwen35_2b PUBLIC gufo_npu_qwen35_npu)
-set_source_files_properties(npu_decoder.cpp npu_prefill.cpp PROPERTIES
-  COMPILE_OPTIONS "-march=x86-64-v3;-O3")
+# deltanet.cpp must keep the flags of src/models/qwen35/decoder.cpp: its
+# step is bit-identical to Mixer::Linear's only with the same fused
+# multiply-adds.
+set_source_files_properties(npu_decoder.cpp npu_prefill.cpp deltanet.cpp
+  PROPERTIES COMPILE_OPTIONS "-march=x86-64-v3;-O3")
 # Its NPU programs (kernels/) are registered from kernels/CMakeLists.txt.
 
 # How often a second MTP draft would be kept (tools/qwen35_2b/mtp_depth.cpp).
