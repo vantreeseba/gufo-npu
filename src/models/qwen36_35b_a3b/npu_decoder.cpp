@@ -16,6 +16,7 @@
 #include "core/vec.hpp"
 #include "models/qwen35/draft_vocab.hpp"
 #include "models/qwen35/moe.hpp"
+#include "models/qwen36_35b_a3b/cpu_gemv.hpp"
 #include "models/qwen36_35b_a3b/npu/gemv.hpp"
 #include "npu/gemv.hpp"
 
@@ -134,15 +135,18 @@ struct NpuDecoder::Impl {
     // the CPU router post_attention_norm and the router rows (experts, then
     // the shared expert's gate) in fp32.
     std::unique_ptr<Buffer> arena;
+    // MoE: the mixer output projection on the CPU, from `out`'s weight
+    // buffer read in place (written once at load, never by the NPU).
+    std::unique_ptr<Buffer> out_w;
+    std::unique_ptr<CpuGemv> out_cpu;
     std::vector<float> post_norm;
     std::vector<float> router;
     std::vector<int> chosen;  // the last step's first token's experts
     // Per token count. Dense: out, ffn, down, then the next block's in (or
-    // the LM head). MoE: mixer_out runs out alone; after routing,
+    // the LM head). MoE: out runs on the CPU (out_cpu); after routing,
     // moe[n - kGatherExperts] runs the two gathers over n experts and the
     // next block's in as one chain sequence.
     std::unique_ptr<Chain> chain[kMaxTokens];
-    std::unique_ptr<Chain> mixer_out[kMaxTokens];
     std::vector<std::unique_ptr<Chain>> moe[kMaxTokens];
     // The last block's chains without the LM head after them (prompt
     // passes whose logits nobody reads); the residual stays in lm_x.
@@ -248,6 +252,9 @@ struct NpuDecoder::Impl {
     std::size_t ffn_y_bytes = npu::kFfnYBytes;
     if (c.IsMoe()) {
       MakeExperts(b, file, p);
+      b.out_w = std::make_unique<Buffer>(b.out->weights());
+      b.out_cpu = std::make_unique<CpuGemv>(pool, b.out_w->as<std::uint8_t>(),
+                                            b.out->rows(), b.out->dim());
     } else {
       b.ffn = std::make_unique<Q4nxGemv>(
           runtime,
@@ -332,8 +339,8 @@ struct NpuDecoder::Impl {
   }
 
   // b's chains for `tokens`, into `next_gemv` (`next`), whose regions
-  // follow b's in `acts`. MoE: out -> ffn_x.D alone in mixer_out, then per
-  // expert count one chain sequence: gate + up (residual -> the next
+  // follow b's in `acts`. MoE (out runs on the CPU): per expert count one
+  // chain sequence: gate + up (residual -> the next
   // region's x.H) -> ffn_y, down -> that x's D, then `next_gemv`. Dense:
   // out, ffn, down and `next_gemv` as separate calls on the same regions.
   // With `bare`, the chains go to bare_chain / bare_moe and stop before the
@@ -345,13 +352,7 @@ struct NpuDecoder::Impl {
           "npu decoder: the next call does not match the chain's");
     }
     b.next = next;
-    Buffer& ffn_d = b.views.emplace_back(b.ffn_x->Sub(kD, kSlottedBytes));
     if (b.arena) {
-      if (!bare) {
-        auto& out = b.mixer_out[tokens - 1];
-        out = std::make_unique<Chain>(runtime);
-        out->Add(*b.out, *b.out_x, ffn_d, *scratch, tokens);
-      }
       const ChainNext kind = bare ? ChainNext::kNone : next;
       Buffer& window = b.views.emplace_back(
           acts->Sub(b.base + npu::kBlockFfnX, npu::ChainWindowBytes(kind)));
@@ -365,6 +366,7 @@ struct NpuDecoder::Impl {
       }
       return;
     }
+    Buffer& ffn_d = b.views.emplace_back(b.ffn_x->Sub(kD, kSlottedBytes));
     const std::size_t next_base = b.base + npu::kBlockBytes;
     Buffer& next_x = b.views.emplace_back(
         acts->Sub(next_base + npu::kBlockInX, npu::kInputBytes));
@@ -386,8 +388,8 @@ struct NpuDecoder::Impl {
 
   // Runs block b's FFN for `count` tokens and the call chained after it (the
   // next block's input projection, or an LM head): the chain, or for MoE the
-  // mixer's output projection, routing, then the chain sequence (the
-  // gathers and the next call).
+  // mixer's output projection on the CPU, routing, then the chain sequence
+  // (the gathers and the next call).
   // With `bare`, the last block's chains without the LM head.
   void SubmitFfn(Block& b, int count, NpuDecoder::Timeline::Submissions& kind,
                  bool bare = false) {
@@ -395,9 +397,25 @@ struct NpuDecoder::Impl {
       Submit(bare ? *b.bare_chain[count - 1] : *b.chain[count - 1], kind);
       return;
     }
-    Submit(*b.mixer_out[count - 1], timeline.mixer_out);
+    // ffn_x's token slots: H, the residual the previous chain wrote, and D,
+    // the out projection's output, which the CPU writes here. Invalidate
+    // them before the CPU writes D (an invalidate after would drop it), and
+    // flush them before the chain reads them; H goes back unchanged.
+    Buffer slots = b.ffn_x->Sub(0, count * kSlotBytes);
+    FromDevice(slots);
+    {
+      const auto start = std::chrono::steady_clock::now();
+      b.out_cpu->Run(b.out_x->as<float>(), gufo_npu::npu::kGemvSlot,
+                     slots.as<float>() + gufo_npu::npu::kGemvHidden,
+                     gufo_npu::npu::kGemvSlot, count);
+      const double seconds = SecondsSince(start);
+      cpu_seconds += seconds;
+      timeline.out_projection.seconds += seconds;
+      ++timeline.out_projection.count;
+    }
     const std::size_t n =
-        RouteExperts(b, count, bare ? ChainNext::kNone : b.next);
+        RouteExperts(b, count, bare ? ChainNext::kNone : b.next, slots);
+    ToDevice(slots);
     Submit(bare ? *b.bare_moe[count - 1][n] : *b.moe[count - 1][n], kind);
   }
 
@@ -559,12 +577,11 @@ struct NpuDecoder::Impl {
   // the experts only the other token chose 0, and they add exact zeros, so its
   // result does not depend on what the other token chose. Returns the index of
   // the chain for the union's size (n - kGatherExperts).
-  std::size_t RouteExperts(Block& b, int count, ChainNext next) {
+  // `slots`: ffn_x's first `count` token slots, H and D current on the host.
+  std::size_t RouteExperts(Block& b, int count, ChainNext next, Buffer& slots) {
     const auto start = std::chrono::steady_clock::now();
     const Config& c = config;
     const int d = c.hidden;
-    Buffer slots = b.ffn_x->Sub(0, count * kSlotBytes);
-    FromDevice(slots);
     for (int t = 0; t < count; ++t) {
       const float* h = slots.as<float>() + t * gufo_npu::npu::kGemvSlot;
       auto& x = router_x[t];
@@ -697,7 +714,11 @@ struct NpuDecoder::Impl {
         mixer.Linear(il, in_t, st, y);
       }
     }
-    ToDevice(out_x);
+    // An MoE block's out projection runs on the CPU from the host copy; the
+    // NPU never reads or writes its out_x.
+    if (!b.arena) {
+      ToDevice(out_x);
+    }
   }
 };
 

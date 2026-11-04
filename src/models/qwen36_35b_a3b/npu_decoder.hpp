@@ -22,12 +22,13 @@
 // mixers (Gated DeltaNet, attention) and the DeltaNet alpha/beta rows.
 //
 // Each layer keeps its experts and its shared expert in one device arena.
-// After the mixer's output projection (its own submission) the CPU routes in
-// fp32 (moe.hpp) and points two gathers at the chosen experts (Q4nxGather):
-// gate + up with SwiGLU scaled by the router weights, then one down over all
-// of them, and the next layer's input projection in one instruction
-// sequence (a chain sequence, npu::ChainSequence). Two submissions per
-// layer, on regions of one activation buffer. A two-token step reads the union
+// The CPU runs the mixer's output projection (CpuGemv, from the NPU weight
+// buffer in place), routes in fp32 (moe.hpp) and points two gathers at the
+// chosen experts (Q4nxGatherChain): gate + up with SwiGLU scaled by the
+// router weights, then one down over all of them, and the next layer's
+// input projection in one instruction sequence (a chain sequence,
+// npu::ChainSequence). One submission per layer, on regions of one
+// activation buffer. A two-token step reads the union
 // of both tokens' experts once; each token weighs the experts it did not choose
 // 0. (The dense FFN path kept from the family's decoder is unused: the 35B's
 // program has no dense FFN shapes.)
@@ -35,7 +36,7 @@
 // A step takes one or two tokens; the weights are read once for both. The
 // second token of a pair can be a speculative draft: Resolve() keeps it or
 // rolls the state back to just after the first. The MTP head drafts the
-// token after next on the NPU as well (four submissions per draft); its LM
+// token after next on the NPU as well (two submissions per draft); its LM
 // head scores only the draft vocabulary, and the main model still checks
 // each draft over every token.
 namespace gufo_npu::qwen36_35b_a3b {
@@ -150,11 +151,12 @@ public:
       long count = 0;
       double seconds = 0;
     };
-    Submissions first;      // layer 0's input projection
-    Submissions mixer_out;  // an MoE layer's mixer output projection
-    Submissions layers;     // a layer's FFN into the next projection or head
-    Submissions head;       // the LM head alone (Logits)
-    Submissions mtp;        // the MTP head's
+    Submissions first;  // layer 0's input projection
+    // An MoE layer's mixer output projection, on the CPU.
+    Submissions out_projection;
+    Submissions layers;  // a layer's FFN into the next projection or head
+    Submissions head;    // the LM head alone (Logits)
+    Submissions mtp;     // the MTP head's
     double sync_seconds = 0;
     double routing_seconds = 0;
     long steps = 0;
