@@ -1,5 +1,60 @@
 # Changelog
 
+## [0.3.0](https://github.com/vantreeseba/gufo-npu/compare/v0.2.0...v0.3.0) (2026-11-04)
+
+
+### Features
+
+* **bench:** time chained GEMV calls (bench gemv --chain) and a per-submission decode timeline for Qwen3.5-2B ([cacebec](https://github.com/vantreeseba/gufo-npu/commit/cacebec4583291bed6289bdeaa670b350c8c741a))
+* **npu:** patch the expert gathers inside a chain sequence (Q4nxGatherChain), sharing Q4nxGather's patch discovery ([525e0ac](https://github.com/vantreeseba/gufo-npu/commit/525e0acf779a0ff5c823b72042c2d8c0bcb690ff))
+* **qwen36_35b_a3b:** add a CPU q4nx GEMV shaped like the NPU core's, for the mixer output projection ([f9fd5ef](https://github.com/vantreeseba/gufo-npu/commit/f9fd5ef9690d9e6f6f853542def07a6aa5774d82))
+
+
+### Bug Fixes
+
+* **npu:** initialize every Buffer::Impl field, silencing -Wmissing-field-initializers ([2241722](https://github.com/vantreeseba/gufo-npu/commit/224172258632d9ef5d1288be2e1e0158afb25ca6))
+* **npu:** make every sub-buffer from its root buffer, as syncing a sub-buffer of a sub-buffer left stale data ([5892a65](https://github.com/vantreeseba/gufo-npu/commit/5892a656133b9ec1a25ace02d321caa7cbb163bb))
+
+
+### Performance
+
+* **qwen35_2b:** run each layer's chained GEMVs as one instruction sequence ([6044314](https://github.com/vantreeseba/gufo-npu/commit/6044314ef3c8d577b536905155fa2781698c3f9c))
+* **qwen35_2b:** run each layer's out, gate + up, down and next projection as one chain sequence (one call per layer) ([0d35013](https://github.com/vantreeseba/gufo-npu/commit/0d350130982d09afb8dd423ee8b9df62d1c8ef80))
+* **qwen36_35b_a3b:** build one chain sequence per MoE layer (gate + up gather, down gather, next call) with RTP words written only when they change ([5fe929b](https://github.com/vantreeseba/gufo-npu/commit/5fe929b48df52e6e65b2a24deed0dabfc0a8b255))
+* **qwen36_35b_a3b:** run each MoE layer's gathers and next projection as one chain sequence on one activation buffer, with a decode timeline ([36aa325](https://github.com/vantreeseba/gufo-npu/commit/36aa3257f01d4db1fcdf64efcbcd59b6aaf97fa4))
+* **qwen36_35b_a3b:** run each MoE layer's gathers and next projection as one instruction sequence, 7% faster decode ([5aa2d5d](https://github.com/vantreeseba/gufo-npu/commit/5aa2d5d4aea80bdd168f90782c54d3dc4e57fd1c))
+* **qwen36_35b_a3b:** run the MoE layers' mixer output projection on the CPU, 8-10% faster decode ([f2b0c51](https://github.com/vantreeseba/gufo-npu/commit/f2b0c5189ceb17b659b5c2fbeebbdbc211b5c76b))
+* **qwen36_35b_a3b:** run the MoE layers' mixer output projection on the CPU, one NPU submission per layer ([19cb688](https://github.com/vantreeseba/gufo-npu/commit/19cb6889a87368f7c4d30b35b2e09511f7744f7c))
+* **qwen36_35b_a3b:** write each gate + up gather round's router scales just before its weights, 13% faster gather ([1f133dc](https://github.com/vantreeseba/gufo-npu/commit/1f133dcb6114dc39a60817d30258312e373e6da6))
+
+
+### Documentation
+
+* point AGENTS.md, NOTICE and comments at the per-model decode and prefill programs ([4c964c9](https://github.com/vantreeseba/gufo-npu/commit/4c964c98c5f99b791e2f61b528cb8fa5f38e5e59))
+* **qwen35_2b:** record the chain sequences as retained, 3-4% faster decode with the same output ([ae08249](https://github.com/vantreeseba/gufo-npu/commit/ae08249e3fc75e3ab39de9b76379e203997e0867))
+* **qwen35_2b:** record the chain sequences as unmeasured and how to measure them on the box ([09ff1fa](https://github.com/vantreeseba/gufo-npu/commit/09ff1fad67ae24eaa760273b553c0bbc05433604))
+* **qwen35_2b:** say where Qwen3.5-2B's NPU programs and tests now live ([3f16e56](https://github.com/vantreeseba/gufo-npu/commit/3f16e568e78e5b1d5e3b027c78ef7dd1df9a249e))
+* **qwen36_35b_a3b:** point to the 35B's own decode program and decoder ([a4d7042](https://github.com/vantreeseba/gufo-npu/commit/a4d7042683e0ad0ab9e822049a6f18922d49dca0))
+* **qwen36_35b_a3b:** record the chain sequences and per-round gather scales, 7% faster decode with the same replies ([c054238](https://github.com/vantreeseba/gufo-npu/commit/c054238cac95c36434be15d9fe9b9b12aba098df))
+* **qwen36_35b_a3b:** record the CPU mixer output projection, 8-10% faster decode ([6f1c45d](https://github.com/vantreeseba/gufo-npu/commit/6f1c45df85519548060cb1e518539a027359df26))
+
+
+### Code Refactoring
+
+* **npu:** drop the q4nx_gemv defaults from the shared GEMV runtime; the 35B passes its own design ([cd461b3](https://github.com/vantreeseba/gufo-npu/commit/cd461b35aed54d824fea8bfdc5a5697a6ae35de2))
+* **npu:** run Qwen3.5-2B and Qwen3.6-35B-A3B on their own decode programs, decoders and prefills ([#25](https://github.com/vantreeseba/gufo-npu/issues/25)) ([53b44a2](https://github.com/vantreeseba/gufo-npu/commit/53b44a25ad89734bd5507ae30cfb96a64e8bad83))
+* **qwen35_2b:** give Qwen3.5-2B its own decode GEMV program (qwen35_2b_decode) ([a5b4eba](https://github.com/vantreeseba/gufo-npu/commit/a5b4ebae72adfadb1a70ddbd39fe777b378c5241))
+* **qwen35_2b:** give Qwen3.5-2B its own prefill GEMM program (qwen35_2b_prefill) ([27006cc](https://github.com/vantreeseba/gufo-npu/commit/27006cc90000e2dcaa7dc6012ecef6fc1094dca2))
+* **qwen35_2b:** move Qwen3.5-2B's NPU prefill into its package ([6e1ae27](https://github.com/vantreeseba/gufo-npu/commit/6e1ae275d531c2f317ca3e3dc4d7f0e52a8c40bd))
+* **qwen35_2b:** run Qwen3.5-2B on its own NPU decoder ([3c7d19b](https://github.com/vantreeseba/gufo-npu/commit/3c7d19bbcdadb7e495c2d73559279d4079b75483))
+* **qwen35_2b:** run Qwen3.5-2B's GEMV op tests and bench gemv on its own decode program ([166c84e](https://github.com/vantreeseba/gufo-npu/commit/166c84e7a1dc9e92df10d34b36da258c7ff8c1da))
+* **qwen36_35b_a3b:** build the decode GEMV as qwen36_35b_a3b_decode with only the 35B's shapes ([0c18f41](https://github.com/vantreeseba/gufo-npu/commit/0c18f41ea7f913b99552ff984968d6930a317d51))
+* **qwen36_35b_a3b:** move the q4nx GEMV design and the NPU decoder into the 35B's package ([4262546](https://github.com/vantreeseba/gufo-npu/commit/426254686d19d4170fe721475292c2bd7dcedff6))
+* **qwen36_35b_a3b:** share the CPU's q4nx block layout and code permutations in q4nx_tile.hpp ([57a9986](https://github.com/vantreeseba/gufo-npu/commit/57a9986b020b2cdb835532b1fef0a5433ad15eed))
+* **qwen36_35b_a3b:** spell the shared NPU types gufo_npu::npu:: where the package's own npu namespace hides them ([8b17d32](https://github.com/vantreeseba/gufo-npu/commit/8b17d3269e914c360094a1bbf443995467596c96))
+* **qwen36_35b_a3b:** the CLI, the server and the MoE spike run the 35B on its own decoder and program ([7fc24c2](https://github.com/vantreeseba/gufo-npu/commit/7fc24c25b852bde1cd6cf3db7840a5e23b9c4c63))
+* **qwen36_35b_a3b:** the NPU decoder lives in the 35B's package and loads qwen36_35b_a3b_decode ([28d71c3](https://github.com/vantreeseba/gufo-npu/commit/28d71c3d0eaa3485df5f25b481954bf3026b3420))
+
 ## [0.2.0](https://github.com/vantreeseba/gufo-npu/compare/v0.1.0...v0.2.0) (2026-11-02)
 
 
