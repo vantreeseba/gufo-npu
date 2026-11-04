@@ -136,7 +136,10 @@ struct NpuDecoder::Impl {
   // shared_head_norm.
   bool has_mtp = false;
   Block mtp;
-  std::vector<float> enorm, hnorm, output_norm;
+  std::vector<float> enorm, hnorm, output_norm, shared_head_norm;
+  // The MTP block's final residual per token of the last draft
+  // (mtp_hidden()).
+  std::vector<float> mtp_residual;
   std::unique_ptr<Q4nxGemv> eh_proj, draft_lm;
   std::vector<int> draft_ids;
   std::unique_ptr<Buffer> eh_x, mtp_lm_x, mtp_lm_y;
@@ -340,6 +343,9 @@ struct NpuDecoder::Impl {
       mtp_lm_y = Region(draft_base + npu::kHeadY, draft_lm->y_bytes());
       SetNormWeight(*mtp_lm_x,
                     file.Tensor(p + "nextn.shared_head_norm.weight"));
+      shared_head_norm =
+          ToFloats(file.Tensor(p + "nextn.shared_head_norm.weight"));
+      mtp_residual.resize(kMaxTokens * hidden);
       // eh_proj -> block in_x.H (its D stays zero); in: residual ->
       // ffn_x.H; the block chains into the draft LM head on its own input.
       for (int tokens = 1; tokens <= kMaxTokens; ++tokens) {
@@ -500,6 +506,18 @@ bool NpuDecoder::can_draft() const {
   return impl_->has_mtp;
 }
 
+const float* NpuDecoder::mtp_hidden(int t) {
+  Impl& m = *impl_;
+  const int d = m.config.hidden;
+  m.FromDevice(*m.mtp_lm_x);
+  const float* slot = m.mtp_lm_x->as<float>() + t * npu::kSlot;
+  float* out = m.mtp_residual.data() + static_cast<std::size_t>(t) * d;
+  for (int i = 0; i < d; ++i) {
+    out[i] = slot[i] + slot[npu::kHidden + i];
+  }
+  return out;
+}
+
 const float* NpuDecoder::hidden(int t) const {
   return impl_->final_hidden.data() +
          static_cast<std::size_t>(t) * impl_->config.hidden;
@@ -617,7 +635,8 @@ void NpuDecoder::Resolve(DecodeState& state, bool keep_second) {
 }
 
 void NpuDecoder::FillMtp(const float* const* hidden, const int* tokens,
-                         int count, int position, DecodeState& state) {
+                         int count, int position, DecodeState& state,
+                         bool from_mtp) {
   Impl& m = *impl_;
   const Config& c = m.config;
   const int d = c.hidden;
@@ -638,7 +657,8 @@ void NpuDecoder::FillMtp(const float* const* hidden, const int* tokens,
                                           quant::RowBytes(m.embed->type, d),
                       m.normed.data(), d);
     RmsNorm(m.normed.data(), m.enorm.data(), d, c.rms_eps, slot);
-    RmsNorm(hidden[t], m.output_norm.data(), d, c.rms_eps, m.normed.data());
+    RmsNorm(hidden[t], (from_mtp ? m.shared_head_norm : m.output_norm).data(),
+            d, c.rms_eps, m.normed.data());
     RmsNorm(m.normed.data(), m.hnorm.data(), d, c.rms_eps, slot + d);
   }
   m.ToDevice(x);
@@ -649,9 +669,9 @@ void NpuDecoder::FillMtp(const float* const* hidden, const int* tokens,
 }
 
 int NpuDecoder::Draft(const float* const* hidden, const int* tokens, int count,
-                      int position, DecodeState& state) {
+                      int position, DecodeState& state, bool from_mtp) {
   Impl& m = *impl_;
-  FillMtp(hidden, tokens, count, position, state);
+  FillMtp(hidden, tokens, count, position, state, from_mtp);
   m.SubmitFfn(m.mtp, count, m.timeline.mtp);
   m.FromDevice(*m.mtp_lm_y);
   const float* scores =
