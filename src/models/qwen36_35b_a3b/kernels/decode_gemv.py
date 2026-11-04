@@ -416,7 +416,20 @@ def _emit_call(call, tokens, X, W, Y, R, arr, written):
             [0, 0, seg_chunk, 1],
         )
 
-    def gather_sequence(W, Y, w_prods, y_conses, tg, finish_residual):
+    def write_scales(rtps, rnd):
+        """Round rnd's swiglu_scaled scales (placeholders the host patches),
+        one word per token in every core."""
+        for rtp in rtps:
+            for t in range(TOKENS):
+                i = rnd * TOKENS + t
+                rtp[RTP_SCALES + i] = SCALE_SENTINEL + i
+
+    def gather_sequence(W, Y, w_prods, y_conses, tg, finish_residual, rtps=None):
+        """With `rtps` (gate + up), each round's scales are written just
+        before its weights are queued instead of all before the token: a
+        core reads round r's scale only when it stores round r, after all its
+        weights have arrived, and the 576 RTP writes of 9 experts (~66 ns
+        each) then overlap the stream instead of delaying its start."""
         window = []
 
         def push(group, depth=GATHER_DEPTH):
@@ -434,6 +447,8 @@ def _emit_call(call, tokens, X, W, Y, R, arr, written):
                 g = TaskGroup()
                 for rnd in part:
                     last = rnd == part[-1]
+                    if rtps is not None:
+                        write_scales(rtps, rnd)
                     for col in range(COLS):
                         w_prods[col].fill(
                             W, seg_tap(rnd * COLS + col), wait=last, group=g
@@ -478,7 +493,9 @@ def _emit_call(call, tokens, X, W, Y, R, arr, written):
             if written[c] is None or written[c][word] != value:
                 rtp[word] = value
         written[c] = core_words
-        if epilogue == "swiglu_scaled":
+        # A rounds gather writes each round's scales itself, just before
+        # that round's weights (gather_sequence).
+        if epilogue == "swiglu_scaled" and gather != "rounds":
             for i in range(rounds * TOKENS):
                 rtp[RTP_SCALES + i] = SCALE_SENTINEL + i
     # One broadcast sends the token to every core; it has no completion
@@ -505,7 +522,10 @@ def _emit_call(call, tokens, X, W, Y, R, arr, written):
 
     tg = TaskGroup()
     if gather:
-        gather_sequence(W.tensor, Y.tensor, w_prods, y_conses, tg, finish_residual)
+        gather_sequence(
+            W.tensor, Y.tensor, w_prods, y_conses, tg, finish_residual,
+            arr.rtps if epilogue == "swiglu_scaled" else None,
+        )
         tg.finish()
         x_task.free()
         return
