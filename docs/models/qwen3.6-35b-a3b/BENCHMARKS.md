@@ -75,6 +75,19 @@ anew.
 - Device buffers: 19.0 GiB (19,416 MiB, the MTP block's arena and dense
   matrices included), anonymous memory ~0.6 GB. Load 20.2–21.2 s.
 
+### One packed RTP word per call (2026-11-04)
+
+A call's shape (k blocks, rounds, input and output stage, residual pieces,
+core row, tokens) goes to each core as one packed RTP word, which the core
+unpacks once per call, instead of up to seven words: a deltanet layer's
+chain stream issued 512 shape-word writes (32 cores each), ~64 ns apiece on
+the sequence's critical path. One layer's chain in a 20-run runlist (9
+experts, one token): deltanet 640–647 → 617.5–622.6 µs, attention 579–580 →
+554.6–555.4 µs. In the decoder (interleaved against 6f1c45d, three runs):
+the layer submission 830–836 → 804–810 µs; sky 24.7–25.0 tok/s and
+Fibonacci 24.2–24.9 without a draft (23.9–24.4, 23.9–24.1 before), 34.9–35.5
+with MTP (34.2–34.7); replies the same.
+
 ### The mixer output projection on the CPU (2026-11-04)
 
 Each MoE layer's mixer output projection (ssm_out / attn_output, 4096 →
