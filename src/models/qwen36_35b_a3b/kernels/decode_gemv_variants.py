@@ -72,10 +72,86 @@ def sequences():
             yield (dim, rows, prologue, epilogue, y_stride, tokens, gather, experts)
 
 
+# Chains: one instruction sequence runs a MoE layer's calls after the CPU
+# router (the gate + up gather, the down gather, then the next call), so the
+# submission is one call instead of three. The calls read and write regions
+# of one activation buffer, laid out per layer in blocks
+# (src/models/qwen36_35b_a3b/npu/gemv.hpp mirrors this layout):
+#   block: in_x | ffn_x | in_y | out_x | ffn_y | scratch
+#   head:  x | r | y      (the LM heads' input, residual and logits)
+# A chain's window starts at its block's ffn_x and runs into the next block
+# (the next layer's, or a head), whose x, r and y sit where a block's in_x,
+# ffn_x and in_y do. Bytes throughout. Runtime arguments: the window, the
+# layer's expert arena twice (the gate + up gather patches only the second
+# argument, the down gather only the third), the next call's weights.
+INPUT_BYTES = (TOKENS * SLOT + HIDDEN // 2) * 4  # an input region (X_FLOATS)
+IN_Y_BYTES = TOKENS * 12288 * 4  # the longest input projection's y (DeltaNet)
+FFN_Y_BYTES = 8 * (MAX_DIM // 2) * 4  # a gate + up gather's y (y_bytes)
+SCRATCH_BYTES = (SLOT + HIDDEN) * 4  # a residual argument nobody reads
+BLOCK_IN_X = 0
+BLOCK_FFN_X = INPUT_BYTES
+BLOCK_IN_Y = 2 * INPUT_BYTES
+BLOCK_OUT_X = 2 * INPUT_BYTES + IN_Y_BYTES
+BLOCK_FFN_Y = 3 * INPUT_BYTES + IN_Y_BYTES
+BLOCK_SCRATCH = 3 * INPUT_BYTES + IN_Y_BYTES + FFN_Y_BYTES
+BLOCK_BYTES = BLOCK_SCRATCH + SCRATCH_BYTES
+# Offsets inside a chain's window.
+WINDOW_FFN_X = 0
+WINDOW_FFN_Y = BLOCK_FFN_Y - BLOCK_FFN_X
+WINDOW_SCRATCH = BLOCK_SCRATCH - BLOCK_FFN_X
+WINDOW_NEXT = BLOCK_BYTES - BLOCK_FFN_X  # the next block's (or head's) x
+WINDOW_NEXT_R = WINDOW_NEXT + BLOCK_FFN_X
+WINDOW_NEXT_Y = WINDOW_NEXT + BLOCK_IN_Y
+D_OFFSET = HIDDEN * 4  # the D half of a slot
+
+# The call after a layer's FFN, by name: the rows of a resnorm/store call on
+# the hidden vector, or None for a chain that stops after the FFN (the last
+# layer of a prompt pass whose logits nobody reads).
+CHAIN_NEXT = {
+    "deltanet": 12288,  # the next layer's DeltaNet input
+    "attention": 9216,  # the next layer's attention input
+    "lm": 248832,  # the LM head
+    "draft": 32768,  # the MTP draft's LM head
+    "bare": None,
+}
+
+
+def chain_name(next_name, experts, tokens) -> str:
+    """Matches qwen36_35b_a3b::npu::ChainSequence."""
+    return f"{XCLBIN}_chain_{next_name}_e{experts}_t{tokens}"
+
+
+def chain_window_bytes(next_name) -> int:
+    """The window a chain reads and writes (its first argument)."""
+    rows = CHAIN_NEXT[next_name]
+    if rows is None:
+        return WINDOW_NEXT + INPUT_BYTES
+    return WINDOW_NEXT_Y + TOKENS * rows * 4
+
+
+def chains():
+    """(next, experts, tokens): one token reads 9 experts, two read 9 to 17,
+    as the gathers do."""
+    for next_name in CHAIN_NEXT:
+        for experts in MOE_COUNTS:
+            for tokens in (1, 2) if experts == 9 else (2,):
+                yield (next_name, experts, tokens)
+
+
+assert all(
+    offset % 64 == 0
+    for offset in (BLOCK_FFN_X, BLOCK_IN_Y, BLOCK_OUT_X, BLOCK_FFN_Y, BLOCK_SCRATCH, BLOCK_BYTES)
+)
+
 # build.py checks these: the xclbin, then per variant an instruction ELF and
-# the raw instruction words (the host's instruction-buffer flow).
-OUTPUTS = [f"{XCLBIN}.xclbin"] + [
-    f"{sequence_name(d, n, p, e, t, g, x)}.insts.{suffix}"
-    for d, n, p, e, _, t, g, x in sequences()
-    for suffix in ("elf", "bin")
-]
+# the raw instruction words (the host's instruction-buffer flow), then per
+# chain its raw instruction words (chains run only in that flow).
+OUTPUTS = (
+    [f"{XCLBIN}.xclbin"]
+    + [
+        f"{sequence_name(d, n, p, e, t, g, x)}.insts.{suffix}"
+        for d, n, p, e, _, t, g, x in sequences()
+        for suffix in ("elf", "bin")
+    ]
+    + [f"{chain_name(n, x, t)}.insts.bin" for n, x, t in chains()]
+)
