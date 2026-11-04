@@ -125,8 +125,10 @@ Buffer Buffer::Sub(std::size_t offset, std::size_t bytes) const {
   if (offset % 64 != 0 || offset + bytes > impl_->bytes) {
     throw std::invalid_argument("npu buffer: sub-buffer out of range");
   }
+  const xrt::bo& root = impl_->root ? *impl_->root : impl_->bo;
+  const std::size_t at = impl_->offset + offset;
   return Buffer(
-      std::make_shared<Impl>(Impl{xrt::bo(impl_->bo, bytes, offset), bytes}));
+      std::make_shared<Impl>(Impl{xrt::bo(root, bytes, at), bytes, root, at}));
 }
 
 void* Buffer::data() {
