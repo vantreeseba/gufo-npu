@@ -369,36 +369,49 @@ Turbo shortens the single-call round trip by ~14 µs and the GEMVs by ~3%
 (+0.6% decode). Bandwidth does not move, so the NPU clock is not the limit.
 gufo-npu does not change the power mode.
 
-### One chain sequence per layer (to measure)
+### One chain sequence per layer
 
-Each layer's out → gate + up → down → next projection now runs as one
+Each layer's out → gate + up → down → next projection runs as one
 instruction sequence (`qwen35_2b_decode_chain_*`, one call per submission
-instead of four), on regions of one activation buffer. Not measured yet;
-expected 1.1–1.4 ms per token (4–5%), from the ~20 µs command cost of the 72
-calls it removes from the runlists.
+instead of four), on regions of one activation buffer. RTP words are written
+only when they change (896 → 640 per chain).
 
-On the box, the same toolchain for both builds: main and this branch, warm,
-interleaved, three runs of each per prompt:
+2026-11-03, the box, the same toolchain image for both builds, main
+(b098153) against this change, warm, interleaved, three runs each
+(`--max-tokens 256`):
+
+| Prompt | main | one chain sequence per layer | |
+|---|---|---|---|
+| Sky, `--draft none` | 39.14, 39.38, 39.21 tok/s | **40.79, 40.75, 40.69** | +3.9% |
+| Sky, `--draft mtp` | 53.99, 53.70, 53.71 tok/s | **55.30, 55.60, 55.60** | +3.2% |
+| Fibonacci, `--draft none` | 38.81, 38.87, 38.65 tok/s | **40.12, 40.10, 40.16** | +3.4% |
+| Fibonacci, `--draft mtp` | 64.71, 64.48, 64.61 tok/s | **66.59, 66.64, 66.72** | +3.1% |
+
+- Every reply hashes the same as main's (sky `a49f1c4c`, Fibonacci
+  `fdb595fb`, with and without MTP). The 35B reply is unchanged too
+  (`2c9f87d3`, 20.4–20.8 tok/s on both).
+- 0.86–0.94 ms less per token, below the 1.1–1.4 ms expected from the ~20 µs
+  command cost of the 72 calls it removes.
+- The `[timeline: ...]` line: a decode step takes ~24.7 ms, a layer's chain
+  submission ~977 µs (~1,031 µs for two tokens), the LM head alone ~8.0 ms.
+- `bench gemv --chain 16`, per call inside a runlist: DeltaNet in 216 µs,
+  attention in 151 µs, mixer out 77 µs, gate + up 309 µs, down 166 µs, LM head
+  5.29 ms.
+
+To repeat it:
 
 ```sh
 # The cost of a call inside a runlist, per decode shape (one-token calls).
 gufo-npu bench gemv --model "$GUFO_NPU_QWEN35_2B_Q4_GGUF" --chain 16
 # Decode speed, without and with MTP; the [timeline: ...] line shows the
 # mean wall time of each kind of submission (layer = a layer's chain).
-for draft in none mtp; do
-  gufo-npu generate --device npu --model "$GUFO_NPU_QWEN35_2B_Q4_GGUF" \
-    --prompt "Why is the sky blue?" --max-tokens 256 --draft $draft
-  gufo-npu generate --device npu --model "$GUFO_NPU_QWEN35_2B_Q4_GGUF" \
-    --prompt "Write a Python function for Fibonacci numbers." \
-    --max-tokens 256 --draft $draft
-done
-# Same output: the chain sequences against the per-call chain, then the
+gufo-npu generate --device npu --model "$GUFO_NPU_QWEN35_2B_Q4_GGUF" \
+  --prompt "Explain in a few sentences why the sky is blue." \
+  --max-tokens 256 --draft none   # and --draft mtp, and the Fibonacci prompt
+# Same output: every chain sequence against the per-call chain, then the
 # decoder against the CPU decoder.
-ctest --preset npu -R 'qwen35_decode_gemv_chain_test|qwen35_decode_gemv_test|qwen35_npu_decode_test|qwen35_npu_sampling_test'
+ctest --preset npu -R 'qwen35_decode_gemv_chain_test|qwen35_decode_gemv_test|qwen35_npu_decode_test|qwen35_npu_sampling_test|qwen35_npu_prefill_test'
 ```
-
-The replies must hash the same as main's (greedy). The layer submission's
-mean (timeline) should drop by about 60 µs.
 
 ## NPU prefill (Phase 4)
 
