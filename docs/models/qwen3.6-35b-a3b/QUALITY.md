@@ -399,6 +399,13 @@ and the next input projection, re-pointed between submissions) over five
 selections: one token with 9 experts (twice), and two tokens with unions of
 9, 13 and 17 experts, each token weighing about a third of them 0. 20,000
 runs; every byte each selection writes is identical to its first run.
+`qwen36_moe_chain_sequence_test` (label `npu`) runs a layer two ways on
+two copies of the activation buffer, the gathers and the next projection as
+separate calls and as the chain sequence the decoder submits, with a new
+selection and new router weights every run (one token with 9 experts, two
+tokens with 9, 13 and 17), for every next call (DeltaNet, attention, LM
+head, draft head, none): both copies must match bit for bit after every
+run, apart from the gate + up output's padding, which the design discards.
 `q4nx_moe_gather_test` checks the same gathers against the CPU (worst
 relative error 4.8e-4 to 7.9e-4).
 
