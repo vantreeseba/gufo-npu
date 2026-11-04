@@ -107,8 +107,9 @@ Flow GemvRuntime::flow() const {
 }
 
 Buffer::Buffer(GemvRuntime& runtime, std::size_t bytes)
-    : impl_(std::make_shared<Impl>(Impl{
-          runtime.impl().hw.Buffer(std::max<std::size_t>(bytes, 64)), bytes})) {
+    : impl_(std::make_shared<Impl>(
+          Impl{runtime.impl().hw.Buffer(std::max<std::size_t>(bytes, 64)),
+               bytes, std::nullopt, 0})) {
   // Zero it and push the zeros out of the CPU cache now: dirty lines left
   // behind can be written back over what the NPU writes later (seen as
   // intermittently corrupted LM head output).
@@ -280,8 +281,8 @@ std::size_t Q4nxGemv::weight_bytes() const {
 }
 
 Buffer Q4nxGemv::weights() const {
-  return Buffer(
-      std::make_shared<Buffer::Impl>(Buffer::Impl{impl_->w, impl_->w_bytes}));
+  return Buffer(std::make_shared<Buffer::Impl>(
+      Buffer::Impl{impl_->w, impl_->w_bytes, std::nullopt, 0}));
 }
 
 namespace {

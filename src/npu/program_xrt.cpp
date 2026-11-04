@@ -51,8 +51,9 @@ bool Program::Has(const std::string& sequence) const {
 }
 
 Buffer::Buffer(Program& program, std::size_t bytes)
-    : impl_(std::make_shared<Impl>(Impl{
-          program.impl().hw.Buffer(std::max<std::size_t>(bytes, 64)), bytes})) {
+    : impl_(std::make_shared<Impl>(
+          Impl{program.impl().hw.Buffer(std::max<std::size_t>(bytes, 64)),
+               bytes, std::nullopt, 0})) {
   // As the GEMV runtime's buffers: zeroed, and the zeros pushed out of the
   // CPU cache before the NPU writes it.
   std::memset(data(), 0, bytes);
