@@ -75,6 +75,33 @@ anew.
 - Device buffers: 19.0 GiB (19,416 MiB, the MTP block's arena and dense
   matrices included), anonymous memory ~0.6 GB. Load 20.2–21.2 s.
 
+### One chain sequence per MoE layer, gather scales per round (2026-11-04)
+
+Each MoE layer's second submission (gate + up gather, down gather, next
+projection) runs as one instruction sequence
+(`qwen36_35b_a3b_decode_chain_*`, patched like the gathers), RTP shape
+words are written only when they change, and the gate + up gather writes
+each round's router scales just before that round's weights. Interleaved
+against main (b098153; the 35B there is the same as on 6044314), the same
+toolchain image, warm, three runs each, `--max-tokens 128`:
+
+| Prompt | main | this change | |
+|---|---|---|---|
+| Sky, `--draft none` | 20.56, 20.73, 20.41 tok/s | **22.10, 22.13, 21.94** | +7% |
+| Sky, `--draft mtp` | 26.48, 26.61, 26.58 tok/s | **28.20, 28.21, 28.36** | +6.5% |
+| Fibonacci, `--draft none` | 20.46, 20.40, 20.35 tok/s | **21.71, 21.70, 21.77** | +6.5% |
+| Fibonacci, `--draft mtp` | 29.78, 29.80, 29.78 tok/s | **31.97, 32.15, 31.98** | +7.5% |
+
+- Replies hash the same as main's (sky `2c9f87d3`, Fibonacci `fc2f2574`).
+- The chain sequences alone (before the scale change): sky 21.05–21.49,
+  Fibonacci 20.99–21.16 without a draft (+3%).
+- The `[timeline: …]` lines, short prompt without a draft: a step ~46.1 ms;
+  per layer the chain submission ~820 µs and the mixer output ~194 µs;
+  routing ~1.8 ms per step; first submission ~430 µs.
+- What is left: a layer's chain reads ~31 MB (gathers 16.4, DeltaNet input
+  14.5), ~560 µs at 56 GB/s, against ~820; the mixer output (4.8 MB, ~90
+  µs) takes ~194 µs as a submission of its own.
+
 ### One token per pass
 
 The first version (one token per pass, prompt included, no MTP), same

@@ -112,4 +112,12 @@ if(GUFO_NPU_ENABLE_XRT AND GUFO_NPU_BUILD_KERNELS)
   set_tests_properties(q4nx_moe_chain_test PROPERTIES
                        LABELS "qwen36_35b_a3b;npu;kernels" SKIP_RETURN_CODE 77
                        TIMEOUT 600)
+
+  add_executable(qwen36_moe_chain_sequence_test moe_chain_sequence_test.cpp)
+  target_link_libraries(qwen36_moe_chain_sequence_test PRIVATE gufo_npu_runtime)
+  add_test(NAME qwen36_moe_chain_sequence_test
+           COMMAND qwen36_moe_chain_sequence_test "${kernels}")
+  set_tests_properties(qwen36_moe_chain_sequence_test PROPERTIES
+                       LABELS "qwen36_35b_a3b;npu;kernels" SKIP_RETURN_CODE 77
+                       TIMEOUT 900)
 endif()

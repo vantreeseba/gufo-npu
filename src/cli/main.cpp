@@ -981,6 +981,15 @@ int GenerateOnNpu(const gufo_npu::gguf::File& file,
                  tl.first.count, mean_us(tl.layers), tl.layers.count,
                  mean_us(tl.head), tl.head.count, mean_us(tl.mtp), tl.mtp.count,
                  1e6 * tl.sync_seconds / steps);
+    // MoE decoders: the mixer output projection's own submission and the
+    // CPU router between it and the layer's chain.
+    if constexpr (requires { tl.mixer_out; }) {
+      std::fprintf(stderr,
+                   "[timeline: mixer out %.0f us (x%ld); %.0f us routing per "
+                   "step]\n",
+                   mean_us(tl.mixer_out), tl.mixer_out.count,
+                   1e6 * tl.routing_seconds / steps);
+    }
   }
   return 0;
 }

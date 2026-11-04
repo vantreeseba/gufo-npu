@@ -95,7 +95,22 @@ Chain::Chain(GemvRuntime&) {
 }
 Chain::~Chain() = default;
 void Chain::Add(Q4nxGemv&, Buffer&, Buffer&, Buffer&, std::size_t) {}
+struct Q4nxGatherChain::Impl {};
+Q4nxGatherChain::Q4nxGatherChain(GemvRuntime&, const std::string&,
+                                 const ExpertArena&, std::size_t, std::size_t) {
+  NoXrt();
+}
+Q4nxGatherChain::~Q4nxGatherChain() = default;
+void Q4nxGatherChain::Select(const int*, const float*) {}
+std::size_t Q4nxGatherChain::experts() const {
+  return 0;
+}
+std::size_t Q4nxGatherChain::tokens() const {
+  return 0;
+}
+
 void Chain::Add(Q4nxGather&, Buffer&, Buffer&, Buffer&, Buffer&) {}
+void Chain::Add(Q4nxGatherChain&, Buffer&, Buffer&, Buffer&) {}
 void Chain::Add(const std::string&, Buffer&, Buffer&, Buffer&, Buffer&) {}
 void Chain::Run() {}
 

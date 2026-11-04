@@ -25,11 +25,12 @@
 // After the mixer's output projection (its own submission) the CPU routes in
 // fp32 (moe.hpp) and points two gathers at the chosen experts (Q4nxGather):
 // gate + up with SwiGLU scaled by the router weights, then one down over all
-// of them, chained with the next layer's input projection. Two submissions
-// per layer. A two-token step reads the union of both tokens' experts once;
-// each token weighs the experts it did not choose 0. (The dense FFN path
-// kept from the family's decoder is unused: the 35B's program has no dense
-// FFN shapes.)
+// of them, and the next layer's input projection in one instruction
+// sequence (a chain sequence, npu::ChainSequence). Two submissions per
+// layer, on regions of one activation buffer. A two-token step reads the union
+// of both tokens' experts once; each token weighs the experts it did not choose
+// 0. (The dense FFN path kept from the family's decoder is unused: the 35B's
+// program has no dense FFN shapes.)
 //
 // A step takes one or two tokens; the weights are read once for both. The
 // second token of a pair can be a speculative draft: Resolve() keeps it or
@@ -140,6 +141,26 @@ public:
   long submissions() const;
   double cpu_seconds() const;
   double router_seconds() const;
+
+  // Where a step's time goes: per kind of submission their count and wall
+  // time, the host's buffer syncs, routing (with patching the chain
+  // sequences) and the steps' wall time.
+  struct Timeline {
+    struct Submissions {
+      long count = 0;
+      double seconds = 0;
+    };
+    Submissions first;      // layer 0's input projection
+    Submissions mixer_out;  // an MoE layer's mixer output projection
+    Submissions layers;     // a layer's FFN into the next projection or head
+    Submissions head;       // the LM head alone (Logits)
+    Submissions mtp;        // the MTP head's
+    double sync_seconds = 0;
+    double routing_seconds = 0;
+    long steps = 0;
+    double step_seconds = 0;
+  };
+  const Timeline& timeline() const;
 
 private:
   struct Impl;
