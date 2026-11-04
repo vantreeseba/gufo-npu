@@ -89,9 +89,40 @@ KERNEL_SOURCE = HERE / "aie" / "decode_gemv.cc"
 XCLBIN = V.NAME
 
 bf16 = np.dtype[bfloat16]
-# k blocks, rounds, input stage, output stage, residual pieces, core row,
-# tokens.
-RTP_TY = np.ndarray[(7,), np.dtype[np.int32]]
+# Word 0: the call's shape packed into fields (SHAPE_FIELDS), so a call
+# writes one word per core (each RTP write costs the sequence ~66 ns, 32
+# cores per word); word 1: the core's row, written once per sequence.
+RTP_TY = np.ndarray[(2,), np.dtype[np.int32]]
+# (name, bits) of RTP word 0, lowest bits first.
+SHAPE_FIELDS = (
+    ("k_blocks", 6),
+    ("rounds", 8),
+    ("prologue", 2),
+    ("epilogue", 2),
+    ("res_pieces", 5),
+    ("tokens", 2),
+)
+
+
+def _pack_shape(**fields):
+    """RTP word 0 for a call (SHAPE_FIELDS)."""
+    word, shift = 0, 0
+    for name, bits in SHAPE_FIELDS:
+        value = fields[name]
+        assert 0 <= value < 1 << bits, (name, value)
+        word += value << shift
+        shift += bits
+    return word
+
+
+def _unpack_shape(word):
+    """SHAPE_FIELDS of RTP word 0 on the core (powers of two: shifts and
+    masks once lowered)."""
+    fields, scale = {}, 1
+    for name, bits in SHAPE_FIELDS:
+        fields[name] = (word // scale) % (1 << bits)
+        scale <<= bits
+    return fields
 
 PROLOGUES = {"plain": 0, "resnorm": 1, "act": 2}
 EPILOGUES = {"store": 0, "swiglu": 1}
@@ -178,30 +209,32 @@ class _Array:
         y_col_ty = np.ndarray[(ROWS, TOKENS * M_TILE), np.dtype[np.float32]]
         shims = [Tile(j, 0) for j in range(COLS)]
 
-        def body(x, w_in, y_out, k_zero, k_block, k_store, y_acc, sums, rtp):
-            for _ in range_(rtp[1]):
+        def body(x, w_in, y_out, k_zero, k_block, k_store, y_acc, sums, f):
+            for _ in range_(f["rounds"]):
                 k_zero(y_acc)
-                for kb in range_(rtp[0]):
+                for kb in range_(f["k_blocks"]):
                     w = w_in.acquire(1)
-                    k_block(w, x, y_acc, sums, kb, rtp[2], rtp[6])
+                    k_block(w, x, y_acc, sums, kb, f["prologue"], f["tokens"])
                     w_in.release(1)
                 y = y_out.acquire(1)
-                k_store(y, y_acc, rtp[3])
+                k_store(y, y_acc, f["epilogue"])
                 y_out.release(1)
 
         # The sequence writes the RTP before it sends the token, so it is
-        # current once the token arrives.
+        # current once the token arrives; a core reads it once per call,
+        # right after taking the token.
         def core_fn(
             x_in, w_in, y_out, k_residual, k_prep, k_zero, k_block, k_store, y_acc, sums, rtp
         ):
             x = x_in.acquire(1)
-            k_residual(x, rtp[0], rtp[2], rtp[6])
-            k_prep(x, sums, rtp[0], rtp[2], rtp[6])
-            body(x, w_in, y_out, k_zero, k_block, k_store, y_acc, sums, rtp)
+            f = _unpack_shape(rtp[0])
+            k_residual(x, f["k_blocks"], f["prologue"], f["tokens"])
+            k_prep(x, sums, f["k_blocks"], f["prologue"], f["tokens"])
+            body(x, w_in, y_out, k_zero, k_block, k_store, y_acc, sums, f)
             x_in.release(1)
 
-        # The residual column's cores first send their quarter of H + D (RTP
-        # word 4 pieces; 0 when the input stage is not resnorm).
+        # The residual column's cores first send their quarter of H + D (the
+        # res_pieces field pieces; 0 when the input stage is not resnorm).
         def residual_core_fn(
             x_in,
             w_in,
@@ -217,13 +250,14 @@ class _Array:
             rtp,
         ):
             x = x_in.acquire(1)
-            k_residual(x, rtp[0], rtp[2], rtp[6])
-            for piece in range_(rtp[4]):
+            f = _unpack_shape(rtp[0])
+            k_residual(x, f["k_blocks"], f["prologue"], f["tokens"])
+            for piece in range_(f["res_pieces"]):
                 y = y_out.acquire(1)
-                k_residual_out(y, x, rtp[5], piece)
+                k_residual_out(y, x, rtp[1], piece)
                 y_out.release(1)
-            k_prep(x, sums, rtp[0], rtp[2], rtp[6])
-            body(x, w_in, y_out, k_zero, k_block, k_store, y_acc, sums, rtp)
+            k_prep(x, sums, f["k_blocks"], f["prologue"], f["tokens"])
+            body(x, w_in, y_out, k_zero, k_block, k_store, y_acc, sums, f)
             x_in.release(1)
 
         of_x = ObjectFifo(x_ty, name="x", depth=1)
@@ -378,15 +412,16 @@ def _emit_call(
         [M_TILE, HIDDEN // ROWS, SLOT, 1],
     )
 
-    shape_words = (
-        k_blocks,
-        rounds,
-        PROLOGUES[prologue],
-        EPILOGUES[epilogue],
-        RES_PIECES if prologue == "resnorm" else 0,
+    shape_word = _pack_shape(
+        k_blocks=k_blocks,
+        rounds=rounds,
+        prologue=PROLOGUES[prologue],
+        epilogue=EPILOGUES[epilogue],
+        res_pieces=RES_PIECES if prologue == "resnorm" else 0,
+        tokens=tokens,
     )
     for c, (rtp, row) in enumerate(zip(rtps, rtp_rows)):
-        words = shape_words + (row, tokens)
+        words = (shape_word, row)
         for word, value in enumerate(words):
             if written[c] is None or written[c][word] != value:
                 rtp[word] = value
