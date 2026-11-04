@@ -352,15 +352,26 @@ std::string GatherSequence(const std::string& design, Q4nxGather::Kind kind,
          std::to_string(kGemvHidden) + "_act_store_k" + count + t;
 }
 
-}  // namespace
+// Throws unless the design has a gather variant for `experts` and `tokens`.
+void CheckGatherShape(std::size_t experts, std::size_t tokens) {
+  if (tokens < 1 || tokens > kGemvTokens) {
+    throw std::invalid_argument("q4nx gather: 1 or 2 tokens per call");
+  }
+  if (experts < kGatherExperts ||
+      experts > (tokens == 1 ? kGatherExperts : kMaxGatherExperts)) {
+    throw std::invalid_argument("q4nx gather: no variant for " +
+                                std::to_string(experts) + " experts and " +
+                                std::to_string(tokens) + " token(s)");
+  }
+}
 
-struct Q4nxGather::Impl {
-  GemvRuntime::Impl& rt;
-  Kind kind;
-  ExpertArena arena;
+// One gather's patch sites in an instruction stream: its weight patches (on
+// buffer argument `arg`) and, for gate + up, its scale words. A stream may
+// hold several gathers, each reading the arena through its own argument.
+struct GatherPatches {
+  Q4nxGather::Kind kind;
   std::size_t experts;
   std::size_t tokens;
-  std::unique_ptr<InstrSequence> instructions;
   // A weight patch: the expert slot (index into Select's ids) it reads and
   // its offset inside that expert's matrix.
   struct Site {
@@ -377,37 +388,21 @@ struct Q4nxGather::Impl {
   };
   std::vector<Scale> scales;
 
-  Impl(GemvRuntime::Impl& r, Kind k, const ExpertArena& a, std::size_t n,
-       std::size_t t)
-      : rt(r), kind(k), arena(a), experts(n), tokens(t) {
-    if (rt.flow != Flow::kInstructionBuffer) {
-      throw std::logic_error(
-          "q4nx gather: needs a runtime with the instruction-buffer flow");
-    }
-    if (tokens < 1 || tokens > kGemvTokens) {
-      throw std::invalid_argument("q4nx gather: 1 or 2 tokens per call");
-    }
-    if (experts < kGatherExperts ||
-        experts > (tokens == 1 ? kGatherExperts : kMaxGatherExperts)) {
-      throw std::invalid_argument("q4nx gather: no variant for " +
-                                  std::to_string(experts) + " experts and " +
-                                  std::to_string(tokens) + " token(s)");
-    }
-    const std::string name =
-        GatherSequence(rt.design.name, kind, experts, tokens);
-    instructions = std::make_unique<InstrSequence>(rt.hw, *rt.kernel,
-                                                   rt.Path(name, ".insts.bin"));
-    const auto& w = instructions->words;
+  // `name` names the stream in errors.
+  GatherPatches(Q4nxGather::Kind k, const std::vector<std::uint32_t>& w,
+                std::uint32_t arg, std::size_t n, std::size_t t,
+                const std::string& name)
+      : kind(k), experts(n), tokens(t) {
     // The compiled offsets place segments back to back in a virtual matrix:
     //   gate + up: segment round * kCols + col, a column's slice of the
     //     gate + up of the round's expert;
     //   down: segment (round * kCols + col) * experts + expert, the
     //     expert's part of that (round, col) slice.
+    const bool up = kind == Q4nxGather::Kind::kGateUp;
     const std::size_t seg =
-        kind == Kind::kGateUp
-            ? ExpertArena::kUpBytes / q4nx::kCols
-            : ExpertArena::kDownBytes / (kDownRounds * q4nx::kCols);
-    for (const std::size_t word : PatchSites(w, kWeightArg)) {
+        up ? ExpertArena::kUpBytes / q4nx::kCols
+           : ExpertArena::kDownBytes / (kDownRounds * q4nx::kCols);
+    for (const std::size_t word : PatchSites(w, arg)) {
       const std::uint64_t placeholder = PatchOffset(w, word);
       if (placeholder % seg != 0) {
         throw std::runtime_error("q4nx gather: unexpected patch offset in " +
@@ -415,9 +410,8 @@ struct Q4nxGather::Impl {
       }
       const std::uint64_t index = placeholder / seg;
       const Site site =
-          kind == Kind::kGateUp
-              ? Site{word, index / q4nx::kCols, (index % q4nx::kCols) * seg}
-              : Site{word, index % experts, (index / experts) * seg};
+          up ? Site{word, index / q4nx::kCols, (index % q4nx::kCols) * seg}
+             : Site{word, index % experts, (index / experts) * seg};
       if (site.expert >= experts) {
         throw std::runtime_error("q4nx gather: patch beyond the experts in " +
                                  name);
@@ -425,14 +419,13 @@ struct Q4nxGather::Impl {
       sites.push_back(site);
     }
     const std::size_t want_sites =
-        experts * q4nx::kCols *
-        (kind == Kind::kGateUp ? std::size_t{1} : kDownRounds);
+        experts * q4nx::kCols * (up ? std::size_t{1} : kDownRounds);
     if (sites.size() != want_sites) {
       throw std::runtime_error("q4nx gather: " + std::to_string(sites.size()) +
                                " weight patches in " + name + ", expected " +
                                std::to_string(want_sites));
     }
-    if (kind != Kind::kGateUp) {
+    if (!up) {
       return;
     }
     for (std::size_t i = 0; i < w.size(); ++i) {
@@ -449,6 +442,73 @@ struct Q4nxGather::Impl {
                                std::to_string(want_scales));
     }
   }
+
+  // Points the patches at arena experts ids[0..experts) and, for gate + up,
+  // writes the scales (Q4nxGather::Select's contract). The caller syncs.
+  void Apply(std::vector<std::uint32_t>& w, const ExpertArena& arena,
+             const int* ids, const float* scale_values) const {
+    for (std::size_t i = 0; i < experts; ++i) {
+      if (ids[i] < 0 || static_cast<std::size_t>(ids[i]) >= arena.experts) {
+        throw std::out_of_range("q4nx gather: expert outside the arena");
+      }
+    }
+    const bool up = kind == Q4nxGather::Kind::kGateUp;
+    for (const auto& site : sites) {
+      const auto e = static_cast<std::size_t>(ids[site.expert]);
+      const std::size_t base = up ? arena.UpOffset(e) : arena.DownOffset(e);
+      SetPatchOffset(w, site.word, base + site.offset);
+    }
+    if (!up) {
+      return;
+    }
+    if (scale_values == nullptr) {
+      throw std::invalid_argument("q4nx gather: gate + up needs scales");
+    }
+    for (const auto& s : scales) {
+      // A token past the call's count has no output; its scale is unused.
+      const float v =
+          s.token < tokens ? scale_values[s.expert * tokens + s.token] : 0.0f;
+      std::memcpy(&w[s.word], &v, sizeof(v));
+    }
+  }
+};
+
+// The buffer arguments of a gather chain sequence (A, AU, AD, WN), as a
+// patch op numbers them (its argument index in the runtime sequence): the
+// activation window, the expert arena as the gate + up gather reads it, the
+// same arena as the down gather reads it, and the next call's weights. Each
+// gather's weight patches are on its own arena argument.
+constexpr std::uint32_t kChainWindowArg = 0;
+constexpr std::uint32_t kChainUpArg = 1;
+constexpr std::uint32_t kChainDownArg = 2;
+constexpr std::uint32_t kChainNextArg = 3;
+
+}  // namespace
+
+struct Q4nxGather::Impl {
+  GemvRuntime::Impl& rt;
+  Kind kind;
+  ExpertArena arena;
+  std::size_t experts;
+  std::size_t tokens;
+  std::unique_ptr<InstrSequence> instructions;
+  std::optional<GatherPatches> patches;
+
+  Impl(GemvRuntime::Impl& r, Kind k, const ExpertArena& a, std::size_t n,
+       std::size_t t)
+      : rt(r), kind(k), arena(a), experts(n), tokens(t) {
+    if (rt.flow != Flow::kInstructionBuffer) {
+      throw std::logic_error(
+          "q4nx gather: needs a runtime with the instruction-buffer flow");
+    }
+    CheckGatherShape(experts, tokens);
+    const std::string name =
+        GatherSequence(rt.design.name, kind, experts, tokens);
+    instructions = std::make_unique<InstrSequence>(rt.hw, *rt.kernel,
+                                                   rt.Path(name, ".insts.bin"));
+    patches.emplace(kind, instructions->words, kWeightArg, experts, tokens,
+                    name);
+  }
 };
 
 Q4nxGather::Q4nxGather(GemvRuntime& runtime, Kind kind,
@@ -461,29 +521,7 @@ Q4nxGather::~Q4nxGather() = default;
 
 void Q4nxGather::Select(const int* ids, const float* scales) {
   Impl& m = *impl_;
-  auto& w = m.instructions->words;
-  for (std::size_t i = 0; i < m.experts; ++i) {
-    if (ids[i] < 0 || static_cast<std::size_t>(ids[i]) >= m.arena.experts) {
-      throw std::out_of_range("q4nx gather: expert outside the arena");
-    }
-  }
-  for (const auto& site : m.sites) {
-    const auto e = static_cast<std::size_t>(ids[site.expert]);
-    const std::size_t base =
-        m.kind == Kind::kGateUp ? m.arena.UpOffset(e) : m.arena.DownOffset(e);
-    SetPatchOffset(w, site.word, base + site.offset);
-  }
-  if (m.kind == Kind::kGateUp) {
-    if (scales == nullptr) {
-      throw std::invalid_argument("q4nx gather: gate + up needs scales");
-    }
-    for (const auto& s : m.scales) {
-      // A token past the call's count has no output; its scale is unused.
-      const float v =
-          s.token < m.tokens ? scales[s.expert * m.tokens + s.token] : 0.0f;
-      std::memcpy(&w[s.word], &v, sizeof(v));
-    }
-  }
+  m.patches->Apply(m.instructions->words, m.arena, ids, scales);
   m.instructions->Sync();
 }
 
@@ -501,6 +539,57 @@ std::size_t Q4nxGather::experts() const {
 }
 
 std::size_t Q4nxGather::tokens() const {
+  return impl_->tokens;
+}
+
+struct Q4nxGatherChain::Impl {
+  GemvRuntime::Impl& rt;
+  ExpertArena arena;
+  std::size_t experts;
+  std::size_t tokens;
+  std::unique_ptr<InstrSequence> instructions;
+  std::optional<GatherPatches> up;
+  std::optional<GatherPatches> down;
+
+  Impl(GemvRuntime::Impl& r, const std::string& sequence, const ExpertArena& a,
+       std::size_t n, std::size_t t)
+      : rt(r), arena(a), experts(n), tokens(t) {
+    if (rt.flow != Flow::kInstructionBuffer) {
+      throw std::logic_error(
+          "q4nx gather chain: needs a runtime with the instruction-buffer "
+          "flow");
+    }
+    CheckGatherShape(experts, tokens);
+    instructions = std::make_unique<InstrSequence>(
+        rt.hw, *rt.kernel, rt.Path(sequence, ".insts.bin"));
+    up.emplace(Q4nxGather::Kind::kGateUp, instructions->words, kChainUpArg,
+               experts, tokens, sequence);
+    down.emplace(Q4nxGather::Kind::kDown, instructions->words, kChainDownArg,
+                 experts, tokens, sequence);
+  }
+};
+
+Q4nxGatherChain::Q4nxGatherChain(GemvRuntime& runtime,
+                                 const std::string& sequence,
+                                 const ExpertArena& arena, std::size_t experts,
+                                 std::size_t tokens)
+    : impl_(std::make_unique<Impl>(runtime.impl(), sequence, arena, experts,
+                                   tokens)) {}
+
+Q4nxGatherChain::~Q4nxGatherChain() = default;
+
+void Q4nxGatherChain::Select(const int* ids, const float* scales) {
+  Impl& m = *impl_;
+  m.up->Apply(m.instructions->words, m.arena, ids, scales);
+  m.down->Apply(m.instructions->words, m.arena, ids, nullptr);
+  m.instructions->Sync();
+}
+
+std::size_t Q4nxGatherChain::experts() const {
+  return impl_->experts;
+}
+
+std::size_t Q4nxGatherChain::tokens() const {
   return impl_->tokens;
 }
 
@@ -531,6 +620,22 @@ void Chain::Add(Q4nxGather& gather, Buffer& x, Buffer& arena, Buffer& y,
   impl_->runs.push_back(g.instructions->Run(
       *g.rt.kernel,
       {&x.impl().bo, &arena.impl().bo, &y.impl().bo, &residual.impl().bo}));
+  impl_->runlist.add(impl_->runs.back());
+}
+
+void Chain::Add(Q4nxGatherChain& chain, Buffer& window, Buffer& arena,
+                Buffer& next_weights) {
+  auto& g = chain.impl();
+  if (arena.size() < g.arena.bytes()) {
+    throw std::invalid_argument("q4nx gather chain: arena buffer too small");
+  }
+  // In argument order kChainWindowArg, kChainUpArg, kChainDownArg,
+  // kChainNextArg: the arena twice, once per gather.
+  static_assert(kChainWindowArg == 0 && kChainUpArg == 1 &&
+                kChainDownArg == 2 && kChainNextArg == 3);
+  impl_->runs.push_back(g.instructions->Run(
+      *g.rt.kernel, {&window.impl().bo, &arena.impl().bo, &arena.impl().bo,
+                     &next_weights.impl().bo}));
   impl_->runlist.add(impl_->runs.back());
 }
 

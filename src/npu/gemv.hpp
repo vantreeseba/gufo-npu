@@ -265,6 +265,36 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
+// One instruction sequence of the design holding a gate + up gather and a
+// down gather (a chain sequence, e.g. a layer's gathers and the next call
+// after them), patched like Q4nxGather. Its buffer arguments are the
+// activation window, the arena twice (the gate + up gather's weight patches
+// on the first, the down gather's on the second) and the next call's
+// weights; Chain::Add binds them. Needs a runtime with
+// Flow::kInstructionBuffer.
+class Q4nxGatherChain {
+public:
+  Q4nxGatherChain(GemvRuntime& runtime, const std::string& sequence,
+                  const ExpertArena& arena, std::size_t experts,
+                  std::size_t tokens);
+  ~Q4nxGatherChain();
+  Q4nxGatherChain(const Q4nxGatherChain&) = delete;
+  Q4nxGatherChain& operator=(const Q4nxGatherChain&) = delete;
+
+  // Q4nxGather::Select's contract, for both gathers: ids of experts()
+  // experts, scales[i * tokens + t] for the gate + up.
+  void Select(const int* ids, const float* scales);
+
+  std::size_t experts() const;
+  std::size_t tokens() const;
+
+  struct Impl;
+  Impl& impl() { return *impl_; }
+
+private:
+  std::unique_ptr<Impl> impl_;
+};
+
 // Calls submitted together and run back to back (an XRT runlist).
 class Chain {
 public:
@@ -279,6 +309,10 @@ public:
   // A gather over the experts in `arena` (an ExpertArena's bytes).
   void Add(Q4nxGather& gather, Buffer& x, Buffer& arena, Buffer& y,
            Buffer& residual);
+  // A gather chain sequence on its activation window, the expert arena
+  // (bound as both arena arguments) and the next call's weights.
+  void Add(Q4nxGatherChain& chain, Buffer& window, Buffer& arena,
+           Buffer& next_weights);
   // A run of one of the design's other instruction sequences, by name (e.g.
   // several GEMVs in one stream), on its four buffer arguments in order.
   // Throws when the sequence was not compiled.
