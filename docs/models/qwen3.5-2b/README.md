@@ -26,29 +26,44 @@ NPU decode with MTP speculation and NPU prefill: see
 
 Orange runs on the NPU, blue on the CPU.
 
-**Decode, one layer** (1 or 2 tokens per pass):
+**Decode, one layer** (1 or 2 tokens per pass; times are one token without a draft, warm, from [BENCHMARKS.md](BENCHMARKS.md), "The host's part of a step"):
 
 ```mermaid
 flowchart LR
-  inp["Norm + input projection"]:::npu --> mix["Token mixer:<br/>Gated DeltaNet (18 layers)<br/>or gated attention (6 layers)"]:::cpu
-  mix --> sub
-  subgraph sub ["One chained NPU submission"]
+  inp["Norm + input projection<br/>(first submission: 281–286 µs)"]:::npu -- "sync from the NPU<br/>~1 µs each" --> mix["Token mixer:<br/>Gated DeltaNet (18 layers), 36–43 µs each<br/>or gated attention (6 layers), 22–32 µs each"]:::cpu
+  mix -- "sync to the NPU ~1 µs,<br/>submit 3.0–3.4 µs" --> sub
+  subgraph sub ["One chained NPU submission: 939–945 µs on average"]
     out["Output projection"]:::npu --> ffn["Residual + norm,<br/>gate + up, SwiGLU"]:::npu --> down["Down projection"]:::npu --> nxt["Residual + norm,<br/>next layer's input projection"]:::npu
   end
   nxt -.-> mix
-  lm["LM head"]:::npu --> pick["Sample / check the MTP draft"]:::cpu
+  lm["LM head<br/>~5.3 ms, 290 MB"]:::npu -- "logits copy 30–32 µs" --> pick["Sample / check the MTP draft"]:::cpu
   classDef npu fill:#ffa94d,stroke:#d9480f,color:#000
   classDef cpu fill:#74c0fc,stroke:#1864ab,color:#000
 ```
 
-*Qwen3.5-2B: 24 layers, hidden 2,048, FFN 6,144, GQA 8 query / 2 KV heads (head dim 256), DeltaNet 16 key / 16 value heads. Every weight matrix is a q4nx GEMV on the NPU; the CPU runs only the mixers (and DeltaNet's small alpha/beta rows), so a token is 25 NPU submissions (one per layer, plus one).*
+*Qwen3.5-2B: 24 layers, hidden 2,048, FFN 6,144, GQA 8 query / 2 KV heads (head dim 256), DeltaNet 16 key / 16 value heads. Every weight matrix is a q4nx GEMV on the NPU; the CPU runs only the mixers (and DeltaNet's small alpha/beta rows), so a token is 25 NPU submissions (one per layer, plus one). A layer's chain runs in ~683 µs inside a runlist, ~605 µs of it reading its 33.9 MB of weights; a submission adds the NPU's ~65 µs command round trip, and the last layer's also runs the LM head, which is why the average is 939–945 µs.*
+
+**Where a decode step goes** (one token without a draft: 23.8–24.1 ms, ~42 tok/s):
+
+```mermaid
+pie showData
+  title One decode step, ms (midpoints)
+  "NPU: reading weights (1.11 GB at ~56 GB/s)" : 19.8
+  "NPU: call overhead inside the chains" : 1.9
+  "NPU: submission round trips (25)" : 1.2
+  "CPU: DeltaNet (18 layers)" : 0.72
+  "CPU: attention (6 layers)" : 0.16
+  "CPU: syncs, logits copy, embedding, other" : 0.14
+```
+
+*The NPU slices are estimates that add up to the measured 22.9 ms of submissions: weights read at the measured ceiling, the chains' measured ~683 µs against ~605 µs of reading, and the rest as round trips (`bench dispatch`: 65–70 µs for a one-run command). The CPU slices are measured. A two-token MTP verify step takes 26.1–26.4 ms: 24 layer submissions of 995–1,000 µs, DeltaNet 1.38–1.66 ms (each token makes its own passes over the state), attention 0.24–0.41 ms.*
 
 **Prompt pass** (prompts of 7 tokens or more):
 
 ```mermaid
 flowchart LR
-  chunk["Prompt chunk<br/>(up to 1,024 tokens)"] --> proj["Projections as<br/>bfp16 GEMMs"]:::npu
-  proj --> mixp["Norms, residuals, SwiGLU,<br/>DeltaNet + attention, batched"]:::cpu
+  chunk["Prompt chunk<br/>(256, 512 or 1,024 rows)"] --> proj["Projections as<br/>bfp16 GEMMs<br/>11 / 14.5 / 17 TFLOPS by chunk size"]:::npu
+  proj --> mixp["Norms, residuals, SwiGLU,<br/>DeltaNet + attention, batched<br/>~0.14 ms per token"]:::cpu
   mixp --> proj
   mixp --> state["Decoder state filled<br/>(K/V, DeltaNet, MTP cache)"]
   state --> first["First token: LM head<br/>on the last row"]:::npu
@@ -56,4 +71,4 @@ flowchart LR
   classDef cpu fill:#74c0fc,stroke:#1864ab,color:#000
 ```
 
-*With two chunks in flight, one chunk's GEMMs on the NPU overlap the CPU mixing the other.*
+*With two chunks in flight, one chunk's GEMMs on the NPU overlap the CPU mixing the other. A pass costs ~0.10 s however short the prompt; time to first token is 0.18 s at 476 tokens, 0.31 s at 1,000, 0.58 s at 2,048 and 1.24 s at 4,096 ([BENCHMARKS.md](BENCHMARKS.md), "NPU prefill").*
