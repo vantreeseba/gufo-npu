@@ -433,6 +433,42 @@ warm, three runs each (`--max-tokens 256`):
 - One layer chain in a 16-run runlist: 713–716 → 682–684 µs (1 token), of
   which ~605 µs is reading its 33.9 MB at 56 GB/s.
 
+### Fused DeltaNet decode step (2026-11-04)
+
+The CPU DeltaNet of a decode step was most of the host's time between
+submissions: per layer, a pool dispatch for the conv, another for the
+heads, the alpha/beta rows on the calling thread, and both again for the
+second token of a pair. `qwen35_2b::DeltaNetStep` runs a layer in one pool
+dispatch: each value head's job computes its alpha/beta rows, the conv,
+SiLU and L2 norms of its q, k and v channels, the delta rule and the gated
+norm, and applies both tokens of a pair to each 32-column block of its state
+while the block is in L1 (AVX-512 on Zen 5). It is bit-identical to
+`Mixer::Linear` (`qwen35_deltanet_test`: every DeltaNet layer, 120 one- and
+two-token steps with drafts kept and rolled back, with and without
+AVX-512).
+
+Main (563fc3e) against this change, the same toolchain image, interleaved,
+warm, a warm-up round and then two sweeps of three runs
+(`--max-tokens 256`), ranges over the six runs:
+
+| Prompt | main | fused DeltaNet step | |
+|---|---|---|---|
+| Sky, `--draft none` | 41.76–42.52 tok/s | **42.68–43.30** | +1.5% |
+| Fibonacci, `--draft none` | 41.61–41.96 (39.37 once, disturbed) | **41.36–42.73** | +1.1% |
+| Sky, `--draft mtp` | 56.81–58.15 tok/s | **58.18–58.73** | +2.1% |
+| Fibonacci, `--draft mtp` | 67.80–69.78 tok/s | **70.09–70.44** | +2.0% |
+
+- Every reply hashes the same as main's (sky `a49f1c4c`, Fibonacci
+  `fdb595fb`, with and without MTP).
+- A step (timeline): sky without a draft 23.6–24.1 → 23.2–23.5 ms; an MTP
+  verify step 25.8–26.8 → 25.5–25.8 ms. Layer submissions are unchanged
+  (924–1,009 µs), so the time saved is the host's.
+- `qwen35_npu_decode_test` prints the same as on main (argmax against the
+  q4nx CPU decoder 72/73, the same logit errors, speculative decode equal to
+  plain greedy for 48 tokens); `qwen35_npu_sampling_test`,
+  `qwen35_npu_prefill_test`, `qwen35_prompt_cache_test` and
+  `qwen35_decoder_test` pass.
+
 ## NPU prefill (Phase 4)
 
 `gufo-npu generate --device npu` now runs every prompt token but the last
