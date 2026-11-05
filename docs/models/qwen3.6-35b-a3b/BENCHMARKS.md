@@ -363,7 +363,8 @@ Reproduce: `python3 tools/bench/openai_bench.py --base-url http://<host>:13305/a
 
 The CPU decode path checked by `qwen36_decoder_test`: `Decoder` over
 `GgufProjections` in fp32, straight from the UD-Q4_K_XL GGUF (2.75 GB read
-per token, mostly Q8_0; a fused Q8_0 dot, other types dequantized per row),
+per token, mostly Q8_0; fused Q8_0 and Q6_K dots, other types dequantized
+per row),
 16 threads, release build, GGUF in page cache. 2026-10-27: one decode pass
 over 10 chat-prompt tokens to warm up, then the same 10 tokens timed; three
 runs: 43.5, 43.6 and 43.4 ms per token, **23.0 tok/s** at short context.
@@ -382,6 +383,15 @@ runs: 43.5, 43.6 and 43.4 ms per token, **23.0 tok/s** at short context.
 - The CPU reads these weights at ~70 GB/s averaged over the step. On its
   own it streams 115–120 GB/s on 16 threads; the NPU reads at most ~56 GB/s
   (below).
+- Fused Q6_K dot (2026-11-05, `qwen36_decoder_test` over the 17 chat-prompt
+  tokens, main and the change interleaved, three rounds each, GGUF in page
+  cache): on the UD-Q4_K_XL, whose only Q6_K tensors are three layers'
+  expert down projections, 20.5–22.8 → 22.7–23.6 tok/s (within the runs'
+  spread). On an imatrix Q4_K_M (`Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf`,
+  22.3 GB; LM head, `attn_qkv`, half the expert down projections and half
+  the shared experts in Q6_K), 10.4–10.5 → **21.5–23.4 tok/s**. Same logits on both (rel. err against the
+  reference 3.28e-4 and 1.06e-3, argmax 17/17, no routing differences). The
+  Q4_K_M's remaining Q4_K and Q5_K matrices still dequantize per row.
 
 ## DDR bandwidth (Phase 1)
 

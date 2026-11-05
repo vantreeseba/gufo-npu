@@ -1,20 +1,16 @@
 #include "models/qwen35/gguf_projections.hpp"
 
 #include <algorithm>
-#include <cstring>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
 
-#if defined(__x86_64__)
-#include <immintrin.h>
-#endif
-
 #include "core/cpus.hpp"
 #include "core/quant.hpp"
 #include "core/thread_pool.hpp"
 #include "core/vec.hpp"
+#include "models/qwen35/gguf_dot.hpp"
 
 namespace gufo_npu::qwen35 {
 namespace {
@@ -57,48 +53,21 @@ double DotDouble(const float* a, const float* b, std::size_t n) {
   return sum;
 }
 
-// A Q8_0 row (blocks of an fp16 scale and 32 int8) dotted with fp32 x
-// without dequantizing it first: most of the 35B's bytes per token are Q8_0.
-float DotQ8_0(const std::uint8_t* row, const float* x, std::size_t n) {
-  constexpr std::size_t kBlock = 32;
-  constexpr std::size_t kBlockBytes = 34;
-#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
-  __m256 acc = _mm256_setzero_ps();
-  for (std::size_t b = 0; b < n / kBlock; ++b, row += kBlockBytes) {
-    std::uint16_t bits;
-    std::memcpy(&bits, row, sizeof(bits));
-    const __m256 d = _mm256_set1_ps(_cvtsh_ss(bits));
-    const auto* q = reinterpret_cast<const __m128i*>(row + 2);
-    const float* xb = x + b * kBlock;
-    __m256 block = _mm256_setzero_ps();
-    for (int j = 0; j < 2; ++j) {
-      const __m128i q16 = _mm_loadu_si128(q + j);
-      const __m256 lo = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q16));
-      const __m256 hi =
-          _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(q16, 8)));
-      block = _mm256_fmadd_ps(lo, _mm256_loadu_ps(xb + 16 * j), block);
-      block = _mm256_fmadd_ps(hi, _mm256_loadu_ps(xb + 16 * j + 8), block);
-    }
-    acc = _mm256_fmadd_ps(d, block, acc);
+// The fused dot for rows of `type` (gguf_dot.hpp), or nullptr when rows
+// are dequantized first. Most of the 35B's bytes per token are Q8_0; Q6_K
+// holds some expert down projections and, in other quantizations, the LM
+// head and dense matrices.
+using FusedDot = float (*)(const std::uint8_t* row, const float* x,
+                           std::size_t n);
+FusedDot FusedDotFor(gguf::GgmlType type) {
+  switch (type) {
+    case gguf::GgmlType::kQ8_0:
+      return &gguf_dot::DotQ8_0;
+    case gguf::GgmlType::kQ6_K:
+      return &gguf_dot::DotQ6_K;
+    default:
+      return nullptr;
   }
-  const __m128 sum4 =
-      _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
-  const __m128 sum2 = _mm_add_ps(sum4, _mm_movehl_ps(sum4, sum4));
-  return _mm_cvtss_f32(_mm_add_ss(sum2, _mm_movehdup_ps(sum2)));
-#else
-  float sum = 0;
-  for (std::size_t b = 0; b < n / kBlock; ++b, row += kBlockBytes) {
-    std::uint16_t bits;
-    std::memcpy(&bits, row, sizeof(bits));
-    const auto* q = reinterpret_cast<const std::int8_t*>(row + 2);
-    float block = 0;
-    for (std::size_t j = 0; j < kBlock; ++j) {
-      block += static_cast<float>(q[j]) * x[b * kBlock + j];
-    }
-    sum += quant::HalfToFloat(bits) * block;
-  }
-  return sum;
-#endif
 }
 
 }  // namespace
@@ -286,16 +255,17 @@ void GgufProjections::MatMul(const std::vector<Rows>& parts, const float* x,
     }
     const Rows& part = parts[p];
     const auto row_bytes = quant::RowBytes(part.w->type, in);
+    const FusedDot fused = exact ? nullptr : FusedDotFor(part.w->type);
     const std::size_t begin = (job - first_job[p]) * kChunk;
     const std::size_t end = std::min(part.rows, begin + kChunk);
     thread_local std::vector<float> row;
     row.resize(in);
     for (std::size_t r = begin; r < end; ++r) {
       const std::uint8_t* data = part.w->data + (part.first + r) * row_bytes;
-      if (!exact && part.w->type == gguf::GgmlType::kQ8_0) {
+      if (fused != nullptr) {
         for (int t = 0; t < tokens; ++t) {
           y[static_cast<std::size_t>(t) * stride + offset + r] =
-              DotQ8_0(data, x + static_cast<std::size_t>(t) * in, in);
+              fused(data, x + static_cast<std::size_t>(t) * in, in);
         }
         continue;
       }
