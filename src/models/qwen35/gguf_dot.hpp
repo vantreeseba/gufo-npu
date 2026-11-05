@@ -9,10 +9,11 @@
 #endif
 
 #include "core/quant.hpp"
+#include "core/vec.hpp"
 
 // One GGUF weight row dotted with fp32 x without dequantizing the row first:
-// GgufProjections' fp32 path for its most read types. `n` is a multiple of
-// the type's block. The functions are static (a copy per translation unit),
+// GgufProjections' fp32 path for the types its models store. `n` is a multiple
+// of the type's block. The functions are static (a copy per translation unit),
 // as in core/vec.hpp, because the body depends on the unit's target flags:
 // the decoders build with AVX2 + FMA + F16C.
 namespace gufo_npu::qwen35::gguf_dot {
@@ -65,6 +66,130 @@ static inline float DotQ8_0(const std::uint8_t* row, const float* x,
   }
   return sum;
 #endif
+}
+
+// F32: the row as stored.
+static inline float DotF32(const std::uint8_t* row, const float* x,
+                           std::size_t n) {
+  return vec::Dot(reinterpret_cast<const float*>(row), x, static_cast<int>(n));
+}
+
+// The weights' scale d * scale_j and offset dmin * min_j of a Q4_K/Q5_K
+// super-block's 8 sub-blocks, from its 12 packed bytes of 6-bit scales and
+// mins (quant::ScaleMinK4, all 8 at once).
+static inline void ScalesMinsK4(const std::uint8_t* s, float d, float dmin,
+                                float* scale, float* min) {
+  for (int j = 0; j < 8; ++j) {
+    const int sc =
+        j < 4 ? s[j] & 63 : (s[j + 4] & 0xF) | ((s[j - 4] >> 6) << 4);
+    const int m = j < 4 ? s[j + 4] & 63 : (s[j + 4] >> 4) | ((s[j] >> 6) << 4);
+    scale[j] = d * static_cast<float>(sc);
+    min[j] = dmin * static_cast<float>(m);
+  }
+}
+
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+// acc + (q * scale - min) . x over one sub-block: 32 codes (bytes) and
+// x[0..31].
+static inline __m256 SubBlockK4(__m256i codes, __m256 scale, __m256 min,
+                                const float* x, __m256 acc) {
+  const __m128i lo = _mm256_castsi256_si128(codes);
+  const __m128i hi = _mm256_extracti128_si256(codes, 1);
+  const __m128i eighths[4] = {lo, _mm_srli_si128(lo, 8), hi,
+                              _mm_srli_si128(hi, 8)};
+  for (int i = 0; i < 4; ++i) {
+    const __m256 q = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(eighths[i]));
+    acc = _mm256_fmadd_ps(_mm256_fmsub_ps(q, scale, min),
+                          _mm256_loadu_ps(x + 8 * i), acc);
+  }
+  return acc;
+}
+#endif
+
+// Q4_K and, with kFifthBit, Q5_K: super-blocks of 256 values in 8
+// sub-blocks of 32; weight = d * scale_j * q - dmin * min_j, as
+// quant::Dequantize. Q4_K is d, dmin (fp16), 12 scale bytes and qs[128]
+// (144 bytes); Q5_K puts qh[32] before qs (176 bytes). Byte l of qs's p-th
+// 32 holds value l of sub-block 2p (low nibble) and of 2p + 1 (high
+// nibble); bit j of qh[l] adds 16 to value l of sub-block j.
+template<bool kFifthBit>
+static inline float DotK4(const std::uint8_t* row, const float* x,
+                          std::size_t n) {
+  constexpr std::size_t kBlock = 256;
+  constexpr std::size_t kBlockBytes = kFifthBit ? 176 : 144;
+  float scale[8];
+  float min[8];
+#if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
+  const __m256i low4 = _mm256_set1_epi8(0x0F);
+  const __m256i sixteen = _mm256_set1_epi8(0x10);
+  __m256 acc = _mm256_setzero_ps();
+  for (std::size_t b = 0; b < n / kBlock; ++b, row += kBlockBytes) {
+    std::uint16_t d_bits;
+    std::uint16_t dmin_bits;
+    std::memcpy(&d_bits, row, sizeof(d_bits));
+    std::memcpy(&dmin_bits, row + 2, sizeof(dmin_bits));
+    ScalesMinsK4(row + 4, _cvtsh_ss(d_bits), _cvtsh_ss(dmin_bits), scale, min);
+    const std::uint8_t* qs = row + 16 + (kFifthBit ? 32 : 0);
+    __m256i qh = _mm256_setzero_si256();
+    if constexpr (kFifthBit) {
+      qh = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row + 16));
+    }
+    const float* xb = x + b * kBlock;
+    for (int p = 0; p < 4; ++p, qs += 32) {
+      const __m256i q =
+          _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qs));
+      __m256i codes[2] = {_mm256_and_si256(q, low4),
+                          _mm256_and_si256(_mm256_srli_epi16(q, 4), low4)};
+      for (int i = 0; i < 2; ++i) {
+        const int j = 2 * p + i;
+        if constexpr (kFifthBit) {
+          const __m256i bit = _mm256_set1_epi8(static_cast<char>(1 << j));
+          const __m256i set = _mm256_cmpeq_epi8(_mm256_and_si256(qh, bit), bit);
+          codes[i] = _mm256_or_si256(codes[i], _mm256_and_si256(set, sixteen));
+        }
+        acc = SubBlockK4(codes[i], _mm256_set1_ps(scale[j]),
+                         _mm256_set1_ps(min[j]), xb + 32 * j, acc);
+      }
+    }
+  }
+  return HorizontalSum(acc);
+#else
+  float sum = 0;
+  for (std::size_t b = 0; b < n / kBlock; ++b, row += kBlockBytes) {
+    std::uint16_t d_bits;
+    std::uint16_t dmin_bits;
+    std::memcpy(&d_bits, row, sizeof(d_bits));
+    std::memcpy(&dmin_bits, row + 2, sizeof(dmin_bits));
+    ScalesMinsK4(row + 4, quant::HalfToFloat(d_bits),
+                 quant::HalfToFloat(dmin_bits), scale, min);
+    const std::uint8_t* qh = row + 16;
+    const std::uint8_t* qs = row + 16 + (kFifthBit ? 32 : 0);
+    const float* xb = x + b * kBlock;
+    float block = 0;
+    for (int j = 0; j < 8; ++j) {
+      const std::uint8_t* bytes = qs + 32 * (j / 2);
+      for (int l = 0; l < 32; ++l) {
+        int v = (j % 2) == 0 ? bytes[l] & 0xF : bytes[l] >> 4;
+        if (kFifthBit && ((qh[l] >> j) & 1) != 0) {
+          v += 16;
+        }
+        block += (scale[j] * static_cast<float>(v) - min[j]) * xb[32 * j + l];
+      }
+    }
+    sum += block;
+  }
+  return sum;
+#endif
+}
+
+static inline float DotQ4_K(const std::uint8_t* row, const float* x,
+                            std::size_t n) {
+  return DotK4<false>(row, x, n);
+}
+
+static inline float DotQ5_K(const std::uint8_t* row, const float* x,
+                            std::size_t n) {
+  return DotK4<true>(row, x, n);
 }
 
 // Q6_K: super-blocks of 256 values, 210 bytes: ql[128] (low 4 bits),

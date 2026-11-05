@@ -29,19 +29,44 @@ std::uint16_t RandomHalf(std::mt19937& rng) {
   return static_cast<std::uint16_t>(sign | exponent | mantissa);
 }
 
-// Random bytes for `n` values of `type`, with each block's fp16 scale
-// (Q8_0: first 2 bytes; Q6_K: last 2 of 210) replaced by a normal half.
+// Byte offsets of a block's fp16 scales: Q8_0's d first, Q4_K's and
+// Q5_K's d and dmin first, Q6_K's d last.
+std::vector<std::size_t> HalfOffsets(GgmlType type) {
+  switch (type) {
+    case GgmlType::kQ8_0:
+      return {0};
+    case GgmlType::kQ4_K:
+    case GgmlType::kQ5_K:
+      return {0, 2};
+    case GgmlType::kQ6_K:
+      return {208};
+    default:
+      return {};
+  }
+}
+
+// A random row of `n` values of `type`: random codes, scales and mins, each
+// block's fp16 scales normal halves; F32 rows standard normal.
 std::vector<std::uint8_t> RandomRow(GgmlType type, std::size_t n,
                                     std::mt19937& rng) {
   std::vector<std::uint8_t> row(quant::RowBytes(type, n));
+  if (type == GgmlType::kF32) {
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    for (std::size_t i = 0; i < n; ++i) {
+      const float v = normal(rng);
+      std::memcpy(&row[4 * i], &v, sizeof(v));
+    }
+    return row;
+  }
   for (auto& byte : row) {
     byte = static_cast<std::uint8_t>(rng());
   }
   const std::size_t block_bytes = quant::BlockBytes(type);
-  const std::size_t scale_at = type == GgmlType::kQ8_0 ? 0 : block_bytes - 2;
   for (std::size_t b = 0; b < row.size(); b += block_bytes) {
-    const std::uint16_t half = RandomHalf(rng);
-    std::memcpy(&row[b + scale_at], &half, sizeof(half));
+    for (const std::size_t at : HalfOffsets(type)) {
+      const std::uint16_t half = RandomHalf(rng);
+      std::memcpy(&row[b + at], &half, sizeof(half));
+    }
   }
   return row;
 }
@@ -56,7 +81,10 @@ int main() {
   };
   const Case cases[] = {
       {"Q8_0", GgmlType::kQ8_0, &dot::DotQ8_0},
+      {"Q4_K", GgmlType::kQ4_K, &dot::DotQ4_K},
+      {"Q5_K", GgmlType::kQ5_K, &dot::DotQ5_K},
       {"Q6_K", GgmlType::kQ6_K, &dot::DotQ6_K},
+      {"F32", GgmlType::kF32, &dot::DotF32},
   };
   std::mt19937 rng(20261105);
   std::normal_distribution<float> normal(0.0f, 1.0f);
