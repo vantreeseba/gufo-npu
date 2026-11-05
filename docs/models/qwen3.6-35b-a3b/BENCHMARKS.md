@@ -389,8 +389,10 @@ runs: 43.5, 43.6 and 43.4 ms per token, **23.0 tok/s** at short context.
   expert down projections, 20.5–22.8 → 22.7–23.6 tok/s (within the runs'
   spread). On an imatrix Q4_K_M (`Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf`,
   22.3 GB; LM head, `attn_qkv`, half the expert down projections and half
-  the shared experts in Q6_K), 10.4–10.5 → **21.5–23.4 tok/s**. Same logits on both (rel. err against the
-  reference 3.28e-4 and 1.06e-3, argmax 17/17, no routing differences). The
+  the shared experts in Q6_K), 10.4–10.5 → **21.5–23.4 tok/s**. Same
+  results as main on both: rel. err against the reference 3.28e-4 and
+  1.06e-3, argmax 17/17; on the UD-Q4_K_XL the same 3 routing differences
+  as main (near-ties from position 13, gap 1.3e-4), none on the Q4_K_M. The
   Q4_K_M's remaining Q4_K and Q5_K matrices still dequantize per row.
 
 ## DDR bandwidth (Phase 1)
