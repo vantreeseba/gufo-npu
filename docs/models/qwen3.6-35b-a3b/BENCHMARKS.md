@@ -363,8 +363,8 @@ Reproduce: `python3 tools/bench/openai_bench.py --base-url http://<host>:13305/a
 
 The CPU decode path checked by `qwen36_decoder_test`: `Decoder` over
 `GgufProjections` in fp32, straight from the UD-Q4_K_XL GGUF (2.75 GB read
-per token, mostly Q8_0; fused Q8_0 and Q6_K dots, other types dequantized
-per row),
+per token, mostly Q8_0; fused dots for Q8_0, Q4_K, Q5_K, Q6_K and F32,
+F16 and BF16 dequantized per row),
 16 threads, release build, GGUF in page cache. 2026-10-27: one decode pass
 over 10 chat-prompt tokens to warm up, then the same 10 tokens timed; three
 runs: 43.5, 43.6 and 43.4 ms per token, **23.0 tok/s** at short context.
@@ -392,8 +392,13 @@ runs: 43.5, 43.6 and 43.4 ms per token, **23.0 tok/s** at short context.
   the shared experts in Q6_K), 10.4–10.5 → **21.5–23.4 tok/s**. Same
   results as main on both: rel. err against the reference 3.28e-4 and
   1.06e-3, argmax 17/17; on the UD-Q4_K_XL the same 3 routing differences
-  as main (near-ties from position 13, gap 1.3e-4), none on the Q4_K_M. The
-  Q4_K_M's remaining Q4_K and Q5_K matrices still dequantize per row.
+  as main (near-ties from position 13, gap 1.3e-4), none on the Q4_K_M.
+- Fused Q4_K, Q5_K and F32 dots (2026-11-05, same test, against the fused
+  Q6_K above, interleaved, four rounds): UD-Q4_K_XL (routed expert gate/up
+  in Q4_K, down in Q5_K) 22.9–23.6 → **23.7–25.6 tok/s**; Q4_K_M 23.9–24.3
+  → **25.0–26.4 tok/s**. Same results: argmax 17/17, the same routing
+  (3 near-ties on the UD, none on the Q4_K_M), rel. err 3.28e-4 → 3.29e-4
+  and 1.06e-3 → 1.04e-3.
 
 ## DDR bandwidth (Phase 1)
 
