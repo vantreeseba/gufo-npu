@@ -54,17 +54,22 @@ double DotDouble(const float* a, const float* b, std::size_t n) {
 }
 
 // The fused dot for rows of `type` (gguf_dot.hpp), or nullptr when rows
-// are dequantized first. Most of the 35B's bytes per token are Q8_0; Q6_K
-// holds some expert down projections and, in other quantizations, the LM
-// head and dense matrices.
+// are dequantized first (F16 and BF16, which the models store only in small
+// tensors).
 using FusedDot = float (*)(const std::uint8_t* row, const float* x,
                            std::size_t n);
 FusedDot FusedDotFor(gguf::GgmlType type) {
   switch (type) {
     case gguf::GgmlType::kQ8_0:
       return &gguf_dot::DotQ8_0;
+    case gguf::GgmlType::kQ4_K:
+      return &gguf_dot::DotQ4_K;
+    case gguf::GgmlType::kQ5_K:
+      return &gguf_dot::DotQ5_K;
     case gguf::GgmlType::kQ6_K:
       return &gguf_dot::DotQ6_K;
+    case gguf::GgmlType::kF32:
+      return &gguf_dot::DotF32;
     default:
       return nullptr;
   }
