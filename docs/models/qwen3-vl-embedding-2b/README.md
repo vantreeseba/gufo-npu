@@ -9,8 +9,9 @@ with its shapes); nothing is shared with the Qwen3.5 family. See
 
 Text and images run on the NPU, in `gufo-npu embed` and in the server
 (images with the mmproj, `--mmproj`). For an image, every matrix product
-runs on the NPU and attention and the elementwise ops on the CPU, about
-4.3 s for a 1280 x 1440 page (BENCHMARKS.md). The fp32 CPU reference (`vision.hpp`,
+and the vision tower's attention run on the NPU, and the text model's
+attention and the elementwise ops on the CPU: about 3 s for a 1280 x 1440
+page (BENCHMARKS.md). The fp32 CPU reference (`vision.hpp`,
 `Reference::EmbedImage`) is the oracle. The forward pass, costs and plan
 are in [VISION.md](VISION.md). Video is not run.
 

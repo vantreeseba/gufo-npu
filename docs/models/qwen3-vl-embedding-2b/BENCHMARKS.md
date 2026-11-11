@@ -5,6 +5,54 @@ warm (2 warm-up calls per length), unique inputs per call, tokens per second
 over the timed calls and the share of time in GEMM waits, buffer syncs, CPU
 attention and the rest.
 
+## 2026-11-11, ViT attention on the NPU (VISION.md stage 3), source build, F16 GGUF + F16 mmproj
+
+`NpuVision::Encode` on the test cards of `qwen3vl_embed_2b_npu_vision_test`,
+warm, median of 5 runs after a warm-up, from a probe linked against main
+and against this branch (main's run used this build's GEMM xclbin, which
+is unchanged); the two alternated main, branch, main, branch on the same
+box state (vision seconds, sweep 1 / sweep 2):
+
+| Card | Patches | main (CPU attention) | branch (NPU attention) |
+|---|---|---|---|
+| 96 x 64 | 24 | 0.030 / 0.030 | 0.161 / 0.203 |
+| 320 x 240 | 320 | 0.068 / 0.063 | 0.214 / 0.244 |
+| 640 x 480 | 1,200 | 0.276 / 0.260 | 0.351 / 0.335 |
+| 1024 x 768 | 3,072 | 0.763 / 0.728 | 0.777 / 0.695 |
+| 1280 x 1440 | 7,200 | 3.572 / 3.565 | 2.469 / 2.376 |
+
+- A page's vision tower is 1.15 s (33%) faster. From ~3,000 patches
+  down the NPU path is slower: every block moves the NPU from the GEMM's
+  hardware context to the attention's and back, ~0.15 s per image
+  (EXPERIMENTS.md, Candidates).
+- The switch: the GEMM and the attention program alternated, each call
+  awaited, take 8.56 ms per pair against 0.35 + 2.04 ms of work alone,
+  so ~3.1 ms a switch (docs/research/STRIX-HALO-NPU.md).
+
+`qwen3vl_embed_2b_npu_vision_test`'s page (1280 x 1440, 1,822 tokens),
+3 runs: 3.22, 2.92 and 3.13 s (stage 2: 4.20 to 4.40 s). Run 2:
+
+| Phase | Time | NPU GEMM calls | GEMM wait | sync | attention | other |
+|---|---|---|---|---|---|---|
+| Vision tower | 2.20 s | 792 | 0.17 s | 0.08 s | **1.65 s** (NPU) | 0.30 s |
+| Text model | 0.72 s | 224 | 0.30 s | 0.04 s | 0.25 s (CPU) | 0.13 s |
+
+The attention program alone (`qwen3vl_embed_2b_vit_attention_test`, one
+layer, warm, no context switch; the q/k/v split on the CPU, then the NPU
+call with its buffer syncs):
+
+| Patches (padded) | Per layer | Split | NPU |
+|---|---|---|---|
+| 24 (256) | 0.53 ms | 0.30 ms | 0.23 ms |
+| 300 (512) | 0.85 ms | 0.33 ms | 0.52 ms |
+| 1,200 (1,280) | 2.7 to 2.9 ms | 0.5 to 0.6 ms | 2.2 to 2.3 ms |
+| 3,000 (3,072) | 12.1 ms | 1.2 ms | 10.9 ms |
+| 7,200 (7,424) | 61 to 64 ms | 2.7 to 4.5 ms | 58.4 to 59.1 ms |
+
+At 7,200 patches that is 5.1 TFLOP per page in 1.4 s of NPU time (3.6
+TFLOP/s; the 3-term splits run three mmuls per product), against the
+CPU's 120 ms per layer.
+
 ## 2026-11-11, images on the NPU (VISION.md stage 2), source build, F16 GGUF + F16 mmproj
 
 `qwen3vl_embed_2b_npu_vision_test`'s page: a 1280 x 1440 test card
