@@ -34,13 +34,19 @@ Where a page's time goes (sweep 1, run 1):
   0.08 to 0.09 s per image, warm.
 
 The text path after this change (the attention kernels take a head
-layout, the GEMM pass is shared): `gufo-npu bench embed --tokens
-128,512,2048 --batch 8 --runs 5`, two sweeps at load ~11 from other
-services: 3,380 and 3,327 tok/s at 128 tokens, 3,793 and 3,790 at 512,
-2,760 and 2,629 at 2,048, against 3,544, 4,024 and 3,037 in the table
-below. The same-day run of main for comparison was cut short (the box
-went down during it), so whether the 5 to 9% gap is load or the change is
-not settled yet.
+layout, the GEMM pass is shared) against main (image `:main`, built
+2026-11-05, after the last change to this code), `gufo-npu bench embed
+--tokens 128,512,2048 --batch 8 --runs 5`, runs alternated main, branch,
+main, branch on the same box state (tok/s):
+
+| Tokens per input | main | branch |
+|---|---|---|
+| 128 | 3,472 / 3,029 | 3,408 / 3,563 |
+| 512 | 3,697 / 3,873 | 3,870 / 3,805 |
+| 2,048 | 2,726 / 2,740 | 2,696 / 2,717 |
+
+Within noise of each other (2,048 tokens: -1%). Both sit 5 to 10% under
+the 2026-10-30 table below, so that gap is the box, not this change.
 
 ## 2026-10-30, AVX-512 attention, image `sha-86050a6`, F16 GGUF
 
