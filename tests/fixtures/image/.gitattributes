@@ -1,0 +1,3 @@
+# Raw pixels and image files: never diffed or converted as text.
+* binary
+expected.txt -binary
