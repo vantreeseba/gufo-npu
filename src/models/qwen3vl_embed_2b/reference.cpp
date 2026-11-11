@@ -191,41 +191,11 @@ struct Reference::Impl {
     const auto segments = Pack({ids}, cfg.vocab);
     const int n = segments.back().length;
     const auto positions = MropePositions(ids, image_pad_id, images);
-    for (const ImageFeatures& f : images) {
-      if (f.embeds.size() != static_cast<std::size_t>(f.Tokens()) * d) {
-        throw std::invalid_argument("qwen3vl: image features of another width");
-      }
-      for (const auto& ds : f.deepstack) {
-        if (ds.size() != f.embeds.size()) {
-          throw std::invalid_argument("qwen3vl: DeepStack features' shape");
-        }
-      }
-    }
-    // Each image token's row and the feature row it takes, in order
-    // (MropePositions has checked that the runs match the images).
-    struct Slot {
-      std::size_t row;
-      const ImageFeatures* image;
-      std::size_t k;
-    };
-    std::vector<Slot> slots;
-    {
-      std::size_t next = 0;
-      std::size_t k = 0;
-      for (std::size_t i = 0; i < ids.size(); ++i) {
-        if (ids[i] != image_pad_id) {
-          continue;
-        }
-        slots.push_back({i, &images[next], k});
-        if (++k == static_cast<std::size_t>(images[next].Tokens())) {
-          ++next;
-          k = 0;
-        }
-      }
-    }
+    const auto slots = ImageRows(ids, image_pad_id, images, d);
     std::vector<float> h = Lookup({ids}, n);
-    for (const Slot& s : slots) {
-      std::copy_n(s.image->embeds.data() + s.k * d, d, h.data() + s.row * d);
+    for (const ImageRow& s : slots) {
+      std::copy_n(s.image->embeds.data() + s.index * d, d,
+                  h.data() + s.row * d);
     }
     Layers(
         h, n,
@@ -237,11 +207,11 @@ struct Reference::Impl {
           // DeepStack: block il of an image's features joins its rows after
           // text layer il.
           const auto layer = static_cast<std::size_t>(il);
-          for (const Slot& s : slots) {
+          for (const ImageRow& s : slots) {
             if (layer >= s.image->deepstack.size()) {
               continue;
             }
-            const float* src = s.image->deepstack[layer].data() + s.k * d;
+            const float* src = s.image->deepstack[layer].data() + s.index * d;
             float* dst = h.data() + s.row * d;
             for (int i = 0; i < d; ++i) {
               dst[i] += src[i];

@@ -408,6 +408,42 @@ std::vector<int> MropePositions(const std::vector<int>& ids, int image_pad_id,
   return out;
 }
 
+std::vector<ImageRow> ImageRows(const std::vector<int>& ids, int image_pad_id,
+                                const std::vector<ImageFeatures>& images,
+                                int width) {
+  for (const ImageFeatures& f : images) {
+    const auto size = static_cast<std::size_t>(f.Tokens()) * width;
+    if (f.embeds.size() != size) {
+      throw std::invalid_argument("qwen3vl: image features of another width");
+    }
+    for (const auto& ds : f.deepstack) {
+      if (ds.size() != size) {
+        throw std::invalid_argument("qwen3vl: DeepStack features' shape");
+      }
+    }
+  }
+  std::vector<ImageRow> rows;
+  std::size_t next = 0;
+  std::size_t index = 0;
+  for (std::size_t i = 0; i < ids.size(); ++i) {
+    if (ids[i] != image_pad_id) {
+      continue;
+    }
+    if (next == images.size()) {
+      throw std::invalid_argument("qwen3vl: more image tokens than images");
+    }
+    rows.push_back({i, &images[next], index});
+    if (++index == static_cast<std::size_t>(images[next].Tokens())) {
+      ++next;
+      index = 0;
+    }
+  }
+  if (next != images.size() || index != 0) {
+    throw std::invalid_argument("qwen3vl: fewer image tokens than images");
+  }
+  return rows;
+}
+
 struct VisionReference::Impl {
   struct Block {
     std::vector<float> ln1_w, ln1_b, ln2_w, ln2_b;

@@ -1,4 +1,4 @@
-# Qwen3-VL-Embedding-2B (arch qwen3vl), text embeddings.
+# Qwen3-VL-Embedding-2B (arch qwen3vl), text and image embeddings.
 #   GUFO_NPU_QWEN3VL_EMBED_2B_GGUF    its BF16 GGUF (llama.cpp's converter)
 #   GUFO_NPU_QWEN3VL_EMBED_2B_ORACLE  the HF oracle's output
 #                                     (tools/reference/qwen3vl_embedding_oracle.py,
@@ -60,6 +60,15 @@ if(GUFO_NPU_ENABLE_XRT AND GUFO_NPU_BUILD_KERNELS)
   add_test(NAME qwen3vl_embed_2b_npu_embed_test
            COMMAND qwen3vl_embed_2b_npu_embed_test "${kernels}")
   set_tests_properties(qwen3vl_embed_2b_npu_embed_test PROPERTIES
+                       LABELS "qwen3vl_embed_2b;npu;model" SKIP_RETURN_CODE 77
+                       TIMEOUT 1800)
+
+  add_executable(qwen3vl_embed_2b_npu_vision_test npu_vision_test.cpp)
+  target_link_libraries(qwen3vl_embed_2b_npu_vision_test PRIVATE
+                        gufo_npu_qwen3vl_embed_2b_npu nlohmann_json)
+  add_test(NAME qwen3vl_embed_2b_npu_vision_test
+           COMMAND qwen3vl_embed_2b_npu_vision_test "${kernels}")
+  set_tests_properties(qwen3vl_embed_2b_npu_vision_test PROPERTIES
                        LABELS "qwen3vl_embed_2b;npu;model" SKIP_RETURN_CODE 77
                        TIMEOUT 1800)
 endif()

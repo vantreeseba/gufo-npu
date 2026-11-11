@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -120,6 +121,19 @@ struct ImageFeatures {
 // std::invalid_argument when the runs do not match `images`.
 std::vector<int> MropePositions(const std::vector<int>& ids, int image_pad_id,
                                 const std::vector<ImageFeatures>& images);
+
+// The rows of an input that take image features: each `image_pad_id` of
+// `ids` in order, with the image (in `images`) and the feature row of it
+// that it takes. Throws std::invalid_argument when the image tokens do not
+// match the images or a feature block is not `width` values per token.
+struct ImageRow {
+  std::size_t row = 0;
+  const ImageFeatures* image = nullptr;
+  std::size_t index = 0;
+};
+std::vector<ImageRow> ImageRows(const std::vector<int>& ids, int image_pad_id,
+                                const std::vector<ImageFeatures>& images,
+                                int width);
 
 // The vision tower in fp32: norms, biases and embeddings dequantized at
 // load, matrix rows as they are used. Slow; the oracle for an NPU path.
