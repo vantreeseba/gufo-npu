@@ -16,4 +16,11 @@ inline constexpr std::size_t kFfn = 6144;
 inline constexpr std::size_t kInRows = 4096;
 inline constexpr std::size_t kQDim = 2048;
 
+// The vision tower (mmproj): width, MLP, a merged 2x2 patch block, and the
+// patch embedding's K (3 x 16 x 16 values) padded to a multiple of 512.
+inline constexpr std::size_t kVitHidden = 1024;
+inline constexpr std::size_t kVitFfn = 4096;
+inline constexpr std::size_t kVitMerged = 4 * kVitHidden;
+inline constexpr std::size_t kPatchDim = 1024;
+
 }  // namespace gufo_npu::qwen3vl_embed_2b::npu

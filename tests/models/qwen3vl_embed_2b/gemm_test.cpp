@@ -36,13 +36,21 @@ struct Shape {
 };
 
 // Must match GEMM_SHAPES in
-// src/models/qwen3vl_embed_2b/kernels/embed_gemm_variants.py: attention
-// input (q | k | v), attention output, gate + up, down.
+// src/models/qwen3vl_embed_2b/kernels/embed_gemm_variants.py. Text:
+// attention input (q | k | v), attention output, gate + up, down. Vision:
+// qkv, attention output (and the padded patch embedding), fc1, fc2, merger
+// fc1, merger fc2.
 constexpr Shape kShapes[] = {
     {model::kHidden, model::kInRows},
     {model::kQDim, model::kHidden},
     {model::kHidden, 2 * model::kFfn},
     {model::kFfn, model::kHidden},
+    {model::kVitHidden, 3 * model::kVitHidden},
+    {model::kVitHidden, model::kVitHidden},
+    {model::kVitHidden, model::kVitFfn},
+    {model::kVitFfn, model::kVitHidden},
+    {model::kVitMerged, model::kVitMerged},
+    {model::kVitMerged, model::kHidden},
 };
 
 // y = A W^T in double, m x rows.
