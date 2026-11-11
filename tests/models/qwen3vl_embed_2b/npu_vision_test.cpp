@@ -4,10 +4,11 @@
 // PreprocessImage, NpuVision and NpuEmbedder::EmbedImage: the embedding
 // against HF (cosine >= 0.99, as the text NPU test; the GEMMs round weights
 // and activations to bfp16 and outputs to bf16) and the image features
-// against VisionReference's. A synthetic 640 x 480 card (1,200 patches, two
-// GEMM chunks) checks the features across chunks and its embedding against
-// the CPU reference's (cosine >= 0.99), and a 1280 x 1440 page (7,200
-// patches, the embedder's cap) is timed.
+// against VisionReference's. Synthetic 640 x 480 and 1024 x 768 cards (1,200
+// and 3,072 patches, several GEMM chunks and attention lengths) check the
+// features across chunks and their embeddings against the CPU reference's
+// (cosine >= 0.995), and a 1280 x 1440 page (7,200 patches, the embedder's
+// cap) is timed.
 //
 // The features' bar is looser than the embeddings': bfp16 noise builds up
 // in a few tokens through the tower's 24 blocks (QUALITY.md), so it is set
@@ -42,6 +43,9 @@ namespace e = gufo_npu::qwen3vl_embed_2b;
 using Clock = std::chrono::steady_clock;
 
 constexpr double kEmbeddingCosine = 0.99;
+// The synthetic cards against the CPU reference (stage 2 gave 0.9964 on
+// the 640 x 480 card, QUALITY.md).
+constexpr double kCardCosine = 0.995;
 constexpr double kFeatureCosine = 0.95;
 
 double Since(Clock::time_point start) {
@@ -180,7 +184,7 @@ int main(int argc, char** argv) {
   const auto vision_file = gufo_npu::gguf::File::Open(mmproj);
   const gufo_npu::Tokenizer tokenizer(*file);
   e::NpuEmbedder embedder(*file, argv[1]);
-  e::NpuVision vision(*vision_file, embedder);
+  e::NpuVision vision(*vision_file, embedder, argv[1]);
   e::VisionReference reference(*vision_file);
   e::Reference text_reference(*file);
   const e::VisionConfig& vc = vision.config();
@@ -235,17 +239,29 @@ int main(int argc, char** argv) {
         CheckFeatures(features, reference.Encode(patches), vc.out_hidden, name);
   }
 
-  {
-    // Across GEMM chunks: 1,200 patches (two chunks), 300 tokens.
-    const auto card = TestCard(640, 480, 3);
-    const e::Patches patches =
-        e::PreprocessImage(card.data(), 640, 480, vc.patch, vc.merge);
+  // Across GEMM chunks and attention lengths: 1,200 patches (two GEMM
+  // chunks, 300 tokens) and 3,072 (three chunks, 768 tokens), against the
+  // CPU reference.
+  const struct {
+    int width, height;
+    std::uint32_t seed;
+  } cards[] = {{640, 480, 3}, {1024, 768, 7}};
+  for (const auto& card_size : cards) {
+    const std::string name = "card " + std::to_string(card_size.width) + "x" +
+                             std::to_string(card_size.height);
+    const auto card =
+        TestCard(card_size.width, card_size.height, card_size.seed);
+    const e::Patches patches = e::PreprocessImage(
+        card.data(), card_size.width, card_size.height, vc.patch, vc.merge);
+    vision.Encode(patches);  // warm-up
+    const auto before = vision.profile();
     const auto start = Clock::now();
     const e::ImageFeatures features = vision.Encode(patches);
-    std::printf("card 640x480: %d patches, vision %.3f s (cold)\n",
-                patches.Count(), Since(start));
+    const double seconds = Since(start);
+    std::printf("%s: %d patches (warm)\n", name.c_str(), patches.Count());
+    PrintVision(before, vision.profile(), seconds);
     const e::ImageFeatures want = reference.Encode(patches);
-    failures += CheckFeatures(features, want, vc.out_hidden, "card 640x480");
+    failures += CheckFeatures(features, want, vc.out_hidden, name);
     // End to end: the NPU path against the CPU reference's (vision and text
     // in fp32), which matches HF at cosine 1.000 (QUALITY.md).
     const auto ids = e::ImageInputIds(tokenizer, features.Tokens(),
@@ -253,13 +269,11 @@ int main(int argc, char** argv) {
     const double cos =
         qwen3vl_test::Cosine(embedder.EmbedImage(ids, pad, {features}),
                              text_reference.EmbedImage(ids, pad, {want}));
-    std::printf(
-        "card 640x480: %zu tokens, embedding cosine to the CPU "
-        "reference %.6f\n",
-        ids.size(), cos);
-    if (cos < kEmbeddingCosine) {
-      std::fprintf(stderr, "FAIL: card 640x480: cosine %.6f < %.2f\n", cos,
-                   kEmbeddingCosine);
+    std::printf("%s: %zu tokens, embedding cosine to the CPU reference %.6f\n",
+                name.c_str(), ids.size(), cos);
+    if (cos < kCardCosine) {
+      std::fprintf(stderr, "FAIL: %s: cosine %.6f < %.3f\n", name.c_str(), cos,
+                   kCardCosine);
       ++failures;
     }
   }

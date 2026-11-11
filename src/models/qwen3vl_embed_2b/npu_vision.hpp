@@ -1,5 +1,6 @@
 #pragma once
 
+#include <filesystem>
 #include <memory>
 
 #include "core/gguf.hpp"
@@ -7,12 +8,15 @@
 #include "models/qwen3vl_embed_2b/vision.hpp"
 
 // Qwen3-VL-Embedding-2B's vision tower on the NPU (docs/models/
-// qwen3-vl-embedding-2b/VISION.md, stage 2). Every linear (the patch
+// qwen3-vl-embedding-2b/VISION.md, stages 2 and 3). Every linear (the patch
 // embedding, each block's qkv, attention output, fc1 and fc2, and the four
 // mergers' fc1 and fc2) is a bfp16 GEMM on the model's GEMM program, in the
-// embedder's hardware context. The CPU runs the rest: the bias adds,
-// LayerNorms, GELUs, 2D RoPE, the full attention (FullAttention, ops.hpp)
-// and the position-embedding resample.
+// embedder's hardware context. Each block's attention runs on the model's
+// ViT attention program (npu/vit_attention.hpp), in its own hardware
+// context, so every block moves the NPU between the two contexts twice. The
+// CPU runs the rest: the bias adds, LayerNorms, GELUs, 2D RoPE, splitting
+// q, k and v for the attention program and the position-embedding
+// resample.
 //
 // An image goes through the tower a block at a time, each projection over
 // its patches in GEMM chunks of up to 1,024 rows, two in flight (as the
@@ -25,10 +29,12 @@ namespace gufo_npu::qwen3vl_embed_2b {
 class NpuVision final : public VisionEncoder {
 public:
   // Keeps pointers into `mmproj`, which must outlive it, and runs on
-  // `embedder`'s GEMM program, so `embedder` must outlive it too. Throws
-  // when the mmproj is not a Qwen3-VL one or its shapes are not the
-  // program's.
-  NpuVision(const gguf::File& mmproj, NpuEmbedder& embedder);
+  // `embedder`'s GEMM program, so `embedder` must outlive it too; loads the
+  // attention program (npu::kVitAttnName) from `kernel_dir`. Throws when
+  // the mmproj is not a Qwen3-VL one or its shapes are not the programs',
+  // or the attention program is missing.
+  NpuVision(const gguf::File& mmproj, NpuEmbedder& embedder,
+            const std::filesystem::path& kernel_dir);
   ~NpuVision() override;
   NpuVision(const NpuVision&) = delete;
   NpuVision& operator=(const NpuVision&) = delete;
@@ -44,7 +50,7 @@ public:
     long gemms = 0;                // NPU GEMM calls
     double gemm_seconds = 0;       // waiting for them
     double sync_seconds = 0;       // syncing their operand buffers
-    double attention_seconds = 0;  // attention on the CPU
+    double attention_seconds = 0;  // attention: q, k, v split + NPU call
     double other_seconds = 0;  // the rest (norms, GELU, biases, conversions)
     double total_seconds = 0;
   };
