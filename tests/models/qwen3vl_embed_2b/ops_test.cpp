@@ -1,7 +1,7 @@
 // Qwen3-VL-Embedding-2B's CPU pieces without a model: the input template and
 // instruction rule, packing, and the attention mixer (online softmax over
-// key blocks, grouped heads, one segment per input) against a direct
-// softmax, pooling and the Matryoshka cut.
+// key blocks, grouped heads, one segment per input) and the vision tower's
+// full attention against a direct softmax, pooling and the Matryoshka cut.
 #include "models/qwen3vl_embed_2b/ops.hpp"
 
 #include <algorithm>
@@ -215,6 +215,82 @@ void TestAttention() {
   TestAttention(cfg, {1, 63, 64, 65, 300}, "model shape");
 }
 
+// The vision tower's full attention against a direct softmax over every
+// row: one image of `rows` patches, q | k | v per row.
+void TestFullAttention(int heads, int hd, int rows, const std::string& name) {
+  const int dim = heads * hd;
+  std::mt19937 rng(11);
+  std::normal_distribution<float> dist(0.0f, 1.0f);
+  std::vector<float> qkv(static_cast<std::size_t>(rows) * 3 * dim);
+  for (auto& x : qkv) {
+    x = dist(rng);
+  }
+  std::vector<double> want(static_cast<std::size_t>(rows) * dim);
+  for (int t = 0; t < rows; ++t) {
+    for (int h = 0; h < heads; ++h) {
+      const float* q = qkv.data() + static_cast<std::size_t>(t) * 3 * dim +
+                       static_cast<std::size_t>(h) * hd;
+      std::vector<double> score(static_cast<std::size_t>(rows));
+      double mx = -INFINITY;
+      for (int j = 0; j < rows; ++j) {
+        const float* k = qkv.data() + static_cast<std::size_t>(j) * 3 * dim +
+                         dim + static_cast<std::size_t>(h) * hd;
+        double dot = 0;
+        for (int d = 0; d < hd; ++d) {
+          dot += static_cast<double>(q[d]) * k[d];
+        }
+        score[j] = dot;
+        mx = std::max(mx, dot);
+      }
+      double total = 0;
+      for (auto& x : score) {
+        x = std::exp(x - mx);
+        total += x;
+      }
+      double* out = want.data() + static_cast<std::size_t>(t) * dim +
+                    static_cast<std::size_t>(h) * hd;
+      for (int j = 0; j < rows; ++j) {
+        const float* v = qkv.data() + static_cast<std::size_t>(j) * 3 * dim +
+                         2 * dim + static_cast<std::size_t>(h) * hd;
+        for (int d = 0; d < hd; ++d) {
+          out[d] += score[j] / total * v[d];
+        }
+      }
+    }
+  }
+  const e::ParallelRun serial = [](std::size_t n,
+                                   const std::function<void(std::size_t)>& fn) {
+    for (std::size_t i = 0; i < n; ++i) {
+      fn(i);
+    }
+  };
+  std::vector<bool> kernels = {false};
+  if (e::detail::HasAvx512()) {
+    kernels.push_back(true);
+  }
+  for (const bool avx512 : kernels) {
+    std::vector<float> got(want.size());
+    e::detail::FullAttention(heads, hd, rows, qkv.data(), got.data(), serial,
+                             avx512);
+    double worst = 0;
+    for (std::size_t i = 0; i < want.size(); ++i) {
+      worst = std::max(worst, std::fabs(got[i] - want[i]));
+    }
+    Check(worst < 1e-4, name + (avx512 ? ", AVX-512" : ", plain") +
+                            ": full attention matches the direct softmax "
+                            "(max error " +
+                            std::to_string(worst) + ")");
+  }
+}
+
+void TestFullAttention() {
+  // Rows that cross the 64-key and 64-query blocks.
+  TestFullAttention(2, 16, 1, "full, one row");
+  TestFullAttention(2, 16, 150, "full, small heads");
+  // The vision tower's shape: 16 heads of 64.
+  TestFullAttention(16, 64, 200, "full, vision shape");
+}
+
 void TestPoolAndTruncate() {
   e::Config cfg;
   cfg.hidden = 16;
@@ -260,6 +336,7 @@ int main() {
   TestInput();
   TestPack();
   TestAttention();
+  TestFullAttention();
   TestPoolAndTruncate();
   if (failures != 0) {
     std::fprintf(stderr, "%d failure(s)\n", failures);

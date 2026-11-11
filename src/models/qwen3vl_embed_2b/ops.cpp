@@ -23,6 +23,7 @@ using vec::RmsNorm;
 // Attention work items: query rows per item, keys per online-softmax block
 // (one transposed key tile), query vectors per register tile.
 constexpr int kQueryBlock = 16;
+constexpr int kVisionQueryBlock = 64;
 constexpr int kKeyBlock = 64;
 constexpr int kTile = 4;
 
@@ -51,6 +52,34 @@ struct CacheAligned {
 };
 using Floats = std::vector<float, CacheAligned<float>>;
 
+// The heads of a packed batch's rows: each input row holds q | k | v
+// (`stride` floats), each output row q_dim floats; `group` query heads
+// share a kv head. Causal attends to the row's own segment up to itself,
+// full to the whole segment.
+struct Layout {
+  int hd = 0;
+  int heads = 0;
+  int kv_heads = 0;
+  int q_dim = 0;
+  int kv_dim = 0;
+  std::size_t stride = 0;
+  int query_block = kQueryBlock;  // query rows per work item
+  bool causal = true;
+
+  int group() const { return heads / kv_heads; }
+};
+
+Layout TextLayout(const Config& cfg) {
+  Layout l;
+  l.hd = cfg.head_dim;
+  l.heads = cfg.heads;
+  l.kv_heads = cfg.kv_heads;
+  l.q_dim = cfg.QDim();
+  l.kv_dim = cfg.KvDim();
+  l.stride = static_cast<std::size_t>(cfg.InRows());
+  return l;
+}
+
 struct Item {
   int segment = 0;
   int kv_head = 0;
@@ -58,25 +87,31 @@ struct Item {
   int t1 = 0;
 };
 
+// The keys a query block reads: [0, end) of its segment (`keys` long).
+int KeyEnd(const Layout& l, const Item& item, int keys) {
+  return l.causal ? item.t1 : keys;
+}
+
 // The plain kernel, for CPUs without AVX-512 (hosted CI): per query vector,
 // a dot product per key and a scaled add per value, softmax online over
 // blocks of kKeyBlock keys.
-void AttendPlain(const Config& cfg, const Item& item, const float* base,
+void AttendPlain(const Layout& l, const Item& item, int keys, const float* base,
                  float* out_base) {
-  const int hd = cfg.head_dim;
-  const int group = cfg.heads / cfg.kv_heads;
-  const int q_dim = cfg.QDim();
-  const int kv_dim = cfg.KvDim();
-  const auto stride = static_cast<std::size_t>(cfg.InRows());
+  const int hd = l.hd;
+  const int group = l.group();
+  const int q_dim = l.q_dim;
+  const int kv_dim = l.kv_dim;
+  const std::size_t stride = l.stride;
+  const int end = KeyEnd(l, item, keys);
   const int n = (item.t1 - item.t0) * group;  // query vectors
   thread_local std::vector<float> o, m, sum, p;
   o.assign(static_cast<std::size_t>(n) * hd, 0.0f);
   m.assign(static_cast<std::size_t>(n), -INFINITY);
   sum.assign(static_cast<std::size_t>(n), 0.0f);
   p.resize(kKeyBlock);
-  for (int jb = 0; jb < item.t1; jb += kKeyBlock) {
+  for (int jb = 0; jb < end; jb += kKeyBlock) {
     for (int t = item.t0; t < item.t1; ++t) {
-      const int limit = std::min(t + 1, jb + kKeyBlock);  // causal
+      const int limit = std::min(l.causal ? t + 1 : keys, jb + kKeyBlock);
       if (limit <= jb) {
         continue;
       }
@@ -239,12 +274,14 @@ __attribute__((target("avx512f"))) void ValuesAvx512(
 // against the transposed keys (`tiles` holds the item's kv head's tiles,
 // one per key block, `tile_step` floats apart), the online-softmax update
 // per query vector, then the weighted values.
-void AttendAvx512(const Config& cfg, const Item& item, const float* base,
-                  const float* tiles, std::size_t tile_step, float* out_base) {
-  const int hd = cfg.head_dim;
-  const int group = cfg.heads / cfg.kv_heads;
-  const int q_dim = cfg.QDim();
-  const auto stride = static_cast<std::size_t>(cfg.InRows());
+void AttendAvx512(const Layout& l, const Item& item, int keys,
+                  const float* base, const float* tiles, std::size_t tile_step,
+                  float* out_base) {
+  const int hd = l.hd;
+  const int group = l.group();
+  const int q_dim = l.q_dim;
+  const std::size_t stride = l.stride;
+  const int end = KeyEnd(l, item, keys);
   // Query vectors i = (t - t0) * group + r, padded to whole tiles with
   // zero queries that are never written out.
   const int n = (item.t1 - item.t0) * group;
@@ -266,13 +303,14 @@ void AttendAvx512(const Config& cfg, const Item& item, const float* base,
                   hd, q.data() + static_cast<std::size_t>(i) * hd);
     }
   }
-  const float* values = base + q_dim + cfg.KvDim() + item.kv_head * hd;
-  for (int jb = 0, b = 0; jb < item.t1; jb += kKeyBlock, ++b) {
+  const float* values = base + q_dim + l.kv_dim + item.kv_head * hd;
+  for (int jb = 0, b = 0; jb < end; jb += kKeyBlock, ++b) {
     ScoresAvx512(q.data(), hd, tiles + b * tile_step, padded, s.data());
     for (int i = 0; i < padded; ++i) {
-      // Causal: a row's keys in the block are a prefix of it.
+      // A row's keys in the block are a prefix of it: up to the row itself
+      // (causal) or to the segment's end.
       const int t = i < n ? item.t0 + i / group : item.t1 - 1;
-      const int count = std::min(kKeyBlock, t - jb + 1);
+      const int count = std::min(kKeyBlock, (l.causal ? t + 1 : keys) - jb);
       float* p = s.data() + static_cast<std::size_t>(i) * kKeyBlock;
       if (count <= 0) {
         std::fill_n(p, kKeyBlock, 0.0f);
@@ -291,7 +329,7 @@ void AttendAvx512(const Config& cfg, const Item& item, const float* base,
     }
     ValuesAvx512(s.data(), corr.data(),
                  values + static_cast<std::size_t>(jb) * stride, stride,
-                 std::min(kKeyBlock, item.t1 - jb), hd, padded, o.data());
+                 std::min(kKeyBlock, end - jb), hd, padded, o.data());
   }
   for (int t = item.t0; t < item.t1; ++t) {
     for (int r = 0; r < group; ++r) {
@@ -308,6 +346,9 @@ void AttendAvx512(const Config& cfg, const Item& item, const float* base,
   }
 }
 #endif
+
+void Mix(const Layout& l, const std::vector<Segment>& segments, const float* in,
+         float* out, const ParallelRun& run, bool avx512);
 
 }  // namespace
 
@@ -378,11 +419,6 @@ void Attention(const Config& cfg, const RopeTable& rope, const float* q_norm,
 
 namespace detail {
 
-// The softmax mixing of Attention, on rows already normalized, rotated and
-// (q) scaled: the AVX-512 kernel or the plain loop.
-void Mix(const Config& cfg, const std::vector<Segment>& segments, float* in,
-         float* out, const ParallelRun& run, bool avx512);
-
 bool HasAvx512() {
 #ifdef GUFO_QWEN3VL_AVX512
   static const bool has = __builtin_cpu_supports("avx512f");
@@ -434,24 +470,30 @@ void Attention(const Config& cfg, const RopeTable& rope, const float* q_norm,
       rope.Apply(k, position);
     }
   });
-  Mix(cfg, segments, in, out, run, avx512);
+  Mix(TextLayout(cfg), segments, in, out, run, avx512);
 }
 
-void Mix(const Config& cfg, const std::vector<Segment>& segments, float* in,
+}  // namespace detail
+
+namespace {
+
+// The softmax mixing on rows already normalized, rotated and (q) scaled:
+// the AVX-512 kernel or the plain loop.
+void Mix(const Layout& l, const std::vector<Segment>& segments, const float* in,
          float* out, const ParallelRun& run, bool avx512) {
-  const int hd = cfg.head_dim;
-  const int kv_heads = cfg.kv_heads;
-  const int q_dim = cfg.QDim();
-  const auto stride = static_cast<std::size_t>(cfg.InRows());
+  const int hd = l.hd;
+  const int kv_heads = l.kv_heads;
+  const int q_dim = l.q_dim;
+  const std::size_t stride = l.stride;
   // Work items: (segment, kv head, block of query rows), each with that kv
   // head's query heads, softmax online over key blocks; the longest first,
   // so a pool that hands out items in order finishes evenly.
   std::vector<Item> items;
   for (int s = 0; s < static_cast<int>(segments.size()); ++s) {
-    for (int t0 = 0; t0 < segments[s].length; t0 += kQueryBlock) {
+    for (int t0 = 0; t0 < segments[s].length; t0 += l.query_block) {
       for (int g = 0; g < kv_heads; ++g) {
         items.push_back(
-            {s, g, t0, std::min(segments[s].length, t0 + kQueryBlock)});
+            {s, g, t0, std::min(segments[s].length, t0 + l.query_block)});
       }
     }
   }
@@ -462,7 +504,8 @@ void Mix(const Config& cfg, const std::vector<Segment>& segments, float* in,
     run(items.size(), [&](std::size_t index) {
       const Item& item = items[index];
       const Segment& seg = segments[static_cast<std::size_t>(item.segment)];
-      AttendPlain(cfg, item, in + static_cast<std::size_t>(seg.begin) * stride,
+      AttendPlain(l, item, seg.length,
+                  in + static_cast<std::size_t>(seg.begin) * stride,
                   out + static_cast<std::size_t>(seg.begin) * q_dim);
     });
     return;
@@ -510,12 +553,50 @@ void Mix(const Config& cfg, const std::vector<Segment>& segments, float* in,
     const Item& item = items[index];
     const auto s = static_cast<std::size_t>(item.segment);
     const Segment& seg = segments[s];
-    AttendAvx512(cfg, item, in + static_cast<std::size_t>(seg.begin) * stride,
-                 tiles + (first[s] * kv_heads + item.kv_head) * tile,
-                 kv_heads * tile,
-                 out + static_cast<std::size_t>(seg.begin) * q_dim);
+    AttendAvx512(
+        l, item, seg.length, in + static_cast<std::size_t>(seg.begin) * stride,
+        tiles + (first[s] * kv_heads + item.kv_head) * tile, kv_heads * tile,
+        out + static_cast<std::size_t>(seg.begin) * q_dim);
   });
 #endif
+}
+
+// The vision tower's heads over one image: as many kv heads as query
+// heads, every patch seeing every other. Larger query blocks than the
+// text's, since one image is one long segment.
+Layout VisionLayout(int heads, int head_dim) {
+  Layout l;
+  l.hd = head_dim;
+  l.heads = heads;
+  l.kv_heads = heads;
+  l.q_dim = heads * head_dim;
+  l.kv_dim = l.q_dim;
+  l.stride = static_cast<std::size_t>(3 * l.q_dim);
+  l.query_block = kVisionQueryBlock;
+  l.causal = false;
+  return l;
+}
+
+}  // namespace
+
+void FullAttention(int heads, int head_dim, int rows, const float* qkv,
+                   float* out, const ParallelRun& run) {
+  detail::FullAttention(heads, head_dim, rows, qkv, out, run,
+                        detail::HasAvx512());
+}
+
+namespace detail {
+
+void FullAttention(int heads, int head_dim, int rows, const float* qkv,
+                   float* out, const ParallelRun& run, bool avx512) {
+  if (avx512 && !HasAvx512()) {
+    throw std::invalid_argument("qwen3vl: the CPU has no AVX-512");
+  }
+  if (heads <= 0 || head_dim <= 0 || rows <= 0) {
+    throw std::invalid_argument("qwen3vl: empty attention");
+  }
+  Mix(VisionLayout(heads, head_dim), std::vector<Segment>{Segment{0, rows}},
+      qkv, out, run, avx512);
 }
 
 }  // namespace detail
@@ -589,7 +670,7 @@ void AttentionMrope(const Config& cfg, const MropeTable& rope,
       rope.Apply(k, cs.data(), sn.data());
     }
   });
-  detail::Mix(cfg, segments, in, out, run, detail::HasAvx512());
+  Mix(TextLayout(cfg), segments, in, out, run, detail::HasAvx512());
 }
 
 std::vector<std::vector<float>> Pool(const Config& cfg,

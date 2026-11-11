@@ -49,8 +49,44 @@ the reference's layer loop was shared with the image path): cosine
 1.000000 on all 15 inputs, alone = batched. Page-sized images are not in
 the oracle yet: the fp32 CPU vision reference is slow at 7,200 patches.
 
+## Images on the NPU
+
+Measured 2026-11-11 on the Strix Halo box from a source build (the
+toolchain image) of the NPU vision branch: `qwen3vl_embed_2b_npu_vision_test`
+with the F16 GGUF, the F16 mmproj and a fresh oracle run with `--images`
+(same pins as above). Two runs of the whole `qwen3vl_embed_2b` label gave
+the same numbers; all 8 tests pass, including the text NPU test (cosine to
+HF min 0.99808, mean 0.99881, alone = batched), the GEMM test at all 30
+sequences (total relative error 9.5e-3 on each) and the CPU reference
+tests (1.000000).
+
+| Check | Tolerance | Result |
+|---|---|---|
+| NPU vision + NPU text vs HF fp32, the 3 cards | cosine ≥ 0.99 per input | **0.99463 to 0.99673** (96x64 0.99673, 128x96 with text 0.99557, 100x70 resized 0.99463) |
+| NPU vs the CPU reference, 640x480 card (1,200 patches, two GEMM chunks; 329 tokens) | cosine ≥ 0.99 | **0.99645** |
+| NPU vision features vs the CPU reference | cosine ≥ 0.95 per block (a bug check) | 0.986 to 0.9999 |
+
+The features' error grows with depth and sits in a few tokens. On the
+640x480 card, per feature block (cosine as a whole; worst token; tokens of
+300 below 0.99):
+
+| Block | Cosine | Worst token | Below 0.99 |
+|---|---|---|---|
+| DeepStack 0 (after vision block 5) | 0.99980 | 0.9995 | 0 |
+| DeepStack 1 (after block 11) | 0.99533 | 0.422 | 12 |
+| DeepStack 2 (after block 17) | 0.99585 | 0.748 | 33 |
+| Merger (after block 23) | 0.98970 | 0.783 | 64 |
+
+The same tokens are the worst in DeepStack 1 and 2; their output norms
+are ordinary (9.5 against a median of 12.9), so it is not a large output
+losing precision. The text model averages them out (embedding 0.996 to
+the reference), but the cause is not pinned down: it is the bfp16 rounding
+of weights and activations (the only difference from the reference), and
+which product contributes most is untested (VISION.md, open questions).
+Page-sized images are not in the HF oracle; the page is timed only.
+
 ## Known differences from the reference embedder
 
 - Inputs over the context limit are refused rather than truncated.
-- Images run only in the CPU reference (no NPU path, no API yet); video is
+- Images run on the NPU in the library only (no CLI or API yet); video is
   not supported.

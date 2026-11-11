@@ -9,8 +9,9 @@ to run it here. Sources, as of 2026-10: HF transformers `main`
 (`conversion/qwen3vl.py`, `tools/mtmd/clip.cpp`, `tools/mtmd/models/qwen3vl.cpp`,
 `gguf-py/gguf/constants.py`).
 
-Status: stage 1 (CPU fp32 reference, `vision.hpp`) is in the package; the
-NPU stages below are plans.
+Status: stages 1 (CPU fp32 reference, `vision.hpp`) and 2 (every linear on
+the NPU GEMM, `npu_vision.hpp` and `NpuEmbedder::EmbedImage`) are in the
+package; stages 3 to 5 below are plans.
 
 ## Input
 
@@ -158,9 +159,10 @@ K % 512 == 0 and N % 64 == 0, chunks of M = 256/512/1024 rows, no bias.
 | merger / DeepStack fc1 (x4) | 1800 | 4096 | 4096 | yes |
 | merger / DeepStack fc2 (x4) | 1800 | 4096 | 2048 | yes |
 
-Six new (K, N) shapes in the xclbin: (1024, 3072), (1024, 1024),
-(1024, 4096), (4096, 1024), (4096, 4096), (4096, 2048); a patch embed
-padded to K = 1024 reuses (1024, 1024). Every linear here has a bias.
+Six (K, N) shapes in the xclbin for the vision tower (stage 2): (1024,
+3072), (1024, 1024), (1024, 4096), (4096, 1024), (4096, 4096), (4096,
+2048); the patch embed, padded with zeros to K = 1024, reuses (1024,
+1024). Every linear here has a bias, added on the CPU as C is widened.
 
 ### Where each piece runs
 
@@ -205,7 +207,9 @@ and bidirectional softmax may run differently; unmeasured.
 The ViT attention is O(n^2) and larger than all the GEMMs together at page
 size: 0.10 T at 1024 patches, 1.6 T at 4096, 5.1 T at 7200, 26 T at 16384.
 With the GEMMs on the NPU and attention on the CPU a page would take
-roughly 4 s, ~80% of it CPU attention. NPU attention (or a smaller
+roughly 4 s, ~80% of it CPU attention. Measured with stage 2 (BENCHMARKS.md,
+2026-11-11): 4.2 to 4.4 s warm, of which the vision tower 3.5 s (CPU
+attention 3.0 s, NPU GEMM waits 0.15 s) and the text model 0.7 s. NPU attention (or a smaller
 `max_pixels`; quality cost unmeasured) is what makes images practical.
 Memory: the ViT keeps 7200 x 4096 fp32 (118 MB) of activations at most.
 
@@ -217,11 +221,16 @@ Memory: the ViT keeps 7200 x 4096 fp32 (118 MB) of activations at most.
    `Reference::EmbedImage`. The test oracle, not a runtime path. Checks:
    `qwen3vl_embed_2b_vision_test` (model-free) and
    `qwen3vl_embed_2b_vision_oracle_test` against HF fp32 (QUALITY.md).
-2. **NPU GEMMs**: the ViT and merger shapes in `embed_gemm_variants.py`
-   (same xclbin, one hardware context), an `NpuVision` mirroring
-   `npu_embedder.cpp`, MRoPE + DeepStack in the NPU embedder; elementwise
-   ops on the CPU for now. Checks: op tests per new shape (relative error
-   < 1e-2), cosine to the stage-1 reference per case, per-phase timings.
+2. **NPU GEMMs** (`npu_vision.hpp/.cpp`, done): the ViT and merger shapes
+   in `embed_gemm_variants.py` (same xclbin, and `NpuVision` runs in the
+   embedder's hardware context), MRoPE + DeepStack in
+   `NpuEmbedder::EmbedImage`; biases, LayerNorm, GELU and RoPE on the CPU,
+   the ViT attention on the text path's AVX-512 kernels (`FullAttention`,
+   ops.hpp: no causal mask, one kv head per head, 64-row query blocks).
+   Checks (`qwen3vl_embed_2b_npu_vision_test`, QUALITY.md): every new shape
+   at relative error 9.5e-3, embeddings at cosine 0.9946 or more to HF on
+   the oracle's cards and 0.9964 to the stage-1 reference on a 1,200-patch
+   card, per-phase timings.
 3. **NPU attention**: a bidirectional flash-attention kernel (head 64,
    online softmax on the core) for the ViT, then the text's causal
    attention with MRoPE-rotated q/k. This is the stage that decides the
@@ -240,8 +249,12 @@ Memory: the ViT keeps 7200 x 4096 fp32 (118 MB) of activations at most.
   decoding differences (libjpeg versions, EXIF rotation) are outside the
   library.
 - **bfp16 for the ViT**: 8-bit mantissas with shared block exponents on
-  LayerNorm outputs and GELU inputs; untested. The tower's 24 layers and
-  the DeepStack injection may amplify error more than the text path does.
+  LayerNorm outputs and GELU inputs. Measured in stage 2 (QUALITY.md): the
+  embeddings stay at cosine 0.995 or more, but a few tokens of the
+  features drift through the 24 blocks (on a 1,200-patch card, 64 of 300
+  merger tokens below 0.99, the worst DeepStack token 0.42). Which product
+  contributes most is untested; finding it (per product, bf16 against
+  bfp16 activations on the CPU) comes before fusing more into the GEMMs.
 - **NPU attention**: no kernel in the tree; QK^T has K = 64, which the GEMM
   cannot tile (K % 512). Needs a dedicated design or a reshaped batched
   GEMM.

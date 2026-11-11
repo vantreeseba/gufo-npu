@@ -7,17 +7,30 @@ HIDDEN = 2048
 FFN = 6144
 # q (16 heads) | k (8) | v (8), head size 128.
 IN_ROWS = 4096
+# The vision tower (mmproj): width, MLP, merged 2x2 patch block and the
+# text width the mergers project to (docs/models/qwen3-vl-embedding-2b/
+# VISION.md).
+VIT_HIDDEN = 1024
+VIT_FFN = 4096
+VIT_MERGED = 4 * VIT_HIDDEN
 
 GEMM_NAME = "qwen3vl_embed_2b_gemm"
 # Tokens per call (rows of A), as npu::kGemmChunks.
 GEMM_CHUNKS = [256, 512, 1024]
-# The projections as (K, N): attention input (q, k, v), attention output,
-# gate + up, down.
+# The projections as (K, N). Text: attention input (q, k, v), attention
+# output, gate + up, down. Vision: qkv, attention output (and the patch
+# embedding, K padded from 768), fc1, fc2, merger fc1, merger fc2.
 GEMM_SHAPES = [
     (HIDDEN, IN_ROWS),
     (HIDDEN, HIDDEN),
     (HIDDEN, 2 * FFN),
     (FFN, HIDDEN),
+    (VIT_HIDDEN, 3 * VIT_HIDDEN),
+    (VIT_HIDDEN, VIT_HIDDEN),
+    (VIT_HIDDEN, VIT_FFN),
+    (VIT_FFN, VIT_HIDDEN),
+    (VIT_MERGED, VIT_MERGED),
+    (VIT_MERGED, HIDDEN),
 ]
 
 

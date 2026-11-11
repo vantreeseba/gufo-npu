@@ -5,6 +5,49 @@ warm (2 warm-up calls per length), unique inputs per call, tokens per second
 over the timed calls and the share of time in GEMM waits, buffer syncs, CPU
 attention and the rest.
 
+## 2026-11-11, images on the NPU (VISION.md stage 2), source build, F16 GGUF + F16 mmproj
+
+`qwen3vl_embed_2b_npu_vision_test`'s page: a 1280 x 1440 test card
+(7,200 patches, 1,800 image tokens, 1,822 tokens with the template),
+`NpuVision::Encode` then `NpuEmbedder::EmbedImage`, one warm-up and 3
+timed runs; the whole label run twice (two sweeps). Other services were
+running on the box.
+
+| Run | Sweep 1 | Sweep 2 |
+|---|---|---|
+| 1 | 4.20 s | 4.22 s |
+| 2 | 4.40 s | 4.27 s |
+| 3 | 4.29 s | 4.33 s |
+
+Where a page's time goes (sweep 1, run 1):
+
+| Phase | Time | NPU GEMM calls | GEMM wait | sync | CPU attention | other |
+|---|---|---|---|---|---|---|
+| Vision tower | 3.47 s | 792 | 0.13 s | 0.08 s | **2.97 s** | 0.29 s |
+| Text model | 0.73 s | 224 | 0.32 s | 0.04 s | 0.24 s | 0.12 s |
+
+- 70% of a page is the ViT's CPU attention (full, over 7,200 patches,
+  16 heads of 64; the text path's AVX-512 kernels), as VISION.md
+  estimated. The NPU's GEMM waits are 0.13 s: the CPU work between calls
+  hides them. Attention on the NPU (stage 3) is what moves this.
+- The oracle's small cards (24 to 48 patches): vision 0.03 to 0.05 s, text
+  0.08 to 0.09 s per image, warm.
+
+The text path after this change (the attention kernels take a head
+layout, the GEMM pass is shared) against main (image `:main`, built
+2026-11-05, after the last change to this code), `gufo-npu bench embed
+--tokens 128,512,2048 --batch 8 --runs 5`, runs alternated main, branch,
+main, branch on the same box state (tok/s):
+
+| Tokens per input | main | branch |
+|---|---|---|
+| 128 | 3,472 / 3,029 | 3,408 / 3,563 |
+| 512 | 3,697 / 3,873 | 3,870 / 3,805 |
+| 2,048 | 2,726 / 2,740 | 2,696 / 2,717 |
+
+Within noise of each other (2,048 tokens: -1%). Both sit 5 to 10% under
+the 2026-10-30 table below, so that gap is the box, not this change.
+
 ## 2026-10-30, AVX-512 attention, image `sha-86050a6`, F16 GGUF
 
 Same settings as below (warm, 2 warm-up and 5 timed calls per length, 8

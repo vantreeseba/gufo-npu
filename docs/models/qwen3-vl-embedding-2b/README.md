@@ -1,23 +1,28 @@
 # Qwen3-VL-Embedding-2B
 
-A text embedding model: one 2,048-value unit vector per input, for search
-and retrieval (mcp-ragdown, Engrafo). It runs in its own package,
+A text and image embedding model: one 2,048-value unit vector per input,
+for search and retrieval (mcp-ragdown, Engrafo). It runs in its own package,
 `src/models/qwen3vl_embed_2b/`, on its own NPU program (a bfp16 GEMM built
 with its shapes); nothing is shared with the Qwen3.5 family. See
 [benchmarks](BENCHMARKS.md), [quality](QUALITY.md) and
 [experiments](EXPERIMENTS.md).
 
-Text only on the NPU and in the server for now. Images have a CPU fp32
-reference (`vision.hpp`, `Reference::EmbedImage`); the forward pass, costs
-and plan are in [VISION.md](VISION.md). Video is not run.
+Text runs on the NPU, in `gufo-npu embed` and in the server. Images run on
+the NPU in the library (`NpuVision::Encode`, then
+`NpuEmbedder::EmbedImage`; no CLI or API yet): every matrix product on the
+NPU, attention and the elementwise ops on the CPU, about 4.3 s for a
+1280 x 1440 page (BENCHMARKS.md). The fp32 CPU reference (`vision.hpp`,
+`Reference::EmbedImage`) is the oracle. The forward pass, costs and plan
+are in [VISION.md](VISION.md). Video is not run.
 
 ## Weights
 
 Tested with [`mradermacher/Qwen3-VL-Embedding-2B-GGUF`](https://huggingface.co/mradermacher/Qwen3-VL-Embedding-2B-GGUF),
 `Qwen3-VL-Embedding-2B.f16.gguf` (3,447,351,456 bytes): llama.cpp's
 conversion of [`Qwen/Qwen3-VL-Embedding-2B`](https://huggingface.co/Qwen/Qwen3-VL-Embedding-2B)
-(Apache-2.0), the text model as arch `qwen3vl` (the vision tower is the
-repo's separate mmproj file, not needed here). The original weights are
+(Apache-2.0), the text model as arch `qwen3vl`; the vision tower is the
+repo's separate mmproj file, `Qwen3-VL-Embedding-2B.mmproj-f16.gguf`
+(projector `qwen3vl_merger`), needed only for images. The original weights are
 BF16; F16 holds them with no measurable loss (QUALITY.md: the CPU reference
 on this file matches HF to cosine 1.000000). BF16, F32 and quantized GGUFs
 load too; every matrix is rounded to bfp16 at load either way.
@@ -90,13 +95,14 @@ curl -s localhost:8081/v1/embeddings -H 'Content-Type: application/json' \
 
 | Test | Label | Needs |
 |---|---|---|
-| `qwen3vl_embed_2b_ops_test` | `qwen3vl_embed_2b` | nothing (hosted CI): template, instruction rule, packing, attention against a direct softmax, pooling, Matryoshka |
+| `qwen3vl_embed_2b_ops_test` | `qwen3vl_embed_2b` | nothing (hosted CI): template, instruction rule, packing, attention (text and the vision tower's full attention) against a direct softmax, pooling, Matryoshka |
 | `qwen3vl_embed_2b_vision_test` | `qwen3vl_embed_2b` | nothing (hosted CI): smart_resize, Pillow's bicubic (fixtures), patch order, position-embedding taps, MRoPE positions, MRoPE attention = text attention at text positions |
 | `qwen3vl_tokenizer_test` | `qwen3vl_embed_2b;model` | the GGUF: HF tokenizer fixtures |
 | `qwen3vl_embed_2b_reference_oracle_test` | `qwen3vl_embed_2b;model` | GGUF + oracle: ids, CPU reference vs HF fp32 (cosine ≥ 0.999), retrieval ranks |
 | `qwen3vl_embed_2b_vision_oracle_test` | `qwen3vl_embed_2b;model` | GGUF + mmproj + oracle `--images`: patch grid, ids, CPU vision + text reference vs HF fp32 (cosine ≥ 0.999) |
 | `qwen3vl_embed_2b_gemm_test` | `qwen3vl_embed_2b;npu;kernels` | NPU: every GEMM shape vs a double reference (relative error < 1e-2) |
 | `qwen3vl_embed_2b_npu_embed_test` | `qwen3vl_embed_2b;npu;model` | NPU + GGUF + oracle: cosine ≥ 0.99, retrieval ranks, alone = batched |
+| `qwen3vl_embed_2b_npu_vision_test` | `qwen3vl_embed_2b;npu;model` | NPU + GGUF + mmproj + oracle `--images`: NPU image embeddings vs HF fp32 (cosine ≥ 0.99), a 1,200-patch card vs the CPU reference (cosine ≥ 0.99), features vs the CPU reference, a page timed |
 
 Variables: `GUFO_NPU_QWEN3VL_EMBED_2B_GGUF` (the BF16 GGUF) and
 `GUFO_NPU_QWEN3VL_EMBED_2B_ORACLE` (the output of

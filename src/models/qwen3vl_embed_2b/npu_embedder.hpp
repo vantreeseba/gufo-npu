@@ -5,6 +5,11 @@
 
 #include "core/gguf.hpp"
 #include "models/qwen3vl_embed_2b/embedder.hpp"
+#include "models/qwen3vl_embed_2b/vision.hpp"
+
+namespace gufo_npu::npu {
+class GemmRuntime;
+}  // namespace gufo_npu::npu
 
 // Qwen3-VL-Embedding-2B on the NPU. Every matrix product is a bfp16 GEMM on
 // the model's own GEMM program (npu/embed_gemm.hpp); the CPU runs the norms,
@@ -40,6 +45,13 @@ public:
   std::vector<std::vector<float>> Embed(
       const std::vector<std::vector<int>>& inputs) override;
 
+  // The unit embedding of one input holding images, as
+  // Reference::EmbedImage: `ids` from ImageInputIds (input.hpp), `images`
+  // from NpuVision::Encode (npu_vision.hpp) in order of appearance. Throws
+  // std::invalid_argument when ids and images disagree.
+  std::vector<float> EmbedImage(const std::vector<int>& ids, int image_pad_id,
+                                const std::vector<ImageFeatures>& images);
+
   // Where the time went since construction.
   struct Profile {
     long tokens = 0;
@@ -51,6 +63,10 @@ public:
     double total_seconds = 0;
   };
   const Profile& profile() const;
+
+  // The model's GEMM program and its hardware context, which NpuVision
+  // shares (npu_vision.hpp).
+  gufo_npu::npu::GemmRuntime& gemm_runtime();
 
 private:
   struct Impl;

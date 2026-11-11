@@ -59,6 +59,14 @@ void Attention(const Config& cfg, const RopeTable& rope, const float* q_norm,
                const float* k_norm, const std::vector<Segment>& segments,
                float* in, float* out, const ParallelRun& run);
 
+// The vision tower's attention over one image (VISION.md): full
+// (bidirectional), one kv head per query head, the same kernels as
+// Attention. `qkv` holds `rows` rows of 3 * heads * head_dim values (q | k |
+// v, heads contiguous), q and k already rotated and q scaled; `out` (rows of
+// heads * head_dim) receives each head's softmax-weighted values.
+void FullAttention(int heads, int head_dim, int rows, const float* qkv,
+                   float* out, const ParallelRun& run);
+
 namespace detail {
 // Whether the CPU runs the AVX-512 attention kernel, which Attention picks
 // when it does (otherwise a plain loop).
@@ -68,6 +76,9 @@ bool HasAvx512();
 void Attention(const Config& cfg, const RopeTable& rope, const float* q_norm,
                const float* k_norm, const std::vector<Segment>& segments,
                float* in, float* out, const ParallelRun& run, bool avx512);
+// FullAttention with the kernel chosen, as Attention. For tests.
+void FullAttention(int heads, int head_dim, int rows, const float* qkv,
+                   float* out, const ParallelRun& run, bool avx512);
 }  // namespace detail
 
 // The text model's interleaved MRoPE sections (t, h, w), in frequencies.

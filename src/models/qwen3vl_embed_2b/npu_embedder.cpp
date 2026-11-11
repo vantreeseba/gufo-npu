@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -15,6 +16,7 @@
 #include "core/simd.hpp"
 #include "core/vec.hpp"
 #include "models/qwen3vl_embed_2b/npu/embed_gemm.hpp"
+#include "models/qwen3vl_embed_2b/npu/gemm_pass.hpp"
 #include "models/qwen3vl_embed_2b/ops.hpp"
 #include "npu/gemm.hpp"
 
@@ -22,9 +24,8 @@ namespace gufo_npu::qwen3vl_embed_2b {
 namespace {
 
 using gufo_npu::npu::Bfp16Gemm;
-using gufo_npu::npu::GemmBuffer;
-using gufo_npu::npu::GemmCall;
 using gufo_npu::npu::GemmRuntime;
+using npu::Chunk;
 using Clock = std::chrono::steady_clock;
 using Bits = std::uint16_t;  // bf16
 
@@ -38,32 +39,6 @@ std::vector<float> ToFloats(const gguf::TensorInfo& t) {
   return out;
 }
 
-// One GEMM call's rows of the batch: n tokens from `begin`, run as m rows
-// (n rounded up to a chunk size of npu::kGemmChunks).
-struct Chunk {
-  int begin = 0;
-  int n = 0;
-  int m = 0;
-};
-
-std::vector<Chunk> Chunks(int rows) {
-  std::vector<Chunk> chunks;
-  const int max = static_cast<int>(gufo_npu::npu::kGemmMaxChunk);
-  for (int begin = 0; begin < rows;) {
-    const int n = std::min(max, rows - begin);
-    int m = max;
-    for (const std::size_t size : gufo_npu::npu::kGemmChunks) {
-      if (static_cast<int>(size) >= n) {
-        m = static_cast<int>(size);
-        break;
-      }
-    }
-    chunks.push_back({begin, n, m});
-    begin += n;
-  }
-  return chunks;
-}
-
 }  // namespace
 
 struct NpuEmbedder::Impl {
@@ -72,21 +47,14 @@ struct NpuEmbedder::Impl {
     std::vector<float> attn_norm, ffn_norm, q_norm, k_norm;
   };
 
-  // A GEMM call's device operands; two, so one chunk's call can run while
-  // the CPU fills the next one's A.
-  struct Slot {
-    std::unique_ptr<GemmBuffer> a, c;
-    GemmCall call;
-    std::size_t c_sync = 0;  // bytes of C to read back
-  };
-
   Config config;
   GemmRuntime runtime;
   const gguf::TensorInfo* embed = nullptr;
   std::vector<Layer> layers;
   std::vector<float> output_norm;
   RopeTable rope;
-  Slot slots[2];
+  MropeTable mrope;
+  std::optional<npu::GemmPass> pass;
   // CPU workers, spinning for the length of an Embed: one per physical core
   // with the caller (half the hardware threads, for SMT), as the prefills.
   BurstPool pool{
@@ -135,7 +103,8 @@ struct NpuEmbedder::Impl {
   Impl(const gguf::File& file, const std::filesystem::path& kernel_dir)
       : config(ReadConfig(file)),
         runtime((CheckShapes(config), kernel_dir), npu::kGemmName),
-        rope(config.head_dim, config.rope_theta) {
+        rope(config.head_dim, config.rope_theta),
+        mrope(config.head_dim, config.rope_theta) {
     embed = &file.Tensor("token_embd.weight");
     output_norm = ToFloats(file.Tensor("output_norm.weight"));
     for (int il = 0; il < config.layers; ++il) {
@@ -152,57 +121,23 @@ struct NpuEmbedder::Impl {
       l.down = Gemm({t("ffn_down.weight")});
       layers.push_back(std::move(l));
     }
-    std::size_t a_bytes = 0;
-    std::size_t c_bytes = 0;
+    std::vector<const Bfp16Gemm*> gemms;
     for (const Layer& l : layers) {
       for (const auto* g : {&l.in, &l.out, &l.ffn, &l.down}) {
-        a_bytes =
-            std::max(a_bytes, (*g)->a_bytes(gufo_npu::npu::kGemmMaxChunk));
-        c_bytes =
-            std::max(c_bytes, (*g)->c_bytes(gufo_npu::npu::kGemmMaxChunk));
+        gemms.push_back(g->get());
       }
     }
-    for (Slot& s : slots) {
-      s.a = std::make_unique<GemmBuffer>(runtime, a_bytes);
-      s.c = std::make_unique<GemmBuffer>(runtime, c_bytes);
-    }
+    pass.emplace(runtime, gemms);
   }
 
   void Run(std::size_t n, const std::function<void(std::size_t)>& fn) {
     pool.Run(n, fn);
   }
 
-  // Runs `g` over every chunk of the batch, two calls in flight: chunk i+1
-  // is written (prepare) and started before chunk i is waited for and read
-  // (consume). prepare(chunk, A) fills A's first chunk.n rows (g.dim() bf16
-  // each); consume(chunk, C) reads C's first chunk.n rows (g.rows() bf16).
+  // Runs `g` over every chunk of the batch (npu::GemmPass::Run).
   template<typename Prepare, typename Consume>
   void Pass(Bfp16Gemm& g, const Prepare& prepare, const Consume& consume) {
-    const auto start = [&](std::size_t i) {
-      Slot& s = slots[i % 2];
-      const Chunk& c = chunks[i];
-      prepare(c, s.a->as<Bits>());
-      const auto sync = Clock::now();
-      s.a->ToDevice(static_cast<std::size_t>(c.n) * g.dim() * sizeof(Bits));
-      profile.sync_seconds += SecondsSince(sync);
-      s.call = g.Start(*s.a, *s.c, static_cast<std::size_t>(c.m));
-      s.c_sync = static_cast<std::size_t>(c.n) * g.rows() * sizeof(Bits);
-      ++profile.gemms;
-    };
-    start(0);
-    for (std::size_t i = 0; i < chunks.size(); ++i) {
-      if (i + 1 < chunks.size()) {
-        start(i + 1);
-      }
-      Slot& s = slots[i % 2];
-      auto t = Clock::now();
-      s.call.Wait();
-      profile.gemm_seconds += SecondsSince(t);
-      t = Clock::now();
-      s.c->FromDevice(s.c_sync);
-      profile.sync_seconds += SecondsSince(t);
-      consume(chunks[i], static_cast<const Bits*>(s.c->as<Bits>()));
-    }
+    pass->Run(g, chunks, prepare, consume);
   }
 
   // A rows = bf16(RMS(h row) * w).
@@ -229,18 +164,26 @@ struct NpuEmbedder::Impl {
     };
   }
 
-  void RunLayer(const Layer& l, const std::vector<Segment>& segments) {
+  // One layer over the batch; `positions` (3 per row, MropePositions) turns
+  // the attention to MRoPE, otherwise each row's place in its segment.
+  void RunLayer(const Layer& l, const std::vector<Segment>& segments,
+                const int* positions) {
     const Config& cfg = config;
     const int q_dim = cfg.QDim();
     const int ffn = cfg.ffn;
     Pass(*l.in, NormRows(l.attn_norm), ReadRows(in, cfg.InRows(), false));
     const auto attention = Clock::now();
-    Attention(
-        cfg, rope, l.q_norm.data(), l.k_norm.data(), segments, in.data(),
-        mixed.data(),
-        [this](std::size_t n, const std::function<void(std::size_t)>& fn) {
-          Run(n, fn);
-        });
+    const ParallelRun run = [this](std::size_t n,
+                                   const std::function<void(std::size_t)>& fn) {
+      Run(n, fn);
+    };
+    if (positions != nullptr) {
+      AttentionMrope(cfg, mrope, positions, l.q_norm.data(), l.k_norm.data(),
+                     segments, in.data(), mixed.data(), run);
+    } else {
+      Attention(cfg, rope, l.q_norm.data(), l.k_norm.data(), segments,
+                in.data(), mixed.data(), run);
+    }
     profile.attention_seconds += SecondsSince(attention);
     Pass(
         *l.out,
@@ -278,29 +221,82 @@ struct NpuEmbedder::Impl {
       longest = std::max(longest, s.length);
     }
     rope.Reserve(longest);
-    const auto rows = static_cast<std::size_t>(n);
+    std::vector<int> ids;
+    ids.reserve(static_cast<std::size_t>(n));
+    for (const auto& input : inputs) {
+      ids.insert(ids.end(), input.begin(), input.end());
+    }
+    Start(ids);
+    for (const auto& l : layers) {
+      RunLayer(l, segments, nullptr);
+    }
+    profile.tokens += n;
+    return Pool(cfg, output_norm.data(), segments, h.data());
+  }
+
+  // Sizes the batch for `ids` (all inputs' tokens, packed) and looks up
+  // their embeddings into h.
+  void Start(const std::vector<int>& ids) {
+    const Config& cfg = config;
+    const auto rows = ids.size();
     const int d = cfg.hidden;
     h.resize(rows * d);
     in.resize(rows * cfg.InRows());
     mixed.resize(rows * cfg.QDim());
     act.resize(rows * cfg.ffn);
-    chunks = Chunks(n);
-    std::vector<int> ids;
-    ids.reserve(rows);
-    for (const auto& input : inputs) {
-      ids.insert(ids.end(), input.begin(), input.end());
-    }
+    chunks = npu::Chunks(static_cast<int>(rows));
     Run(rows, [&](std::size_t t) {
       quant::Dequantize(embed->type,
                         embed->data + static_cast<std::size_t>(ids[t]) *
                                           quant::RowBytes(embed->type, d),
                         h.data() + t * d, d);
     });
-    for (const auto& l : layers) {
-      RunLayer(l, segments);
+  }
+
+  void Finish(Clock::time_point start) {
+    profile.total_seconds += SecondsSince(start);
+    profile.gemms = pass->gemms;
+    profile.gemm_seconds = pass->gemm_seconds;
+    profile.sync_seconds = pass->sync_seconds;
+    profile.other_seconds = profile.total_seconds - profile.gemm_seconds -
+                            profile.sync_seconds - profile.attention_seconds;
+  }
+
+  std::vector<float> EmbedImage(const std::vector<int>& ids, int image_pad_id,
+                                const std::vector<ImageFeatures>& images) {
+    const Config& cfg = config;
+    const int d = cfg.hidden;
+    const auto segments = Pack({ids}, cfg.vocab);
+    const auto positions = MropePositions(ids, image_pad_id, images);
+    const auto image_rows = ImageRows(ids, image_pad_id, images, d);
+    const auto start = Clock::now();
+    const BurstPool::Burst burst(pool);
+    Start(ids);
+    for (const ImageRow& r : image_rows) {
+      std::copy_n(r.image->embeds.data() + r.index * d, d,
+                  h.data() + r.row * d);
     }
-    profile.tokens += n;
-    return Pool(cfg, output_norm.data(), segments, h.data());
+    for (int il = 0; il < cfg.layers; ++il) {
+      RunLayer(layers[static_cast<std::size_t>(il)], segments,
+               positions.data());
+      // DeepStack: block il of an image's features joins its rows after
+      // text layer il.
+      const auto layer = static_cast<std::size_t>(il);
+      for (const ImageRow& r : image_rows) {
+        if (layer >= r.image->deepstack.size()) {
+          continue;
+        }
+        const float* src = r.image->deepstack[layer].data() + r.index * d;
+        float* dst = h.data() + r.row * d;
+        for (int i = 0; i < d; ++i) {
+          dst[i] += src[i];
+        }
+      }
+    }
+    profile.tokens += static_cast<long>(ids.size());
+    auto out = Pool(cfg, output_norm.data(), segments, h.data()).front();
+    Finish(start);
+    return out;
   }
 
   std::vector<std::vector<float>> Embed(
@@ -325,9 +321,7 @@ struct NpuEmbedder::Impl {
         out.push_back(std::move(e));
       }
     }
-    profile.total_seconds += SecondsSince(start);
-    profile.other_seconds = profile.total_seconds - profile.gemm_seconds -
-                            profile.sync_seconds - profile.attention_seconds;
+    Finish(start);
     return out;
   }
 };
@@ -347,8 +341,18 @@ std::vector<std::vector<float>> NpuEmbedder::Embed(
   return impl_->Embed(inputs);
 }
 
+std::vector<float> NpuEmbedder::EmbedImage(
+    const std::vector<int>& ids, int image_pad_id,
+    const std::vector<ImageFeatures>& images) {
+  return impl_->EmbedImage(ids, image_pad_id, images);
+}
+
 const NpuEmbedder::Profile& NpuEmbedder::profile() const {
   return impl_->profile;
+}
+
+gufo_npu::npu::GemmRuntime& NpuEmbedder::gemm_runtime() {
+  return impl_->runtime;
 }
 
 }  // namespace gufo_npu::qwen3vl_embed_2b
