@@ -1,5 +1,42 @@
 # Changelog
 
+## [0.4.0](https://github.com/vantreeseba/gufo-npu/compare/v0.3.0...v0.4.0) (2026-11-11)
+
+
+### Features
+
+* **npu:** time the submit alone, a polled round trip and a one-run runlist in bench dispatch ([16aaa42](https://github.com/vantreeseba/gufo-npu/commit/16aaa42a12be5e0e5fe2eb70c1576a8cc684ff1a))
+* **qwen35_2b:** split a decode step's host work and each submission's submit time in the timeline ([e45a58d](https://github.com/vantreeseba/gufo-npu/commit/e45a58da2204f90ffb0ef5ae87735f6ec9d661b4))
+
+
+### Performance
+
+* **qwen35_2b:** run the DeltaNet decode step as one pool dispatch per layer, bit-identical and 1.5-2% faster decode ([7a84117](https://github.com/vantreeseba/gufo-npu/commit/7a84117ee613295b694c1cb4b44f448b859b34eb))
+* **qwen35_2b:** run the DeltaNet decode step as one pool dispatch per layer, bit-identical to the Mixer's ([c462681](https://github.com/vantreeseba/gufo-npu/commit/c462681434d98e7a09e5537464aec4f175c97954))
+* **qwen35_2b:** time the host part of each decode step and the NPU submit path, which is not where the time goes ([c36dee5](https://github.com/vantreeseba/gufo-npu/commit/c36dee566f79c4028544aefdee05450763e883bf))
+* **qwen35:** fuse Q4_K, Q5_K and F32 rows into the fp32 CPU decoder's dot ([e6c27cf](https://github.com/vantreeseba/gufo-npu/commit/e6c27cfac82fee779a067688791b1521c5a35b1b))
+* **qwen35:** fuse Q4_K, Q5_K and F32 rows into the fp32 CPU decoder's dot, 6-10% faster 35B CPU decode ([d188903](https://github.com/vantreeseba/gufo-npu/commit/d188903ae0c8bc395dd3a9e637851cadb7ada60f))
+* **qwen35:** fuse Q6_K rows into the fp32 CPU decoder's dot, 2x CPU decode on a Q4_K_M 35B ([c9ee0f6](https://github.com/vantreeseba/gufo-npu/commit/c9ee0f68f41a34b589ae02e8febf2b0f5d453621))
+* **qwen35:** fuse Q6_K rows into the fp32 CPU decoder's dot, 2x CPU decode on a Q4_K_M 35B ([f72e175](https://github.com/vantreeseba/gufo-npu/commit/f72e175166cc38afa3067319982d66515b8c2ec8))
+
+
+### Documentation
+
+* **qwen35_2b:** put the decode step's measured times on the data-flow diagrams, with a pie of where a step goes ([73e3e53](https://github.com/vantreeseba/gufo-npu/commit/73e3e5333689859d139a4d63db73b8adc4e00ec7))
+* **qwen35_2b:** record the fused DeltaNet decode step, 1.5-2% faster decode with the same replies ([f36812d](https://github.com/vantreeseba/gufo-npu/commit/f36812dea56303425738478f62338c45c6371253))
+* **qwen35_2b:** record the Gated DeltaNet decode step on the NPU as rejected for now, 2-4% for a second core program mode ([022fc85](https://github.com/vantreeseba/gufo-npu/commit/022fc851d71e5eb461e14fb59d00600b197d1d64))
+* **qwen35_2b:** record the Gated DeltaNet decode step on the NPU as rejected for now, 2-4% for a second core program mode ([fd3898a](https://github.com/vantreeseba/gufo-npu/commit/fd3898adc0bbed25310d7be62557077b081a796e))
+* **qwen35_2b:** record the host's part of a decode step, the submit path is not where the time goes ([e6af6df](https://github.com/vantreeseba/gufo-npu/commit/e6af6df36028726e0e7c00316e04344f7b805b27))
+* **qwen36_35b_a3b:** note the UD GGUF's near-tie routing differences, same as main ([f810af4](https://github.com/vantreeseba/gufo-npu/commit/f810af42af6c9341cd9a7a06b4b92c7e266211f8))
+* **qwen36_35b_a3b:** record prefill experts v2 as rejected, slower than the CPU expert step at every prompt length ([f3573c8](https://github.com/vantreeseba/gufo-npu/commit/f3573c813d30280e10631da0584e7235e56bd32b))
+* **qwen36_35b_a3b:** record prefill experts v2 as rejected, slower than the CPU expert step at every prompt length ([9f9bf4c](https://github.com/vantreeseba/gufo-npu/commit/9f9bf4c8597a028afc6f313523e95ca032ab30a4))
+* **qwen36_35b_a3b:** record the fused Q4_K, Q5_K and F32 CPU dots ([980a14b](https://github.com/vantreeseba/gufo-npu/commit/980a14b5bb7811ff168aec6e6fc9251d641b1295))
+
+
+### Code Refactoring
+
+* **qwen35:** expose the Mixer's worker pool for a model's own CPU steps ([0a57630](https://github.com/vantreeseba/gufo-npu/commit/0a5763050b627e88db3076a7b6a8ca055a7db9c0))
+
 ## [0.3.0](https://github.com/vantreeseba/gufo-npu/compare/v0.2.0...v0.3.0) (2026-11-04)
 
 
