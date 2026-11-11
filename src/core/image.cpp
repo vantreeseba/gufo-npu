@@ -10,6 +10,8 @@
 // jpeglib.h needs <cstdio> first.
 #include <jpeglib.h>
 #include <png.h>
+// After jpeglib.h: its message codes.
+#include <jerror.h>
 
 // libpng and libjpeg leave errors through longjmp. The functions that call
 // setjmp (ReadPng, ReadJpeg) keep only plain locals, fill vectors their
