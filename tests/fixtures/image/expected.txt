@@ -1,0 +1,31 @@
+# file width height outputs (rgb [alpha torgb]) | error
+gray1.png 37 29 rgb
+gray16.png 37 29 rgb
+gray2.png 37 29 rgb
+gray4.png 37 29 rgb
+gray4_adam7.png 37 29 rgb
+gray8.png 37 29 rgb
+gray8_trns.png 37 29 rgb
+graya16.png 37 29 rgb alpha torgb
+graya8.png 37 29 rgb
+huge.png error
+jpeg420.jpg 37 29 rgb
+jpeg420_progressive.jpg 37 29 rgb
+jpeg422.jpg 37 29 rgb
+jpeg444.jpg 37 29 rgb
+jpeg_cmyk.jpg error
+jpeg_gray.jpg 37 29 rgb
+not_an_image.png error
+pal1.png 37 29 rgb
+pal4.png 37 29 rgb
+pal8_trns.png 37 29 rgb
+rgb16.png 37 29 rgb
+rgb8.png 37 29 rgb
+rgb8_adam7.png 37 29 rgb
+rgb8_gama.png 37 29 rgb
+rgb8_trns.png 37 29 rgb
+rgba16.png 37 29 rgb alpha torgb
+rgba8.png 37 29 rgb alpha torgb
+rgba8_adam7.png 37 29 rgb alpha torgb
+truncated.jpg error
+truncated.png error

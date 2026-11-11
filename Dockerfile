@@ -56,6 +56,10 @@ ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
 COPY .devops/requirements-kernels.txt /tmp/requirements-kernels.txt
 RUN pip install --no-cache-dir --upgrade pip \
  && pip install --no-cache-dir -r /tmp/requirements-kernels.txt
+# Image decoding (src/core/image.cpp). Own layer, after the heavy ones.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libpng-dev libjpeg-turbo8-dev \
+ && rm -rf /var/lib/apt/lists/*
 
 FROM toolchain AS build
 ARG BUILD_JOBS=4
@@ -69,9 +73,10 @@ RUN cmake --preset release \
 
 FROM xrt AS runtime
 ARG DEBIAN_FRONTEND=noninteractive
-# curl: the health check.
+# curl: the health check; libpng and libjpeg-turbo: image inputs.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends curl \
+ && apt-get install -y --no-install-recommends curl libpng16-16t64 \
+      libjpeg-turbo8 \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /opt/gufo-npu /opt/gufo-npu
 COPY .devops/entrypoint.sh /opt/gufo-npu/bin/entrypoint.sh

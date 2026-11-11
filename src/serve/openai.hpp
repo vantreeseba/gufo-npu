@@ -84,8 +84,11 @@ struct CompletionRequest {
   }
 };
 
-// Most inputs per /v1/embeddings request (OpenAI's limit).
+// Most inputs per /v1/embeddings request (OpenAI's limit), and most image
+// inputs among them; a request's images hold at most image::kMaxPixels
+// pixels together.
 inline constexpr int kMaxEmbeddingInputs = 2048;
+inline constexpr int kMaxEmbeddingImages = 16;
 
 // A /v1/embeddings request.
 struct EmbeddingsRequest {

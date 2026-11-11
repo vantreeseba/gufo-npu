@@ -7,11 +7,10 @@ with its shapes); nothing is shared with the Qwen3.5 family. See
 [benchmarks](BENCHMARKS.md), [quality](QUALITY.md) and
 [experiments](EXPERIMENTS.md).
 
-Text runs on the NPU, in `gufo-npu embed` and in the server. Images run on
-the NPU in the library (`NpuVision::Encode`, then
-`NpuEmbedder::EmbedImage`; no CLI or API yet): every matrix product on the
-NPU, attention and the elementwise ops on the CPU, about 4.3 s for a
-1280 x 1440 page (BENCHMARKS.md). The fp32 CPU reference (`vision.hpp`,
+Text and images run on the NPU, in `gufo-npu embed` and in the server
+(images with the mmproj, `--mmproj`). For an image, every matrix product
+runs on the NPU and attention and the elementwise ops on the CPU, about
+4.3 s for a 1280 x 1440 page (BENCHMARKS.md). The fp32 CPU reference (`vision.hpp`,
 `Reference::EmbedImage`) is the oracle. The forward pass, costs and plan
 are in [VISION.md](VISION.md). Video is not run.
 
@@ -59,6 +58,13 @@ it, checked against HF by the oracle (QUALITY.md):
   smaller embedding.
 - Inputs longer than the context limit are refused, not truncated (HF
   truncates from the right, which drops the pooled token).
+- An image input puts the image first, then its optional caption, in the
+  user message: `<|vision_start|>` + one `<|image_pad|>` per image token +
+  `<|vision_end|>{text}`. The image is decoded to Pillow's pixels
+  (`src/core/image.hpp`, PNG and JPEG), an alpha channel is composited on
+  white (qwen_vl_utils' `to_rgb`), and it is resized so both sides are
+  multiples of 32 with 4 to 1,800 image tokens (`SmartResize`, Pillow's
+  bicubic). VISION.md has the vision tower.
 
 ## How an input runs
 
@@ -88,6 +94,22 @@ curl -s localhost:8081/v1/embeddings -H 'Content-Type: application/json' \
   -d '{"input": ["first passage", "second passage"], "dimensions": 512}'
 ```
 
+Images need the vision tower, the repo's mmproj GGUF:
+
+```sh
+gufo-npu embed --model qwen3-vl-embedding-2b-bf16.gguf \
+  --mmproj Qwen3-VL-Embedding-2B.mmproj-f16.gguf \
+  --text "a receipt from a hardware store" --image receipt.jpg --similarity
+
+gufo-npu serve --model qwen3-vl-embedding-2b-bf16.gguf \
+  --mmproj Qwen3-VL-Embedding-2B.mmproj-f16.gguf --port 8081
+{ printf '{"input": [{"image": "data:image/jpeg;base64,'
+  base64 -w0 receipt.jpg
+  printf '", "text": "receipt"}]}'; } |
+  curl -s localhost:8081/v1/embeddings -H 'Content-Type: application/json' \
+    --data-binary @-
+```
+
 `POST /v1/embeddings` is described in [docs/SERVING.md](../../SERVING.md).
 `gufo-npu bench embed --model GGUF` times warm batches per input length.
 
@@ -96,13 +118,14 @@ curl -s localhost:8081/v1/embeddings -H 'Content-Type: application/json' \
 | Test | Label | Needs |
 |---|---|---|
 | `qwen3vl_embed_2b_ops_test` | `qwen3vl_embed_2b` | nothing (hosted CI): template, instruction rule, packing, attention (text and the vision tower's full attention) against a direct softmax, pooling, Matryoshka |
-| `qwen3vl_embed_2b_vision_test` | `qwen3vl_embed_2b` | nothing (hosted CI): smart_resize, Pillow's bicubic (fixtures), patch order, position-embedding taps, MRoPE positions, MRoPE attention = text attention at text positions |
+| `qwen3vl_embed_2b_vision_test` | `qwen3vl_embed_2b` | nothing (hosted CI): smart_resize, image token counts, qwen_vl_utils' to_rgb (Pillow fixtures), Pillow's bicubic (fixtures), patch order, position-embedding taps, MRoPE positions, MRoPE attention = text attention at text positions |
 | `qwen3vl_tokenizer_test` | `qwen3vl_embed_2b;model` | the GGUF: HF tokenizer fixtures |
 | `qwen3vl_embed_2b_reference_oracle_test` | `qwen3vl_embed_2b;model` | GGUF + oracle: ids, CPU reference vs HF fp32 (cosine ≥ 0.999), retrieval ranks |
 | `qwen3vl_embed_2b_vision_oracle_test` | `qwen3vl_embed_2b;model` | GGUF + mmproj + oracle `--images`: patch grid, ids, CPU vision + text reference vs HF fp32 (cosine ≥ 0.999) |
 | `qwen3vl_embed_2b_gemm_test` | `qwen3vl_embed_2b;npu;kernels` | NPU: every GEMM shape vs a double reference (relative error < 1e-2) |
 | `qwen3vl_embed_2b_npu_embed_test` | `qwen3vl_embed_2b;npu;model` | NPU + GGUF + oracle: cosine ≥ 0.99, retrieval ranks, alone = batched |
 | `qwen3vl_embed_2b_npu_vision_test` | `qwen3vl_embed_2b;npu;model` | NPU + GGUF + mmproj + oracle `--images`: NPU image embeddings vs HF fp32 (cosine ≥ 0.99), a 1,200-patch card vs the CPU reference (cosine ≥ 0.99), features vs the CPU reference, a page timed |
+| `qwen3vl_embed_2b_engine_image_test` | `qwen3vl_embed_2b;npu;model` | NPU + GGUF + mmproj + oracle `--images`: the oracle's cards as PNGs through the server's engine (`--mmproj`): ids and embeddings vs HF fp32 (cosine ≥ 0.99), a text and the images in one batch = each alone |
 
 Variables: `GUFO_NPU_QWEN3VL_EMBED_2B_GGUF` (the BF16 GGUF) and
 `GUFO_NPU_QWEN3VL_EMBED_2B_ORACLE` (the output of

@@ -49,6 +49,7 @@ needs the host's XRT (see the Dockerfile).
 | `--draft mtp\|none` | `mtp` | MTP speculative decoding (when the GGUF has the MTP layer). Output is the same either way; `none` is for comparisons. |
 | `--preload ID` | the first `--model` | The model loaded at start. |
 | `--unload-after SECONDS` | `0` (never) | Unload a model that has been idle this long, freeing its device and pinned memory; the next request loads it again. |
+| `--mmproj GGUF` | none | The embedding model's vision tower (Qwen3-VL-Embedding-2B's mmproj GGUF), for image inputs to `/v1/embeddings`; about 0.5 GB more device memory. Needs exactly one embedding `--model`. |
 | `--log-level LEVEL` | `info` | What goes to stderr: `error`, `warn`, `info` or `debug` ([Logs](#logs)). |
 
 `SIGINT` or `SIGTERM` stops the server.
@@ -148,11 +149,26 @@ requests to an embedding model, and embedding requests to a chat model, get
 
 | Field | Support |
 |---|---|
-| `input` | A non-empty string, an array of them, an array of token ids, or an array of such arrays; at most 2,048 inputs. Token ids stand for the text inside the model's template. |
+| `input` | A non-empty string, an image object, an array of strings and image objects, an array of token ids, or an array of such arrays; at most 2,048 inputs. Token ids stand for the text inside the model's template. |
 | `encoding_format` | `float` (default) or `base64` (little-endian float32). |
 | `dimensions` | Matryoshka: the first n values, renormalized; 64 to 2,048 for Qwen3-VL-Embedding-2B. |
 | `instruction` | Extension: the task the input is embedded for, the model's system message (default "Represent the user's input."). Give queries a task ("Retrieve passages that answer the question") and leave documents on the default. |
 | `user` | Accepted, ignored. |
+
+An image object is `{"image": "data:image/png;base64,...", "text": "an
+optional caption"}`: the image as a base64 data URI, PNG or JPEG (the
+format is read from the bytes, not the URI's type). The server fetches
+nothing, so URLs and paths get 400. Images need the server started with
+`--mmproj`; without it they get 400 for `input`. They are decoded to the
+pixels Pillow gives (`src/core/image.hpp`), with an alpha channel
+composited on white and EXIF orientation not applied, as the model's
+reference embedder does, then resized as it resizes them, to at most 1,800
+image tokens. A request holds at most 16 images, of at most 67,108,864
+pixels (64 Mi) together; a file that does not decode gets 400 for `input`.
+An image counts one token per 32 x 32 pixels of its resized size in
+`prompt_tokens`. Images run one at a time after the request's texts; a
+1280 x 1440 page takes about 4.3 s
+([benchmarks](models/qwen3-vl-embedding-2b/BENCHMARKS.md)).
 
 Each input, as the model formats it, must fit the context limit
 (`--context-length`, default 8,192 tokens), or the request gets 400

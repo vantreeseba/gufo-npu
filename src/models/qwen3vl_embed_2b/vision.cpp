@@ -354,6 +354,29 @@ Patches PreprocessImage(const std::uint8_t* rgb, int width, int height,
   return Patchify(resized.data(), size.width, size.height, patch, merge);
 }
 
+int ImageTokens(int width, int height, int factor) {
+  const ImageSize size = SmartResize(height, width, factor);
+  return (size.height / factor) * (size.width / factor);
+}
+
+void FlattenAlpha(std::vector<std::uint8_t>& rgb,
+                  std::span<const std::uint8_t> alpha) {
+  if (alpha.empty()) {
+    return;
+  }
+  if (rgb.size() != alpha.size() * 3) {
+    throw std::invalid_argument("FlattenAlpha: " + std::to_string(rgb.size()) +
+                                " RGB values for " +
+                                std::to_string(alpha.size()) + " alphas");
+  }
+  for (std::size_t i = 0; i < rgb.size(); ++i) {
+    const unsigned a = alpha[i / 3];
+    // Pillow's paste with a mask: a / 255 blend, divided by 255 rounded.
+    const unsigned t = rgb[i] * a + 255u * (255u - a) + 128u;
+    rgb[i] = static_cast<std::uint8_t>(((t >> 8) + t) >> 8);
+  }
+}
+
 void InterpolationTaps(int index, int size, int side, int* taps,
                        float* weights) {
   // HF (fp32): src = index * (side - 1) / max(size - 1, 1).

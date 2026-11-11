@@ -1,12 +1,17 @@
 // POST /v1/embeddings over HTTP on localhost with a scripted embedding
 // engine (no model, no NPU): input shapes, usage, dimensions, base64,
-// the instruction extension, limits, and the chat routes refusing an
-// embedding model (and the embeddings route a chat model).
+// the instruction extension, limits, image inputs (data URIs of the PNG and
+// JPEG fixtures in tests/fixtures/image, decoded by the server), and the
+// chat routes refusing an embedding model (and the embeddings route a chat
+// model).
 #include <httplib/httplib.h>
 
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
@@ -15,6 +20,7 @@
 #include <vector>
 
 #include "fakes.hpp"
+#include "serve/openai.hpp"
 #include "serve/server.hpp"
 
 namespace {
@@ -24,6 +30,7 @@ using gufo_npu::serve::Engine;
 using gufo_npu::serve::GenerateRequest;
 using gufo_npu::serve::GenerateResult;
 using gufo_npu::serve::ModelInfo;
+using gufo_npu::serve::PreparedEmbedding;
 using gufo_npu::serve::Server;
 using gufo_npu::serve::ServerOptions;
 using gufo_npu::serve::testing::FakeEngine;
@@ -44,16 +51,18 @@ void Check(bool ok, const std::string& what) {
 }
 
 // One token per byte of the text (or the given ids), after a template of
-// two tokens; vector k of an input is proportional to (n + k + 1).
+// two tokens; an image adds one token per pixel column before its caption.
+// Vector k of an input is proportional to (n + k + 1).
 class FakeEmbedder : public Engine {
 public:
-  FakeEmbedder() {
+  explicit FakeEmbedder(bool images = false, int context = kContext) {
     info_.id = "fake-embed";
     info_.architecture = "fake";
-    info_.context_length = kContext;
+    info_.context_length = context;
     info_.vocab = 1000;
     info_.embedding_length = kLength;
     info_.embedding_min_dimensions = kMinDimensions;
+    info_.embedding_images = images;
   }
   const ModelInfo& info() const override { return info_; }
   const gufo_npu::Tokenizer& tokenizer() const override {
@@ -70,6 +79,9 @@ public:
       instruction_ = std::string(instruction);
     }
     std::vector<int> ids = {1, 2};
+    if (input.image) {
+      ids.insert(ids.end(), static_cast<std::size_t>(input.image->width), 9);
+    }
     if (input.tokens) {
       ids.insert(ids.end(), input.tokens->begin(), input.tokens->end());
     } else {
@@ -80,12 +92,22 @@ public:
     return ids;
   }
   std::vector<std::vector<float>> Embed(
-      const std::vector<std::vector<int>>& inputs) override {
+      const std::vector<PreparedEmbedding>& inputs) override {
     std::vector<std::vector<float>> out;
-    for (const auto& ids : inputs) {
-      out.push_back(Vector(static_cast<int>(ids.size())));
+    std::lock_guard lock(mutex_);
+    images_.clear();
+    for (const auto& input : inputs) {
+      out.push_back(Vector(static_cast<int>(input.ids.size())));
+      if (input.image) {
+        images_.push_back(input.image);
+      }
     }
     return out;
+  }
+  // The decoded images of the last Embed call.
+  std::vector<std::shared_ptr<const gufo_npu::image::Decoded>> images() const {
+    std::lock_guard lock(mutex_);
+    return images_;
   }
   static std::vector<float> Vector(int n) {
     std::vector<float> v(kLength);
@@ -108,6 +130,7 @@ private:
   ModelInfo info_;
   mutable std::mutex mutex_;
   mutable std::string instruction_;
+  std::vector<std::shared_ptr<const gufo_npu::image::Decoded>> images_;
 };
 
 struct Running {
@@ -160,6 +183,32 @@ std::vector<float> FromBase64(const std::string& text) {
   std::vector<float> out(bytes.size() / sizeof(float));
   std::memcpy(out.data(), bytes.data(), out.size() * sizeof(float));
   return out;
+}
+
+std::vector<std::uint8_t> ReadAll(const std::filesystem::path& path) {
+  std::ifstream in(path, std::ios::binary);
+  return {std::istreambuf_iterator<char>(in), {}};
+}
+
+std::string ToBase64(const std::vector<std::uint8_t>& bytes) {
+  static const char kAlphabet[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  for (std::size_t i = 0; i < bytes.size(); i += 3) {
+    const unsigned n = bytes[i] << 16 |
+                       (i + 1 < bytes.size() ? bytes[i + 1] << 8 : 0) |
+                       (i + 2 < bytes.size() ? bytes[i + 2] : 0);
+    out += kAlphabet[n >> 18 & 63];
+    out += kAlphabet[n >> 12 & 63];
+    out += i + 1 < bytes.size() ? kAlphabet[n >> 6 & 63] : '=';
+    out += i + 2 < bytes.size() ? kAlphabet[n & 63] : '=';
+  }
+  return out;
+}
+
+// A fixture file as a data URI.
+std::string DataUri(const std::filesystem::path& file, const char* type) {
+  return std::string("data:") + type + ";base64," + ToBase64(ReadAll(file));
 }
 
 bool Near(const std::vector<float>& a, const std::vector<float>& b) {
@@ -306,9 +355,98 @@ void TestErrors(const Running& server) {
         "completion on an embedding model: 400");
 }
 
+void TestImages(const std::filesystem::path& fixtures) {
+  FakeFormat format;
+  const std::string png = DataUri(fixtures / "rgb8.png", "image/png");
+  {
+    // A text-only model refuses images, pointing at --mmproj.
+    FakeEmbedder text_only;
+    const Running server(text_only, format);
+    const auto r = server.Post("/v1/embeddings", {{"input", {{"image", png}}}});
+    Check(r && r->status == 400 && ErrorCode(r).rfind("input", 0) == 0 &&
+              r->body.find("--mmproj") != std::string::npos,
+          "image to a text-only model: 400 naming --mmproj");
+  }
+  FakeEmbedder engine(true, 4096);
+  const Running server(engine, format);
+  // One image: decoded to Pillow's pixels; 2 + 37 columns of tokens.
+  auto r = server.Post("/v1/embeddings", {{"input", {{"image", png}}}});
+  Check(r && r->status == 200, "one image: 200");
+  if (r && r->status == 200) {
+    const auto body = json::parse(r->body);
+    Check(body["usage"]["prompt_tokens"] == 39, "usage counts image tokens");
+    const auto images = engine.images();
+    Check(images.size() == 1 && images[0]->width == 37 &&
+              images[0]->height == 29 && !images[0]->HasAlpha() &&
+              images[0]->rgb == ReadAll(fixtures / "rgb8.rgb"),
+          "the engine gets the decoded pixels");
+  }
+  // Text and a captioned JPEG, in order.
+  r = server.Post(
+      "/v1/embeddings",
+      {{"input", json::array({"a",
+                              {{"image", DataUri(fixtures / "jpeg420.jpg",
+                                                 "image/jpeg")},
+                               {"text", "cap"}}})}});
+  Check(r && r->status == 200, "text and a captioned image: 200");
+  if (r && r->status == 200) {
+    const auto body = json::parse(r->body);
+    Check(body["data"].size() == 2 &&
+              Near(Floats(body["data"][0]["embedding"]),
+                   FakeEmbedder::Vector(3)) &&
+              Near(Floats(body["data"][1]["embedding"]),
+                   FakeEmbedder::Vector(2 + 37 + 3)),
+          "each input's own vector, in order");
+    Check(engine.images().size() == 1 &&
+              engine.images()[0]->rgb == ReadAll(fixtures / "jpeg420.rgb"),
+          "JPEG decoded as Pillow does");
+  }
+  // RGBA keeps its alpha for the model to flatten.
+  r = server.Post(
+      "/v1/embeddings",
+      {{"input", {{"image", DataUri(fixtures / "rgba8.png", "image/png")}}}});
+  Check(r && r->status == 200 && engine.images().size() == 1 &&
+            engine.images()[0]->alpha == ReadAll(fixtures / "rgba8.alpha"),
+        "RGBA image: alpha passed on");
+  // What is refused, all 400 for input.
+  const auto refused = [&](const json& input, const char* what) {
+    const auto res = server.Post("/v1/embeddings", {{"input", input}});
+    Check(res && res->status == 400 && ErrorCode(res).rfind("input", 0) == 0,
+          std::string(what) + ": 400 for input");
+  };
+  refused({{"image", "https://example.com/a.png"}}, "an image URL");
+  refused({{"image", "/tmp/a.png"}}, "an image path");
+  refused({{"image", "data:image/png;base64,@@@@"}}, "invalid base64");
+  refused(
+      {{"image", "data:image/png," + ToBase64(ReadAll(fixtures / "rgb8.png"))}},
+      "a data URI without base64");
+  refused({{"image",
+            "data:image/png;base64," + ToBase64({'h', 'e', 'l', 'l', 'o'})}},
+          "bytes that are no image");
+  refused({{"image", DataUri(fixtures / "truncated.png", "image/png")}},
+          "a truncated PNG");
+  refused({{"image", DataUri(fixtures / "jpeg_cmyk.jpg", "image/jpeg")}},
+          "a CMYK JPEG");
+  refused({{"image", DataUri(fixtures / "huge.png", "image/png")}},
+          "an image over the pixel limit");
+  refused({{"text", "no image"}}, "an object without image");
+  refused({{"image", png}, {"detail", "high"}}, "an unknown image field");
+  refused({{"image", png}, {"text", 5}}, "a caption that is no string");
+  refused(json::array({1, {{"image", png}}}), "token ids then an image");
+  json many = json::array();
+  for (int i = 0; i <= gufo_npu::serve::kMaxEmbeddingImages; ++i) {
+    many.push_back({{"image", png}});
+  }
+  refused(many, "too many images");
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  if (argc != 2) {
+    std::fprintf(stderr, "usage: serve_embeddings_test <image-fixtures>\n");
+    return 2;
+  }
   FakeFormat format;
   {
     FakeEmbedder engine;
@@ -317,6 +455,7 @@ int main() {
     TestOptions(server, engine);
     TestErrors(server);
   }
+  TestImages(argv[1]);
   {
     // A chat model refuses embeddings.
     FakeEngine chat;

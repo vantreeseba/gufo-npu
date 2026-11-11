@@ -7,7 +7,8 @@ add_library(gufo_npu_qwen3vl_embed_2b STATIC config.cpp input.cpp ops.cpp
                                              reference.cpp vision.cpp)
 target_link_libraries(gufo_npu_qwen3vl_embed_2b PUBLIC gufo_npu_core)
 
-add_library(gufo_npu_qwen3vl_embed_2b_npu STATIC npu_embedder.cpp
+add_library(gufo_npu_qwen3vl_embed_2b_npu STATIC embedding_model.cpp
+                                                 npu_embedder.cpp
                                                  npu_vision.cpp)
 target_link_libraries(gufo_npu_qwen3vl_embed_2b_npu PUBLIC
                       gufo_npu_qwen3vl_embed_2b gufo_npu_runtime)

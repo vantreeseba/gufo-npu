@@ -60,6 +60,14 @@ target_include_directories(gufo_npu_core PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/src"
   "${CMAKE_CURRENT_BINARY_DIR}/generated")
 
+# PNG and JPEG decoding for image inputs (the CLI and the server; models
+# take decoded pixels).
+find_package(PNG REQUIRED)
+find_package(JPEG REQUIRED)
+add_library(gufo_npu_image STATIC src/core/image.cpp)
+target_link_libraries(gufo_npu_image PUBLIC gufo_npu_core PRIVATE PNG::PNG
+                      JPEG::JPEG)
+
 # The server's chat format: OpenAI messages to the Qwen3.5 / Qwen3.6 chat
 # template and the model's output back to content, reasoning and tool calls.
 add_library(gufo_npu_serve_chat STATIC src/serve/chat_format_qwen35.cpp)
@@ -144,14 +152,15 @@ add_library(gufo_npu_serve STATIC
   src/serve/text.cpp
 )
 target_link_libraries(gufo_npu_serve PUBLIC gufo_npu_core nlohmann_json
-                      PRIVATE cpp_httplib)
+                      PRIVATE cpp_httplib gufo_npu_image)
 
 add_executable(gufo-npu src/cli/main.cpp)
 target_link_libraries(gufo-npu PRIVATE gufo_npu_qwen35_npu gufo_npu_qwen35_2b
                       gufo_npu_qwen35_4b
                       gufo_npu_qwen36_35b_a3b gufo_npu_qwen3vl_embed_2b_npu
                       gufo_npu_serve
-                      gufo_npu_serve_chat gufo_npu_serve_engine)
+                      gufo_npu_serve_chat gufo_npu_serve_engine
+                      gufo_npu_image)
 install(TARGETS gufo-npu RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 if(BUILD_TESTING)

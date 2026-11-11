@@ -9,6 +9,7 @@
 #include <string_view>
 #include <vector>
 
+#include "core/image.hpp"
 #include "core/sampling.hpp"
 #include "core/tokenizer.hpp"
 
@@ -28,13 +29,24 @@ struct ModelInfo {
   // its vectors, and the smallest size `dimensions` may cut them to.
   int embedding_length = 0;
   int embedding_min_dimensions = 0;
+  // Image inputs too (an embedding model loaded with its vision tower).
+  bool embedding_images = false;
 };
 
-// One /v1/embeddings input: text, or content as token ids (an OpenAI
-// token array), which the model's input template wraps either way.
+// One /v1/embeddings input: text, content as token ids (an OpenAI token
+// array), or an image with `text` as its optional caption; the model's
+// input template wraps each.
 struct EmbeddingInput {
   std::string text;
   std::optional<std::vector<int>> tokens;
+  std::shared_ptr<const image::Decoded> image;
+};
+
+// An input as the model embeds it: EmbeddingIds' ids, and the image of an
+// image input.
+struct PreparedEmbedding {
+  std::vector<int> ids;
+  std::shared_ptr<const image::Decoded> image;
 };
 
 struct GenerateRequest {
@@ -98,10 +110,11 @@ public:
   // task. Needs only the tokenizer, so it works before the model loads.
   virtual std::vector<int> EmbeddingIds(const EmbeddingInput& input,
                                         std::string_view instruction) const;
-  // One unit vector of info().embedding_length per input (each as
-  // EmbeddingIds built it), in order. One call runs at a time, as Generate.
+  // One unit vector of info().embedding_length per input, in order. One
+  // call runs at a time, as Generate. Throws std::invalid_argument for an
+  // image input when info().embedding_images is false.
   virtual std::vector<std::vector<float>> Embed(
-      const std::vector<std::vector<int>>& inputs);
+      const std::vector<PreparedEmbedding>& inputs);
 };
 
 inline std::vector<int> Engine::EmbeddingIds(const EmbeddingInput&,
@@ -110,7 +123,7 @@ inline std::vector<int> Engine::EmbeddingIds(const EmbeddingInput&,
 }
 
 inline std::vector<std::vector<float>> Engine::Embed(
-    const std::vector<std::vector<int>>&) {
+    const std::vector<PreparedEmbedding>&) {
   throw std::invalid_argument(info().id + " does not make embeddings");
 }
 
@@ -125,6 +138,9 @@ struct EngineOptions {
   // Prompt-cache checkpoints kept between requests (reuse of a multi-turn
   // chat's history); 0: off. The CPU reference has no cache.
   int prompt_cache = 2;
+  // An embedding model's vision tower (its mmproj GGUF), for image inputs;
+  // empty: text only. Other models refuse one.
+  std::string mmproj_path;
 };
 
 // Loads the GGUF's model on the device, picking the model package by

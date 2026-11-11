@@ -4,11 +4,81 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <memory>
+#include <optional>
+#include <stdexcept>
+#include <string_view>
+#include <vector>
+
+#include "core/image.hpp"
 
 namespace gufo_npu::serve {
 namespace {
 
 using json = nlohmann::ordered_json;
+
+// Standard base64 (RFC 4648), padding optional, whitespace skipped;
+// nullopt for anything else.
+std::optional<std::vector<std::uint8_t>> DecodeBase64(std::string_view text) {
+  std::vector<std::uint8_t> out;
+  out.reserve(text.size() / 4 * 3 + 3);
+  unsigned buffer = 0;
+  int bits = 0;
+  int padding = 0;
+  for (const char c : text) {
+    if (c == ' ' || c == '\n' || c == '\r' || c == '\t') {
+      continue;
+    }
+    if (c == '=') {
+      ++padding;
+      continue;
+    }
+    int value = -1;
+    if (c >= 'A' && c <= 'Z') {
+      value = c - 'A';
+    } else if (c >= 'a' && c <= 'z') {
+      value = c - 'a' + 26;
+    } else if (c >= '0' && c <= '9') {
+      value = c - '0' + 52;
+    } else if (c == '+') {
+      value = 62;
+    } else if (c == '/') {
+      value = 63;
+    }
+    if (value < 0 || padding > 0) {
+      return std::nullopt;
+    }
+    buffer = ((buffer << 6) | static_cast<unsigned>(value)) & 0xFFFFu;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out.push_back(static_cast<std::uint8_t>((buffer >> bits) & 0xFFu));
+    }
+  }
+  // Six bits left over are a character too many.
+  if (padding > 2 || bits >= 6) {
+    return std::nullopt;
+  }
+  return out;
+}
+
+// The bytes of a base64 data URI ("data:image/png;base64,..."). The server
+// fetches nothing, so URLs and paths are refused.
+std::vector<std::uint8_t> DataUriBytes(std::string_view uri) {
+  const auto comma = uri.find(',');
+  if (!uri.starts_with("data:image") || comma == std::string_view::npos ||
+      !uri.substr(0, comma).ends_with(";base64")) {
+    throw InvalidRequest(
+        "an image must be a base64 data URI (data:image/png;base64,... or "
+        "data:image/jpeg;base64,...); URLs are not fetched",
+        "input");
+  }
+  auto bytes = DecodeBase64(uri.substr(comma + 1));
+  if (!bytes) {
+    throw InvalidRequest("an image's data URI is not valid base64", "input");
+  }
+  return std::move(*bytes);
+}
 
 // A field that is absent or null reads as missing.
 const json* Field(const json& body, const char* name) {
@@ -422,8 +492,9 @@ EmbeddingsRequest ParseEmbeddingsRequest(const json& body) {
   EmbeddingsRequest req;
   const auto bad_input = [] {
     return InvalidRequest(
-        "input must be a non-empty string, an array of them, an array of "
-        "token ids or an array of such arrays",
+        "input must be a non-empty string, an image object ({\"image\": a "
+        "data URI, \"text\": an optional caption}), an array of those, an "
+        "array of token ids or an array of such arrays",
         "input");
   };
   const auto token_ids = [&](const json& arr) {
@@ -444,7 +515,48 @@ EmbeddingsRequest ParseEmbeddingsRequest(const json& body) {
     if (!s.is_string() || s.get<std::string>().empty()) {
       throw bad_input();
     }
-    return EmbeddingInput{s.get<std::string>(), std::nullopt};
+    return EmbeddingInput{s.get<std::string>(), std::nullopt, nullptr};
+  };
+  // Images are decoded here; a request's images share one pixel budget.
+  int images = 0;
+  long pixels_left = image::kMaxPixels;
+  const auto image_input = [&](const json& item) {
+    for (const auto& [key, value] : item.items()) {
+      if (key != "image" && key != "text") {
+        throw InvalidRequest(
+            "an image input takes \"image\" and \"text\", not \"" + key + "\"",
+            "input");
+      }
+    }
+    const json* data = Field(item, "image");
+    if (data == nullptr || !data->is_string()) {
+      throw InvalidRequest(
+          "an image input needs \"image\", a data URI "
+          "(data:image/png;base64,...)",
+          "input");
+    }
+    EmbeddingInput in;
+    if (const json* caption = Field(item, "text")) {
+      if (!caption->is_string()) {
+        throw InvalidRequest("an image input's \"text\" must be a string",
+                             "input");
+      }
+      in.text = caption->get<std::string>();
+    }
+    if (++images > kMaxEmbeddingImages) {
+      throw InvalidRequest("at most " + std::to_string(kMaxEmbeddingImages) +
+                               " image inputs per request",
+                           "input");
+    }
+    const auto bytes = DataUriBytes(data->get<std::string>());
+    try {
+      auto decoded = image::Decode(bytes, pixels_left);
+      pixels_left -= static_cast<long>(decoded.width) * decoded.height;
+      in.image = std::make_shared<const image::Decoded>(std::move(decoded));
+    } catch (const std::invalid_argument& e) {
+      throw InvalidRequest(std::string("an image input: ") + e.what(), "input");
+    }
+    return in;
   };
   const json* input = Field(body, "input");
   if (input == nullptr) {
@@ -452,20 +564,22 @@ EmbeddingsRequest ParseEmbeddingsRequest(const json& body) {
   }
   if (input->is_string()) {
     req.inputs.push_back(text(*input));
+  } else if (input->is_object()) {
+    req.inputs.push_back(image_input(*input));
   } else if (input->is_array() && !input->empty()) {
     const json& first = input->front();
-    if (first.is_string()) {
-      for (const auto& s : *input) {
-        req.inputs.push_back(text(s));
+    if (first.is_string() || first.is_object()) {
+      for (const auto& item : *input) {
+        req.inputs.push_back(item.is_object() ? image_input(item) : text(item));
       }
     } else if (first.is_number_integer()) {
-      req.inputs.push_back({"", token_ids(*input)});
+      req.inputs.push_back({"", token_ids(*input), nullptr});
     } else if (first.is_array()) {
       for (const auto& p : *input) {
         if (!p.is_array()) {
           throw bad_input();
         }
-        req.inputs.push_back({"", token_ids(p)});
+        req.inputs.push_back({"", token_ids(p), nullptr});
       }
     } else {
       throw bad_input();
