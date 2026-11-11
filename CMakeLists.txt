@@ -152,7 +152,7 @@ add_library(gufo_npu_serve STATIC
   src/serve/text.cpp
 )
 target_link_libraries(gufo_npu_serve PUBLIC gufo_npu_core nlohmann_json
-                      PRIVATE cpp_httplib)
+                      PRIVATE cpp_httplib gufo_npu_image)
 
 add_executable(gufo-npu src/cli/main.cpp)
 target_link_libraries(gufo-npu PRIVATE gufo_npu_qwen35_npu gufo_npu_qwen35_2b

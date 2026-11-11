@@ -73,4 +73,15 @@ if(GUFO_NPU_ENABLE_XRT AND GUFO_NPU_BUILD_KERNELS)
   set_tests_properties(qwen3vl_embed_2b_npu_vision_test PROPERTIES
                        LABELS "qwen3vl_embed_2b;npu;model" SKIP_RETURN_CODE 77
                        TIMEOUT 1800)
+
+  # Image inputs through the server's engine (PNG in, as /v1/embeddings).
+  add_executable(qwen3vl_embed_2b_engine_image_test engine_image_test.cpp)
+  target_link_libraries(qwen3vl_embed_2b_engine_image_test PRIVATE
+                        gufo_npu_serve_engine gufo_npu_image PNG::PNG
+                        nlohmann_json)
+  add_test(NAME qwen3vl_embed_2b_engine_image_test
+           COMMAND qwen3vl_embed_2b_engine_image_test "${kernels}")
+  set_tests_properties(qwen3vl_embed_2b_engine_image_test PROPERTIES
+                       LABELS "qwen3vl_embed_2b;npu;model" SKIP_RETURN_CODE 77
+                       TIMEOUT 1800)
 endif()

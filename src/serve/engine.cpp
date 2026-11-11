@@ -27,9 +27,9 @@
 #include "models/qwen36_35b_a3b/npu_decoder.hpp"
 #include "models/qwen36_35b_a3b/npu_prefill.hpp"
 #include "models/qwen3vl_embed_2b/config.hpp"
+#include "models/qwen3vl_embed_2b/embedding_model.hpp"
 #include "models/qwen3vl_embed_2b/input.hpp"
-#include "models/qwen3vl_embed_2b/npu_embedder.hpp"
-#include "models/qwen3vl_embed_2b/reference.hpp"
+#include "models/qwen3vl_embed_2b/vision.hpp"
 #include "serve/engine_pool.hpp"
 #include "serve/model_registry.hpp"
 
@@ -427,30 +427,51 @@ ModelInfo DescribeEmbedding(const EngineOptions& options,
   info.vocab = config.vocab;
   info.embedding_length = config.hidden;
   info.embedding_min_dimensions = qwen3vl_embed_2b::kMinDimensions;
+  info.embedding_images = !options.mmproj_path.empty();
   return info;
+}
+
+// The embedding model's vision tower, when the options name one. Throws
+// std::invalid_argument for a GGUF that is not a Qwen3-VL mmproj.
+std::unique_ptr<gguf::File> OpenMmproj(const EngineOptions& options) {
+  if (options.mmproj_path.empty()) {
+    return nullptr;
+  }
+  auto file = gguf::File::Open(options.mmproj_path);
+  if (!qwen3vl_embed_2b::IsVisionProjector(*file)) {
+    throw std::invalid_argument(options.mmproj_path +
+                                " is not a Qwen3-VL vision tower (mmproj)");
+  }
+  return file;
 }
 
 std::vector<int> EmbeddingIdsFor(const Tokenizer& tokenizer,
                                  const EmbeddingInput& input,
                                  std::string_view instruction) {
+  namespace e = qwen3vl_embed_2b;
+  if (input.image) {
+    return e::ImageInputIds(
+        tokenizer, e::ImageTokens(input.image->width, input.image->height),
+        input.text, instruction);
+  }
   return input.tokens
-             ? qwen3vl_embed_2b::InputIdsFromTokens(tokenizer, *input.tokens,
-                                                    instruction)
-             : qwen3vl_embed_2b::InputIds(tokenizer, input.text, instruction);
+             ? e::InputIdsFromTokens(tokenizer, *input.tokens, instruction)
+             : e::InputIds(tokenizer, input.text, instruction);
 }
 
 class EmbeddingEngine final : public Engine {
 public:
-  EmbeddingEngine(std::unique_ptr<gguf::File> file, ModelInfo info,
+  EmbeddingEngine(std::unique_ptr<gguf::File> file,
+                  std::unique_ptr<gguf::File> mmproj, ModelInfo info,
                   const EngineOptions& options)
-      : file_(std::move(file)), tokenizer_(*file_), info_(std::move(info)) {
-    if (options.device == "cpu") {
-      embedder_ = std::make_unique<qwen3vl_embed_2b::Reference>(*file_);
-    } else {
-      embedder_ = std::make_unique<qwen3vl_embed_2b::NpuEmbedder>(
-          *file_, KernelDir(options.kernels));
-    }
-  }
+      : file_(std::move(file)),
+        mmproj_(std::move(mmproj)),
+        tokenizer_(*file_),
+        info_(std::move(info)),
+        image_pad_(tokenizer_.Find(qwen3vl_embed_2b::kImagePad)),
+        model_(*file_, mmproj_.get(), options.device,
+               options.device == "npu" ? KernelDir(options.kernels)
+                                       : fs::path()) {}
 
   const ModelInfo& info() const override { return info_; }
   const Tokenizer& tokenizer() const override { return tokenizer_; }
@@ -464,25 +485,51 @@ public:
                                 std::string_view instruction) const override {
     return EmbeddingIdsFor(tokenizer_, input, instruction);
   }
+  // The texts as one batch, then each image on its own (images of
+  // different sizes cannot share the vision tower's attention).
   std::vector<std::vector<float>> Embed(
-      const std::vector<std::vector<int>>& inputs) override {
+      const std::vector<PreparedEmbedding>& inputs) override {
     const std::lock_guard lock(mutex_);
-    for (const auto& ids : inputs) {
-      if (static_cast<int>(ids.size()) > info_.context_length) {
+    std::vector<std::vector<int>> texts;
+    for (const auto& input : inputs) {
+      if (static_cast<int>(input.ids.size()) > info_.context_length) {
         throw std::invalid_argument("an input of " +
-                                    std::to_string(ids.size()) +
+                                    std::to_string(input.ids.size()) +
                                     " tokens exceeds the context length of " +
                                     std::to_string(info_.context_length));
       }
+      if (input.image && !model_.has_vision()) {
+        throw std::invalid_argument(info_.id +
+                                    " was loaded without a vision tower");
+      }
+      if (!input.image) {
+        texts.push_back(input.ids);
+      }
     }
-    return embedder_->Embed(inputs);
+    auto text_vectors =
+        texts.empty() ? std::vector<std::vector<float>>() : model_.Embed(texts);
+    std::vector<std::vector<float>> vectors;
+    std::size_t next_text = 0;
+    for (const auto& input : inputs) {
+      if (!input.image) {
+        vectors.push_back(std::move(text_vectors[next_text++]));
+        continue;
+      }
+      qwen3vl_embed_2b::Image image{input.image->width, input.image->height,
+                                    input.image->rgb};
+      qwen3vl_embed_2b::FlattenAlpha(image.rgb, input.image->alpha);
+      vectors.push_back(model_.EmbedImage(input.ids, image_pad_, image));
+    }
+    return vectors;
   }
 
 private:
   std::unique_ptr<gguf::File> file_;
+  std::unique_ptr<gguf::File> mmproj_;
   Tokenizer tokenizer_;
   ModelInfo info_;
-  std::unique_ptr<qwen3vl_embed_2b::Embedder> embedder_;
+  int image_pad_;
+  qwen3vl_embed_2b::EmbeddingModel model_;
   std::mutex mutex_;
 };
 
@@ -503,7 +550,7 @@ public:
     return EmbeddingIdsFor(tokenizer_, input, instruction);
   }
   std::vector<std::vector<float>> Embed(
-      const std::vector<std::vector<int>>&) override {
+      const std::vector<PreparedEmbedding>&) override {
     throw std::logic_error(info_.id + " is not loaded");
   }
 
@@ -512,15 +559,26 @@ private:
   ModelInfo info_;
 };
 
+// Only an embedding model takes a vision tower.
+void RefuseMmproj(const EngineOptions& options) {
+  if (!options.mmproj_path.empty()) {
+    throw std::invalid_argument(options.model_path +
+                                " is not an embedding model; an mmproj "
+                                "(vision tower) needs Qwen3-VL-Embedding-2B");
+  }
+}
+
 }  // namespace
 
 std::unique_ptr<Engine> ProbeEngine(const EngineOptions& options) {
   const auto file = gguf::File::Open(options.model_path);
   if (qwen3vl_embed_2b::IsEmbeddingModel(*file)) {
     const auto config = qwen3vl_embed_2b::ReadConfig(*file);
+    OpenMmproj(options);  // fail at start, not at the first image
     return std::make_unique<ProbedEmbeddingEngine>(
         *file, DescribeEmbedding(options, *file, config));
   }
+  RefuseMmproj(options);
   const auto config = qwen35::ReadConfig(*file);
   std::optional<ModelPackage> package;
   ModelInfo info = Describe(options, *file, config, package);
@@ -533,9 +591,10 @@ std::unique_ptr<Engine> LoadEngine(const EngineOptions& options) {
   if (qwen3vl_embed_2b::IsEmbeddingModel(*file)) {
     const auto config = qwen3vl_embed_2b::ReadConfig(*file);
     ModelInfo info = DescribeEmbedding(options, *file, config);
-    return std::make_unique<EmbeddingEngine>(std::move(file), std::move(info),
-                                             options);
+    return std::make_unique<EmbeddingEngine>(
+        std::move(file), OpenMmproj(options), std::move(info), options);
   }
+  RefuseMmproj(options);
   const auto config = qwen35::ReadConfig(*file);
   std::optional<ModelPackage> package;
   const ModelInfo info = Describe(options, *file, config, package);

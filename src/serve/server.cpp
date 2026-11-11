@@ -988,8 +988,9 @@ struct Server::Impl {
     Job job;
     job.arrived = Clock::now();
     EmbeddingsRequest request;
-    std::vector<std::vector<int>> inputs;
+    std::vector<PreparedEmbedding> inputs;
     int tokens = 0;
+    int images = 0;
     try {
       const auto body = ParseBody(req);
       request = ParseEmbeddingsRequest(body);
@@ -1020,7 +1021,19 @@ struct Server::Impl {
             }
           }
         }
-        auto ids = job.engine->EmbeddingIds(input, request.instruction);
+        if (input.image && !info.embedding_images) {
+          throw InvalidRequest(
+              "the model " + info.id +
+                  " embeds text only; start the server with --mmproj (its "
+                  "vision tower) for image inputs",
+              "input");
+        }
+        std::vector<int> ids;
+        try {
+          ids = job.engine->EmbeddingIds(input, request.instruction);
+        } catch (const std::invalid_argument& e) {
+          throw InvalidRequest(e.what(), "input");  // e.g. an image's shape
+        }
         if (static_cast<int>(ids.size()) > info.context_length) {
           throw ApiError(400, "invalid_request_error",
                          "context_length_exceeded",
@@ -1030,7 +1043,8 @@ struct Server::Impl {
                          "input");
         }
         tokens += static_cast<int>(ids.size());
-        inputs.push_back(std::move(ids));
+        images += input.image ? 1 : 0;
+        inputs.push_back({std::move(ids), input.image});
       }
     } catch (const ApiError& e) {
       metrics.Request(e.status);
@@ -1063,6 +1077,7 @@ struct Server::Impl {
                   seconds > 0 ? tokens / seconds : 0.0);
     AddDetail(
         "model=" + job.model + " inputs=" + std::to_string(inputs.size()) +
+        " images=" + std::to_string(images) +
         " tokens=" + std::to_string(tokens) +
         " embed_ms=" + std::to_string(static_cast<long>(seconds * 1000.0)) +
         " embed_tok_s=" + rate);

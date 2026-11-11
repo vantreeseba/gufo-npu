@@ -56,7 +56,7 @@ public:
     return probe_.EmbeddingIds(input, instruction);
   }
   std::vector<std::vector<float>> Embed(
-      const std::vector<std::vector<int>>& inputs) override {
+      const std::vector<PreparedEmbedding>& inputs) override {
     return pool_.Embed(index_, inputs);
   }
 
@@ -180,7 +180,7 @@ GenerateResult EnginePool::Generate(std::size_t index,
 }
 
 std::vector<std::vector<float>> EnginePool::Embed(
-    std::size_t index, const std::vector<std::vector<int>>& inputs) {
+    std::size_t index, const std::vector<PreparedEmbedding>& inputs) {
   const std::lock_guard lock(device_mutex_);
   SwitchLocked(index);
   struct Touch {

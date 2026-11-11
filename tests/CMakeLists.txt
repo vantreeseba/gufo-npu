@@ -87,7 +87,8 @@ add_test(NAME serve_logging_test COMMAND serve_logging_test)
 # POST /v1/embeddings over a scripted embedding engine.
 add_executable(serve_embeddings_test serve/server_embeddings_test.cpp)
 target_link_libraries(serve_embeddings_test PRIVATE gufo_npu_serve cpp_httplib)
-add_test(NAME serve_embeddings_test COMMAND serve_embeddings_test)
+add_test(NAME serve_embeddings_test
+         COMMAND serve_embeddings_test "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/image")
 set_tests_properties(serve_text_test serve_server_test serve_chat_test
                      serve_extras_test serve_engine_pool_test serve_logging_test
                      serve_embeddings_test

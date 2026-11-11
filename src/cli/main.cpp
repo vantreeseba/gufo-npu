@@ -44,6 +44,7 @@
 #include "models/qwen36_35b_a3b/npu/gemv.hpp"
 #include "models/qwen36_35b_a3b/npu_decoder.hpp"
 #include "models/qwen36_35b_a3b/npu_prefill.hpp"
+#include "models/qwen3vl_embed_2b/config.hpp"
 #include "models/qwen3vl_embed_2b/embedding_model.hpp"
 #include "models/qwen3vl_embed_2b/input.hpp"
 #include "models/qwen3vl_embed_2b/npu_embedder.hpp"
@@ -119,7 +120,8 @@ constexpr char kUsage[] =
     "        [--device npu|cpu] [--kernels DIR] [--model-id NAME]\n"
     "        [--max-queue N] [--api-key KEY] [--context-length N]\n"
     "        [--prompt-cache N] [--preload ID] [--unload-after SECONDS]\n"
-    "        [--draft mtp|none] [--log-level error|warn|info|debug]\n"
+    "        [--draft mtp|none] [--mmproj GGUF]\n"
+    "        [--log-level error|warn|info|debug]\n"
     "                           OpenAI-compatible server (docs/SERVING.md),\n"
     "                           by default on 127.0.0.1:8080; --prompt-cache\n"
     "                           keeps N checkpoints of earlier prompts for\n"
@@ -127,7 +129,9 @@ constexpr char kUsage[] =
     "                           --model: requests pick one by id, one loaded\n"
     "                           at a time (--preload: the first, default the\n"
     "                           first --model); --unload-after frees an idle\n"
-    "                           model's memory (default 0: never);\n"
+    "                           model's memory (default 0: never); --mmproj\n"
+    "                           gives the embedding --model its vision tower\n"
+    "                           for image inputs;\n"
     "                           --log-level sets what goes to stderr\n"
     "                           (default info; debug adds /health and\n"
     "                           /metrics polls)\n"
@@ -1450,12 +1454,15 @@ int Serve(const std::vector<std::string_view>& args) {
   serve::ServerOptions server_options;
   serve::EnginePoolOptions pool_options;
   std::vector<std::string> model_paths;
+  std::optional<std::string> mmproj;
   std::optional<std::string> kernels;
   serve::LogLevel log_level = serve::LogLevel::kInfo;
   for (std::size_t i = 0; i < args.size(); ++i) {
     const bool has_value = i + 1 < args.size();
     if (args[i] == "--model" && has_value) {
       model_paths.emplace_back(args[++i]);
+    } else if (args[i] == "--mmproj" && has_value) {
+      mmproj = std::string(args[++i]);
     } else if (args[i] == "--log-level" && has_value) {
       const auto level = serve::LogLevelFromName(args[++i]);
       if (!level) {
@@ -1512,6 +1519,28 @@ int Serve(const std::vector<std::string_view>& args) {
   if (engine_options.device == "npu") {
     engine_options.kernels = KernelDir(kernels).string();
   }
+  // --mmproj belongs to the one embedding model among the --model files.
+  std::optional<std::size_t> mmproj_model;
+  if (mmproj) {
+    std::vector<std::size_t> embedding_models;
+    try {
+      for (std::size_t m = 0; m < model_paths.size(); ++m) {
+        if (gufo_npu::qwen3vl_embed_2b::IsEmbeddingModel(
+                *gufo_npu::gguf::File::Open(model_paths[m]))) {
+          embedding_models.push_back(m);
+        }
+      }
+    } catch (const std::exception& e) {
+      std::cerr << "serve: " << e.what() << "\n";
+      return 1;
+    }
+    if (embedding_models.size() != 1) {
+      std::cerr << "serve: --mmproj needs exactly one embedding --model "
+                   "(Qwen3-VL-Embedding-2B)\n";
+      return 2;
+    }
+    mmproj_model = embedding_models.front();
+  }
   serve::Logger::SetLevel(log_level);
   serve::Logger::Info(
       "server",
@@ -1525,6 +1554,7 @@ int Serve(const std::vector<std::string_view>& args) {
           " prompt_cache=" + std::to_string(engine_options.prompt_cache) +
           " context_length=" + std::to_string(engine_options.context_length) +
           " api_key=" + (server_options.api_key.empty() ? "unset" : "set") +
+          " mmproj=" + (mmproj ? "set" : "unset") +
           " log_level=" + std::string(serve::LogLevelName(log_level)));
 
   // SIGINT/SIGTERM stop the server: blocked in every thread (set before any
@@ -1547,9 +1577,12 @@ int Serve(const std::vector<std::string_view>& args) {
     // should give its memory back.
     if (model_paths.size() > 1 || pool_options.unload_after_seconds > 0) {
       std::vector<serve::EngineOptions> models;
-      for (const auto& path : model_paths) {
+      for (std::size_t m = 0; m < model_paths.size(); ++m) {
         models.push_back(engine_options);
-        models.back().model_path = path;
+        models.back().model_path = model_paths[m];
+        if (mmproj_model == m) {
+          models.back().mmproj_path = *mmproj;
+        }
       }
       pool = std::make_unique<serve::EnginePool>(
           std::move(models), serve::ProbeEngine, serve::LoadEngine,
@@ -1565,6 +1598,7 @@ int Serve(const std::vector<std::string_view>& args) {
       server = std::make_unique<serve::Server>(*pool, *format, server_options);
     } else {
       engine_options.model_path = model_paths.front();
+      engine_options.mmproj_path = mmproj.value_or("");
       serve::Logger::Info(
           "loader", "event=load_started artifact=" + engine_options.model_path +
                         " " + serve::Logger::MemoryStatus());

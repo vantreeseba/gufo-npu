@@ -86,7 +86,7 @@ private:
   GenerateResult Generate(std::size_t index, const GenerateRequest& request,
                           const std::function<bool(int)>& on_token);
   std::vector<std::vector<float>> Embed(
-      std::size_t index, const std::vector<std::vector<int>>& inputs);
+      std::size_t index, const std::vector<PreparedEmbedding>& inputs);
   // Under device_mutex_: makes model `index` the loaded one, logging a
   // switch from another.
   void SwitchLocked(std::size_t index);
