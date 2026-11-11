@@ -35,9 +35,44 @@
 - **Weights rounded to bfp16 once at load** from the BF16 GGUF; no q4nx copy
   (there is no decode, so nothing reads q4nx).
 
+## Rejected
+
+- **The ViT's attention on IRON's MHA** (2026-11-11, spike for VISION.md
+  stage 3; not merged). IRON's `mha` design (pinned commit) with mlir-aie
+  v1.4.4's `mha.cc`: 16 heads of 64, 8 pipelines of 3 cores (QK, softmax,
+  PV), q/k/v repacked per head on the CPU. What it took to run at all:
+  `mha.cc` is causal only (the QK and PV skips and the diagonal mask had to
+  be compiled out); K and V padded to 64 x 8 pipelines leave key blocks of
+  pure padding, which skip the softmax's state update while `matmul_PV`
+  still rescales O by the previous block's factor (24 patches gave an
+  all-zero output), so K and V were padded to one key block instead; the
+  pinned design binds `matmul_PV` without v1.4.4's last argument
+  (`S_kv_eff`), harmless here. The kernel's exp2 scale uses log2(e) =
+  1.4453125, corrected through q.
+
+  | | NPU (IRON MHA) | CPU (AVX-512, `FullAttention`) |
+  |---|---|---|
+  | One layer, 7,200 patches | 58 ms best, 60 ms mean (3.7 TFLOP/s) | 120 ms (1.8 TFLOP/s) |
+  | One layer, 1,200 patches | 2.3 ms | 3.7 ms |
+  | Random q, k, v: relative error vs a double softmax | 2.9% (24), 4.2% (1,200), 4.7% (7,200) | 1e-6 |
+  | Page, end to end | 2.57 s (attention 1.40 s) | 4.2 s (attention 2.97 s) |
+  | 640x480 card: embedding vs the CPU reference | **0.9817** (fails 0.99) | 0.9964 |
+  | 640x480 card: features / DeepStack 0 vs the reference | 0.742 / 0.956 | 0.990 / 0.9998 |
+  | Oracle cards (24 to 48 patches) vs HF | 0.9952 to 0.9968 | 0.9946 to 0.9967 |
+
+  Fast enough (2x the CPU, a page 1.6 s sooner) but not accurate enough
+  past small images: the error compounds through the 24 blocks. Likely
+  sources, untested: O accumulated in bf16 across key blocks (`matmul_PV`
+  writes the bf16 tile it rescales), bf16 scores and weights, and
+  `aie::exp2<bfloat16>`'s linear interpolation (up to 7% high per weight).
+  A ViT kernel needs an fp32 O accumulator and a closer exp at least; that
+  is a new kernel, not a configuration of this one.
+
 ## Candidates
 
 - **Attention on the NPU for the ViT** (stage 3): 3.0 s of a page's 4.3 s.
+  IRON's MHA is too inaccurate as is (Rejected, above); a kernel with an
+  fp32 O accumulator and a closer exp is the next try.
 - **Find which bfp16 product makes the ViT's few drifting tokens**
   (QUALITY.md, images on the NPU) before fusing more into the GEMMs.
 

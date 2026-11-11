@@ -256,8 +256,11 @@ Memory: the ViT keeps 7200 x 4096 fp32 (118 MB) of activations at most.
   contributes most is untested; finding it (per product, bf16 against
   bfp16 activations on the CPU) comes before fusing more into the GEMMs.
 - **NPU attention**: no kernel in the tree; QK^T has K = 64, which the GEMM
-  cannot tile (K % 512). Needs a dedicated design or a reshaped batched
-  GEMM.
+  cannot tile (K % 512). IRON's MHA (head 64, after patching it from
+  causal to full) runs a page's attention in 1.4 s against the CPU's 3.0 s,
+  but its bf16 softmax and output drift too far by 1,200 patches
+  (embedding 0.9817 to the reference; EXPERIMENTS.md). Stage 3 needs its
+  own kernel with an fp32 O accumulator and a closer exp.
 - **max_pixels**: the embedder's 1800-token cap is what quality numbers
   assume; a smaller cap trades quality for O(n^2) time, unmeasured.
 - **Batching**: images of different sizes cannot share a ViT attention
