@@ -2,6 +2,21 @@
 
 ## Retained
 
+- **The vision tower's linears on the NPU GEMM** (2026-11-11, VISION.md
+  stage 2). Six (K, N) shapes added to the model's xclbin; the patch
+  embedding (K = 768) is padded with zeros to K = 1024 and reuses the
+  (1024, 1024) sequence rather than adding a K = 768 design. `NpuVision`
+  shares the embedder's hardware context and its two-in-flight chunked
+  pass (`npu/gemm_pass.hpp`). A page (7,200 patches) spends 0.15 s waiting
+  on the NPU's 792 GEMM calls against 3.0 s of CPU attention.
+- **The ViT's attention on the text attention's AVX-512 kernels**
+  (2026-11-11): the kernels take a head layout (query heads, kv heads,
+  stride, causal or full) instead of the text config, so the same
+  transposed key tiles and register blocking serve both. Query blocks are
+  64 rows for the ViT (16 for text, unchanged), since one image is one long
+  segment. The fp32 reference's per-key loop is not a runtime path; this is
+  the interim until NPU attention (stage 3).
+
 - **AVX-512 attention over transposed key tiles** (2026-10-30). Each key
   block is written once as a 128 x 64 tile (keys along the vector lanes),
   so scores are a register-blocked product (4 query vectors x 64 keys, no
@@ -21,6 +36,10 @@
   (there is no decode, so nothing reads q4nx).
 
 ## Candidates
+
+- **Attention on the NPU for the ViT** (stage 3): 3.0 s of a page's 4.3 s.
+- **Find which bfp16 product makes the ViT's few drifting tokens**
+  (QUALITY.md, images on the NPU) before fusing more into the GEMMs.
 
 - Skip the last layer's output projection and FFN for every row but each
   input's last (~2.5% of the GEMM work).
