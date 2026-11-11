@@ -85,6 +85,47 @@ of weights and activations (the only difference from the reference), and
 which product contributes most is untested (VISION.md, open questions).
 Page-sized images are not in the HF oracle; the page is timed only.
 
+## ViT attention on the NPU
+
+Measured 2026-11-11 on the Strix Halo box from a source build (the
+toolchain image) of the stage 3 branch, with the F16 GGUF, the F16 mmproj
+and the oracle above.
+
+`qwen3vl_embed_2b_vit_attention_test`: the attention program against a
+float64 softmax over random q, k, v (16 heads of 64, scores' spread 1 to 4
+in natural-log units), on 96 sampled queries per head where there are
+more:
+
+| Patches (padded length) | Spread | Error vs float64 | bf16 rounding alone | vs `FullAttention` (CPU fp32) |
+|---|---|---|---|---|
+| 24 (256) | 1 | 1.66e-3 | 1.65e-3 | 1.66e-3 |
+| 48 (256) | 3 | 1.67e-3 | 1.67e-3 | 1.67e-3 |
+| 300 (512) | 2 | 1.65e-3 | 1.65e-3 | 1.65e-3 |
+| 1,200 (1,280) | 1, 4 | 1.66e-3, 1.67e-3 | 1.65e-3, 1.66e-3 | 1.66e-3, 1.67e-3 |
+| 3,000 (3,072) | 2 | 1.67e-3 | 1.66e-3 | 1.67e-3 |
+| 7,200 (7,424) | 1, 3 | 1.66e-3, 1.68e-3 | 1.66e-3, 1.67e-3 | 1.66e-3, 1.68e-3 |
+
+Tolerance 3e-3: the error is the bf16 output's rounding; the fp32 state,
+the 3-term bfp16 products and the exp add about 1e-4 to it (in
+quadrature). `qwen3vl_embed_2b_vit_attention_pack_test`
+(hosted CI) checks that the AVX-512 q/k/v split gives the scalar
+encoder's bytes and that hi + lo returns each value within 2^-14 of its
+row's largest.
+
+`qwen3vl_embed_2b_npu_vision_test` with the attention on the NPU, against
+stage 2 (CPU attention, above):
+
+| Check | Tolerance | Stage 3 | Stage 2 |
+|---|---|---|---|
+| NPU vs HF fp32, the 3 cards | cosine ≥ 0.99 | **0.99488 to 0.99634** (96x64 0.99634, 128x96 with text 0.99613, 100x70 resized 0.99488) | 0.99463 to 0.99673 |
+| NPU vs the CPU reference, 640x480 card (1,200 patches) | cosine ≥ 0.995 | **0.99666** | 0.99645 |
+| NPU vs the CPU reference, 1024x768 card (3,072 patches, 797 tokens) | cosine ≥ 0.995 | **0.99736** | not run |
+| 640x480 merger features vs the CPU reference: cosine, worst token, tokens below 0.99 | (≥ 0.95) | 0.98898, 0.738, 65 of 300 | 0.98970, 0.783, 64 |
+
+The attention moved nothing measurable: the drifting tokens are the same
+as with CPU attention (the bfp16 GEMMs', above). The page has no
+reference; it is timed only (BENCHMARKS.md).
+
 ## Image inputs through the CLI and the server
 
 Measured 2026-11-11 on the Strix Halo box from a source build (the

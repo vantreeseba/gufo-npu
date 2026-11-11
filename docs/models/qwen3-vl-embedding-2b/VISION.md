@@ -196,7 +196,7 @@ round trip.
 | patch embed + 4 mergers | 0.37 T | 0.02-0.03 s |
 | text GEMMs (2.82 GFLOP x 1830) | 5.16 T | 0.29-0.47 s |
 | **GEMMs total** | **9.9 T** | **0.55-0.90 s** |
-| ViT attention (4 n^2 d x 24, 19.9 G exps) | 5.10 T | CPU (AVX-512) estimate: ~2.9 s |
+| ViT attention (4 n^2 d x 24, 19.9 G exps) | 5.10 T | NPU, measured: 1.41 s (CPU: 2.97 s) |
 | text attention (causal, 28 layers) | 0.38 T | CPU (AVX-512) estimate: ~0.2 s |
 
 CPU attention rate: BENCHMARKS.md (AVX-512 attention, 2026-10-30) has
@@ -209,8 +209,9 @@ size: 0.10 T at 1024 patches, 1.6 T at 4096, 5.1 T at 7200, 26 T at 16384.
 With the GEMMs on the NPU and attention on the CPU a page would take
 roughly 4 s, ~80% of it CPU attention. Measured with stage 2 (BENCHMARKS.md,
 2026-11-11): 4.2 to 4.4 s warm, of which the vision tower 3.5 s (CPU
-attention 3.0 s, NPU GEMM waits 0.15 s) and the text model 0.7 s. NPU attention (or a smaller
-`max_pixels`; quality cost unmeasured) is what makes images practical.
+attention 3.0 s, NPU GEMM waits 0.15 s) and the text model 0.7 s. With
+stage 3's NPU attention: 2.9 to 3.2 s, the vision tower 2.2 to 2.4 s
+(attention 1.65 s, including its context switches).
 Memory: the ViT keeps 7200 x 4096 fp32 (118 MB) of activations at most.
 
 ## Plan
@@ -231,10 +232,17 @@ Memory: the ViT keeps 7200 x 4096 fp32 (118 MB) of activations at most.
    at relative error 9.5e-3, embeddings at cosine 0.9946 or more to HF on
    the oracle's cards and 0.9964 to the stage-1 reference on a 1,200-patch
    card, per-phase timings.
-3. **NPU attention**: a bidirectional flash-attention kernel (head 64,
-   online softmax on the core) for the ViT, then the text's causal
-   attention with MRoPE-rotated q/k. This is the stage that decides the
-   page time (CPU attention would be ~80% of it, even with AVX-512).
+3. **NPU attention**: for the ViT done (`npu/vit_attention.hpp`, xclbin
+   `qwen3vl_embed_2b_vit_attn`): bidirectional flash attention on the
+   whole array, fp32 softmax state and output, 3-term bfp16 products, its
+   own hardware context. Checks (QUALITY.md): the op test at the bf16
+   output's rounding (1.65e-3 to 1.68e-3 against float64) from 24 to 7,200
+   patches; embeddings unchanged (0.9949 to 0.9963 to HF on the oracle's
+   cards, 0.9967 and 0.9974 to the reference on 1,200- and 3,072-patch
+   cards). A page's vision tower 3.57 -> 2.42 s; below ~3,000 patches the
+   two context switches per block make an image slower (BENCHMARKS.md).
+   Still to do: one hardware context for the tower (EXPERIMENTS.md,
+   Candidates), then the text's causal attention with MRoPE-rotated q/k.
 4. **Fusion**: bias + GELU epilogues and LayerNorm on the NPU, in
    runlists, so a ViT layer is a handful of commands; each move is kept
    only when the timing says so.
@@ -267,12 +275,12 @@ Memory: the ViT keeps 7200 x 4096 fp32 (118 MB) of activations at most.
   merger tokens below 0.99, the worst DeepStack token 0.42). Which product
   contributes most is untested; finding it (per product, bf16 against
   bfp16 activations on the CPU) comes before fusing more into the GEMMs.
-- **NPU attention**: no kernel in the tree; QK^T has K = 64, which the GEMM
-  cannot tile (K % 512). IRON's MHA (head 64, after patching it from
-  causal to full) runs a page's attention in 1.4 s against the CPU's 3.0 s,
-  but its bf16 softmax and output drift too far by 1,200 patches
-  (embedding 0.9817 to the reference; EXPERIMENTS.md). Stage 3 needs its
-  own kernel with an fp32 O accumulator and a closer exp.
+- **Context switches**: the ViT's attention program and the GEMM's are
+  two hardware contexts, and each block moves between them twice (~3 ms a
+  switch, ~0.15 s per image). It costs a small image more than its
+  attention: at 24 patches the vision tower takes 0.16 to 0.20 s against
+  0.03 s with CPU attention. Removing it means one program for the tower
+  (EXPERIMENTS.md, Candidates).
 - **max_pixels**: the embedder's 1800-token cap is what quality numbers
   assume; a smaller cap trades quality for O(n^2) time, unmeasured.
 - **Batching**: images of different sizes cannot share a ViT attention

@@ -27,6 +27,17 @@ add_test(NAME qwen3vl_embed_2b_vision_test
 set_tests_properties(qwen3vl_embed_2b_vision_test PROPERTIES
                      LABELS qwen3vl_embed_2b)
 
+# The ViT attention program's lengths and q/k/v tile splits: no NPU, hosted
+# CI.
+add_executable(qwen3vl_embed_2b_vit_attention_pack_test
+               vit_attention_pack_test.cpp)
+target_link_libraries(qwen3vl_embed_2b_vit_attention_pack_test PRIVATE
+                      gufo_npu_qwen3vl_embed_2b_npu)
+add_test(NAME qwen3vl_embed_2b_vit_attention_pack_test
+         COMMAND qwen3vl_embed_2b_vit_attention_pack_test)
+set_tests_properties(qwen3vl_embed_2b_vit_attention_pack_test PROPERTIES
+                     LABELS qwen3vl_embed_2b)
+
 add_executable(qwen3vl_embed_2b_reference_oracle_test reference_oracle_test.cpp)
 target_link_libraries(qwen3vl_embed_2b_reference_oracle_test PRIVATE
                       gufo_npu_qwen3vl_embed_2b nlohmann_json)
@@ -55,6 +66,15 @@ if(GUFO_NPU_ENABLE_XRT AND GUFO_NPU_BUILD_KERNELS)
   set_tests_properties(qwen3vl_embed_2b_gemm_test PROPERTIES
                        LABELS "qwen3vl_embed_2b;npu;kernels"
                        SKIP_RETURN_CODE 77)
+
+  add_executable(qwen3vl_embed_2b_vit_attention_test vit_attention_test.cpp)
+  target_link_libraries(qwen3vl_embed_2b_vit_attention_test PRIVATE
+                        gufo_npu_qwen3vl_embed_2b_npu)
+  add_test(NAME qwen3vl_embed_2b_vit_attention_test
+           COMMAND qwen3vl_embed_2b_vit_attention_test "${kernels}")
+  set_tests_properties(qwen3vl_embed_2b_vit_attention_test PROPERTIES
+                       LABELS "qwen3vl_embed_2b;npu;kernels"
+                       SKIP_RETURN_CODE 77 TIMEOUT 900)
 
   add_executable(qwen3vl_embed_2b_npu_embed_test npu_embed_test.cpp)
   target_link_libraries(qwen3vl_embed_2b_npu_embed_test PRIVATE

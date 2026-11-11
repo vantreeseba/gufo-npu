@@ -70,6 +70,14 @@ HTTP range requests). "Inferred" marks conclusions not read directly.
   hardware context (not documented; needs a canary test across runs and with
   a second context active). Reloading a design (`load_pdi`) costs milliseconds
   (4.9 ms measured in arXiv 2512.13282) and resets tiles.
+- Moving between two hardware contexts grows with the designs'
+  configuration (CDO) size. Measured 2026-11-11 by alternating
+  Qwen3-VL-Embedding-2B's GEMM (183 KB of CDO) with a one-core attention
+  probe (a 17 KB xclbin): 1.25 ms a switch; with the whole-array ViT
+  attention (361 KB of CDO): 3.1 ms. The two points give about 0.35 ms plus
+  ~10.8 µs per KB, as if the configuration loads at ~93 MB/s. Most of a CDO
+  is the core programs, one copy per core (32 x 9.6 KB of the attention's
+  361 KB), so a smaller program should switch faster.
 - Each core column's 4 cores use all 4 southbound stream channels between
   the core rows and the memtile for their outputs; an extra core-to-shim
   stream does not route (we send the GEMV's residual down the existing
@@ -77,7 +85,10 @@ HTTP range requests). "Inferred" marks conclusions not read directly.
 
 ## Clocks and power
 
-- DPM table {npuclk, hclk} MHz: 396/792 … 1267/1800 (`npu4_regs.c`).
+- DPM table {npuclk, hclk} MHz: 396/792 … 1267/1800 (`npu4_regs.c`). The
+  cores run at npuclk: a kernel's VLIW bundle count divided by 1.267 GHz
+  predicted the ViT attention's measured block times within 5 to 15%
+  (docs/models/qwen3-vl-embedding-2b/EXPERIMENTS.md).
 - `xrt-smi configure --pmode`: turbo = max level, no clock gating;
   performance = max level; balanced = half; powersaver = level 0; default =
   the context solver decides (`aie2_pm.c`). Raising the level takes 3.5 s.

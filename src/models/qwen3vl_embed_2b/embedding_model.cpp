@@ -20,7 +20,7 @@ EmbeddingModel::EmbeddingModel(const gguf::File& file, const gguf::File* mmproj,
   } else if (device == "npu") {
     auto npu = std::make_unique<NpuEmbedder>(file, kernel_dir);
     if (mmproj != nullptr) {
-      vision_ = std::make_unique<NpuVision>(*mmproj, *npu);
+      vision_ = std::make_unique<NpuVision>(*mmproj, *npu, kernel_dir);
     }
     text_ = std::move(npu);
   } else {

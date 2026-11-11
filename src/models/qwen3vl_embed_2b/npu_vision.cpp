@@ -21,6 +21,7 @@
 #include "core/simd.hpp"
 #include "models/qwen3vl_embed_2b/npu/embed_gemm.hpp"
 #include "models/qwen3vl_embed_2b/npu/gemm_pass.hpp"
+#include "models/qwen3vl_embed_2b/npu/vit_attention.hpp"
 #include "models/qwen3vl_embed_2b/ops.hpp"
 #include "npu/gemm.hpp"
 
@@ -178,6 +179,8 @@ struct NpuVision::Impl {
 
   VisionConfig config;
   GemmRuntime& runtime;
+  // The attention program, in its own hardware context.
+  npu::VitAttention attention;
   // hidden x kPatchDim: the patch kernel with its temporal slots summed,
   // K zero-padded from 3 * patch^2.
   std::unique_ptr<Bfp16Gemm> patch;
@@ -193,10 +196,10 @@ struct NpuVision::Impl {
       std::max<std::size_t>(std::thread::hardware_concurrency() / 2, 1) - 1};
   Profile profile;
 
-  // One image: residual stream, qkv (fp32, rotated in place), attention
-  // output, fc1 output after GELU (bf16, fc2's A), a merger's fc1 output
-  // after GELU (bf16), each patch's 2D RoPE angles and grid position.
-  std::vector<float> h, qkv, mixed;
+  // One image: residual stream, qkv (fp32, rotated in place), fc1 output
+  // after GELU (bf16, fc2's A), a merger's fc1 output after GELU (bf16),
+  // each patch's 2D RoPE angles and grid position.
+  std::vector<float> h, qkv;
   std::vector<Bits> act, mid;
   std::vector<float> rcos, rsin;
   std::vector<int> prow, pcol;
@@ -208,13 +211,15 @@ struct NpuVision::Impl {
         static_cast<std::size_t>(c.MergedDim()) != npu::kVitMerged ||
         static_cast<std::size_t>(c.out_hidden) != npu::kHidden ||
         static_cast<std::size_t>(c.PatchValues()) > npu::kPatchDim ||
-        c.heads <= 0 || c.hidden % c.heads != 0 || c.HeadDim() % 4 != 0) {
+        c.heads != npu::kVitAttnHeads ||
+        c.hidden != c.heads * npu::kVitAttnHeadDim) {
       throw std::runtime_error(
           "qwen3vl npu vision: this mmproj's shapes (hidden " +
           std::to_string(c.hidden) + ", ffn " + std::to_string(c.ffn) +
-          ", output " + std::to_string(c.out_hidden) +
-          ") are not Qwen3-VL-Embedding-2B's, which the GEMM program is "
-          "built for");
+          ", output " + std::to_string(c.out_hidden) + ", " +
+          std::to_string(c.heads) +
+          " heads) are not Qwen3-VL-Embedding-2B's, which the GEMM and "
+          "attention programs are built for");
     }
   }
 
@@ -237,8 +242,9 @@ struct NpuVision::Impl {
     return m;
   }
 
-  Impl(const gguf::File& file, GemmRuntime& rt)
-      : config(ReadVisionConfig(file)), runtime(rt) {
+  Impl(const gguf::File& file, GemmRuntime& rt,
+       const std::filesystem::path& kernel_dir)
+      : config(ReadVisionConfig(file)), runtime(rt), attention(kernel_dir) {
     const VisionConfig& c = config;
     CheckShapes(c);
     const int pv = c.PatchValues();
@@ -486,11 +492,11 @@ struct NpuVision::Impl {
     const auto rows = static_cast<std::size_t>(n);
     h.resize(rows * d);
     qkv.resize(rows * 3 * d);
-    mixed.resize(rows * d);
     act.resize(rows * ffn);
     mid.resize(static_cast<std::size_t>(tokens) * c.MergedDim());
     patch_chunks = npu::Chunks(n);
     token_chunks = npu::Chunks(tokens);
+    attention.Reset(n);
     Positions(patches);
 
     // Patch embedding + bias + resampled learned positions.
@@ -531,14 +537,14 @@ struct NpuVision::Impl {
                     Rotate(r, row);
                   });
                 });
-      const auto attention = Clock::now();
-      FullAttention(c.heads, c.HeadDim(), n, qkv.data(), mixed.data(), run);
-      profile.attention_seconds += SecondsSince(attention);
+      const auto attention_start = Clock::now();
+      attention.Run(qkv.data(), run);
+      profile.attention_seconds += SecondsSince(attention_start);
       pass->Run(
           *b.out, patch_chunks,
           [&](const Chunk& ch, Bits* a) {
             Run(static_cast<std::size_t>(ch.n), [&](std::size_t t) {
-              simd::ToBf16Row(mixed.data() + (ch.begin + t) * d, a + t * d, d);
+              attention.Output(static_cast<int>(ch.begin + t), a + t * d);
             });
           },
           BiasRows(h, b.out_b, d, true));
@@ -572,8 +578,10 @@ struct NpuVision::Impl {
   }
 };
 
-NpuVision::NpuVision(const gguf::File& mmproj, NpuEmbedder& embedder)
-    : impl_(std::make_unique<Impl>(mmproj, embedder.gemm_runtime())) {}
+NpuVision::NpuVision(const gguf::File& mmproj, NpuEmbedder& embedder,
+                     const std::filesystem::path& kernel_dir)
+    : impl_(std::make_unique<Impl>(mmproj, embedder.gemm_runtime(),
+                                   kernel_dir)) {}
 
 NpuVision::~NpuVision() = default;
 
