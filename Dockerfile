@@ -37,7 +37,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       libxrt2="${XRT_VERSION}" libxrt-npu2="${XRT_VERSION}" \
       libxrt-utils="${XRT_VERSION}" libxrt-utils-npu="${XRT_VERSION}" \
-      libicu74 libpng16-16t64 libjpeg-turbo8 \
+      libicu74 \
  && apt-get purge -y software-properties-common && apt-get autoremove -y \
  && rm -rf /var/lib/apt/lists/*
 
@@ -48,8 +48,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       build-essential cmake ninja-build ccache git clang-format \
       python3 python3-dev python3-venv \
-      uuid-dev libicu-dev libpng-dev libjpeg-turbo8-dev \
-      libxrt-dev="${XRT_VERSION}" \
+      uuid-dev libicu-dev libxrt-dev="${XRT_VERSION}" \
  && rm -rf /var/lib/apt/lists/*
 ENV VIRTUAL_ENV=/opt/venv
 RUN python3 -m venv "${VIRTUAL_ENV}"
@@ -57,6 +56,10 @@ ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
 COPY .devops/requirements-kernels.txt /tmp/requirements-kernels.txt
 RUN pip install --no-cache-dir --upgrade pip \
  && pip install --no-cache-dir -r /tmp/requirements-kernels.txt
+# Image decoding (src/core/image.cpp). Own layer, after the heavy ones.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libpng-dev libjpeg-turbo8-dev \
+ && rm -rf /var/lib/apt/lists/*
 
 FROM toolchain AS build
 ARG BUILD_JOBS=4
@@ -70,9 +73,10 @@ RUN cmake --preset release \
 
 FROM xrt AS runtime
 ARG DEBIAN_FRONTEND=noninteractive
-# curl: the health check.
+# curl: the health check; libpng and libjpeg-turbo: image inputs.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends curl \
+ && apt-get install -y --no-install-recommends curl libpng16-16t64 \
+      libjpeg-turbo8 \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /opt/gufo-npu /opt/gufo-npu
 COPY .devops/entrypoint.sh /opt/gufo-npu/bin/entrypoint.sh
