@@ -18,6 +18,11 @@ target_link_libraries(quant_test PRIVATE gufo_npu_core)
 add_test(NAME quant_test
          COMMAND quant_test "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/quant")
 
+add_executable(image_test core/image_test.cpp)
+target_link_libraries(image_test PRIVATE gufo_npu_image)
+add_test(NAME image_test
+         COMMAND image_test "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/image")
+
 # The same source twice: with the decoders' flags (F16C, AVX2, FMA paths)
 # and with the default flags (portable fallbacks).
 add_executable(vec_test core/vec_test.cpp)
