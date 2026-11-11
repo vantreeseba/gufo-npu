@@ -238,16 +238,28 @@ Memory: the ViT keeps 7200 x 4096 fp32 (118 MB) of activations at most.
 4. **Fusion**: bias + GELU epilogues and LayerNorm on the NPU, in
    runlists, so a ViT layer is a handful of commands; each move is kept
    only when the timing says so.
-5. API: `/v1/embeddings` and `gufo-npu embed` take an image (decoded by
-   the caller or a small decoder behind the CLI; the library takes RGB8).
+5. **API** (done): `gufo-npu embed --image` and `/v1/embeddings` image
+   objects (base64 data URIs), with the mmproj given as `--mmproj`. PNG
+   and JPEG are decoded at the edge (`src/core/image.hpp`, libpng and
+   libjpeg-turbo, to the pixels Pillow gives; fixtures from Pillow in
+   `tests/fixtures/image`); the model package takes RGB8 and flattens
+   alpha on white as qwen_vl_utils' `to_rgb` (`FlattenAlpha`).
+   `EmbeddingModel` (embedding_model.hpp) holds the text embedder and the
+   vision tower on one device for the CLI and the server. Checks:
+   `image_test` (decoding, byte for byte against Pillow),
+   `qwen3vl_embed_2b_vision_test` (to_rgb, token counts),
+   `serve_embeddings_test` (request shapes and refusals) and
+   `qwen3vl_embed_2b_engine_image_test` (PNGs through the server's
+   engine against HF).
 
 ## Open questions and risks
 
 - **Resize parity**: Pillow's fixed-point bicubic is reproduced (fixtures
   in `vision_test`; one resized card end to end at cosine 1.000000, see
-  QUALITY.md), but only small cards so far, no page-sized image. JPEG
-  decoding differences (libjpeg versions, EXIF rotation) are outside the
-  library.
+  QUALITY.md), but only small cards so far, no page-sized image. Decoding
+  matches Pillow on the fixtures (`image_test`); JPEG decoding could still
+  differ from a Pillow built on another libjpeg-turbo release, and EXIF
+  orientation is ignored, as the reference embedder ignores it.
 - **bfp16 for the ViT**: 8-bit mantissas with shared block exponents on
   LayerNorm outputs and GELU inputs. Measured in stage 2 (QUALITY.md): the
   embeddings stay at cosine 0.995 or more, but a few tokens of the

@@ -85,8 +85,34 @@ of weights and activations (the only difference from the reference), and
 which product contributes most is untested (VISION.md, open questions).
 Page-sized images are not in the HF oracle; the page is timed only.
 
+## Image inputs through the CLI and the server
+
+Measured 2026-11-11 on the Strix Halo box from a source build (the
+toolchain image) of the image-API branch, with the F16 GGUF, the F16
+mmproj and the same `--images` oracle as above. The oracle's three cards
+were written as PNGs (the decoder's PNG path; `image_test` checks every
+PNG and JPEG kind against Pillow byte for byte) and embedded three ways:
+
+| Path | Token counts = HF's | Cosine to HF fp32 (bar 0.99) |
+|---|---|---|
+| `qwen3vl_embed_2b_engine_image_test` (the server's engine, `--mmproj`) | 3/3 | 0.996728, 0.995573, 0.994634 |
+| `gufo-npu embed --mmproj --image` (the two uncaptioned cards) | 2/2 | 0.996728, 0.994634 |
+| `gufo-npu serve --mmproj`, `/v1/embeddings` data URIs (caption and instruction as HF's) | 3/3 | 0.996728, 0.995573, 0.994634 |
+
+The same values as `qwen3vl_embed_2b_npu_vision_test`, which calls
+`NpuVision` and `NpuEmbedder::EmbedImage` directly, so the CLI and the
+server add nothing to the error. An image in one request with a text input
+gets the vector it gets alone (cosine 1.0000000), and so do the engine
+test's text and three images in one batch. The same build passes
+`image_test`, `serve_embeddings_test`, `qwen3vl_embed_2b_vision_test` and,
+unchanged, `qwen3vl_embed_2b_npu_embed_test` and
+`qwen3vl_embed_2b_npu_vision_test`.
+
 ## Known differences from the reference embedder
 
 - Inputs over the context limit are refused rather than truncated.
-- Images run on the NPU in the library only (no CLI or API yet); video is
-  not supported.
+- Image files are decoded to Pillow's pixels; a JPEG could still differ
+  from a Pillow built on another libjpeg-turbo release (the fixtures match
+  on the toolchain image's and on Pillow 12.1's). EXIF orientation is not
+  applied, as the reference embedder does not apply it. Video is not
+  supported.
