@@ -49,8 +49,9 @@ public:
   // Reference::EmbedImage: `ids` from ImageInputIds (input.hpp), `images`
   // from NpuVision::Encode (npu_vision.hpp) in order of appearance. Throws
   // std::invalid_argument when ids and images disagree.
-  std::vector<float> EmbedImage(const std::vector<int>& ids, int image_pad_id,
-                                const std::vector<ImageFeatures>& images);
+  std::vector<float> EmbedImage(
+      const std::vector<int>& ids, int image_pad_id,
+      const std::vector<ImageFeatures>& images) override;
 
   // Where the time went since construction.
   struct Profile {

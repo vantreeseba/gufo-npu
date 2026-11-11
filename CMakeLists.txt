@@ -159,7 +159,8 @@ target_link_libraries(gufo-npu PRIVATE gufo_npu_qwen35_npu gufo_npu_qwen35_2b
                       gufo_npu_qwen35_4b
                       gufo_npu_qwen36_35b_a3b gufo_npu_qwen3vl_embed_2b_npu
                       gufo_npu_serve
-                      gufo_npu_serve_chat gufo_npu_serve_engine)
+                      gufo_npu_serve_chat gufo_npu_serve_engine
+                      gufo_npu_image)
 install(TARGETS gufo-npu RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 if(BUILD_TESTING)

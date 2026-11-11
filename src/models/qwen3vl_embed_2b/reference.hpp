@@ -29,8 +29,9 @@ public:
   // rows take the images' embeddings, the text model rotates by
   // MropePositions, and DeepStack block k is added to the image rows after
   // layer k. Throws std::invalid_argument when ids and images disagree.
-  std::vector<float> EmbedImage(const std::vector<int>& ids, int image_pad_id,
-                                const std::vector<ImageFeatures>& images);
+  std::vector<float> EmbedImage(
+      const std::vector<int>& ids, int image_pad_id,
+      const std::vector<ImageFeatures>& images) override;
 
 private:
   struct Impl;

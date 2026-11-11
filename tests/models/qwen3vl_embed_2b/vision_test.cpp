@@ -1,7 +1,8 @@
-// Qwen3-VL-Embedding-2B's image input without a model: smart_resize,
-// Pillow's bicubic resize (fixtures from Pillow 12.1), patch order and
-// values, the position-embedding taps, MRoPE positions, and MRoPE attention
-// against the text path when t = h = w.
+// Qwen3-VL-Embedding-2B's image input without a model: smart_resize and
+// the image token count, qwen_vl_utils' to_rgb (against Pillow's, from
+// tests/fixtures/image), Pillow's bicubic resize (fixtures from Pillow
+// 12.1), patch order and values, the position-embedding taps, MRoPE
+// positions, and MRoPE attention against the text path when t = h = w.
 #include "models/qwen3vl_embed_2b/vision.hpp"
 
 #include <algorithm>
@@ -9,7 +10,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <functional>
+#include <iterator>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -64,6 +68,44 @@ void TestSmartResize() {
   }
   Check(Throws([] { e::SmartResize(1, 201); }), "aspect ratio above 200");
   Check(Throws([] { e::SmartResize(0, 10); }), "empty image");
+}
+
+void TestImageTokens() {
+  // Merged tokens of the smart_resize grid: 32 x 32 pixels each.
+  Check(e::ImageTokens(1280, 1440) == 40 * 45, "page: 1800 tokens");
+  Check(e::ImageTokens(100, 100) == 3 * 3, "100x100: 9 tokens");
+  Check(e::ImageTokens(3000, 4000) == 36 * 48, "scaled down: 1728 tokens");
+  Check(e::ImageTokens(10, 10) == 2 * 2, "scaled up: 4 tokens");
+  Check(Throws([] { e::ImageTokens(201, 1); }), "tokens: aspect above 200");
+}
+
+std::vector<std::uint8_t> ReadAll(const std::filesystem::path& path) {
+  std::ifstream in(path, std::ios::binary);
+  return {std::istreambuf_iterator<char>(in), {}};
+}
+
+void TestFlattenAlpha(const std::filesystem::path& fixtures) {
+  // Pillow's decode of an RGBA PNG and qwen_vl_utils' to_rgb of it
+  // (tools/reference/image_fixtures.py).
+  for (const char* name : {"rgba8", "rgba16", "graya16"}) {
+    auto rgb = ReadAll(fixtures / (std::string(name) + ".rgb"));
+    const auto alpha = ReadAll(fixtures / (std::string(name) + ".alpha"));
+    const auto expected = ReadAll(fixtures / (std::string(name) + ".torgb"));
+    Check(!rgb.empty() && !expected.empty(),
+          std::string(name) + " fixture in " + fixtures.string());
+    e::FlattenAlpha(rgb, alpha);
+    Check(rgb == expected, std::string(name) + ": to_rgb as Pillow's");
+  }
+  std::vector<std::uint8_t> px = {0, 200, 255, 0, 200, 255, 10, 20, 30};
+  e::FlattenAlpha(px, std::vector<std::uint8_t>{0, 255, 128});
+  Check(px == std::vector<std::uint8_t>{255, 255, 255, 0, 200, 255, 132, 137,
+                                        142},
+        "to_rgb: clear, opaque and half alpha");
+  std::vector<std::uint8_t> opaque = {1, 2, 3};
+  e::FlattenAlpha(opaque, {});
+  Check(opaque == std::vector<std::uint8_t>{1, 2, 3}, "to_rgb: no alpha");
+  Check(Throws([&] { e::FlattenAlpha(opaque, std::vector<std::uint8_t>(2)); }),
+        "to_rgb: sizes disagree");
 }
 
 std::vector<std::uint8_t> Pattern(int width, int height) {
@@ -303,8 +345,15 @@ void TestAttentionMrope() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  if (argc != 2) {
+    std::fprintf(stderr,
+                 "usage: qwen3vl_embed_2b_vision_test <image-fixtures>\n");
+    return 2;
+  }
   TestSmartResize();
+  TestImageTokens();
+  TestFlattenAlpha(argv[1]);
   TestResize();
   TestPatchify();
   TestInterpolation();

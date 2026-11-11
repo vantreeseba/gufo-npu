@@ -22,21 +22,20 @@
 // to bfp16 once, at load: about 0.5 GB of device memory.
 namespace gufo_npu::qwen3vl_embed_2b {
 
-class NpuVision {
+class NpuVision final : public VisionEncoder {
 public:
   // Keeps pointers into `mmproj`, which must outlive it, and runs on
   // `embedder`'s GEMM program, so `embedder` must outlive it too. Throws
   // when the mmproj is not a Qwen3-VL one or its shapes are not the
   // program's.
   NpuVision(const gguf::File& mmproj, NpuEmbedder& embedder);
-  ~NpuVision();
+  ~NpuVision() override;
   NpuVision(const NpuVision&) = delete;
   NpuVision& operator=(const NpuVision&) = delete;
 
-  const VisionConfig& config() const;
-  // As VisionReference::Encode. Throws std::invalid_argument for an empty
-  // grid or one whose sides are not multiples of the merge size.
-  ImageFeatures Encode(const Patches& patches);
+  const VisionConfig& config() const override;
+  // As VisionReference::Encode.
+  ImageFeatures Encode(const Patches& patches) override;
 
   // Where the time went since construction.
   struct Profile {

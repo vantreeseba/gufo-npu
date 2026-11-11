@@ -21,7 +21,9 @@ add_executable(qwen3vl_embed_2b_vision_test vision_test.cpp)
 target_link_libraries(qwen3vl_embed_2b_vision_test PRIVATE
                       gufo_npu_qwen3vl_embed_2b)
 target_compile_options(qwen3vl_embed_2b_vision_test PRIVATE -march=x86-64-v3)
-add_test(NAME qwen3vl_embed_2b_vision_test COMMAND qwen3vl_embed_2b_vision_test)
+add_test(NAME qwen3vl_embed_2b_vision_test
+         COMMAND qwen3vl_embed_2b_vision_test
+                 "${PROJECT_SOURCE_DIR}/tests/fixtures/image")
 set_tests_properties(qwen3vl_embed_2b_vision_test PROPERTIES
                      LABELS qwen3vl_embed_2b)
 

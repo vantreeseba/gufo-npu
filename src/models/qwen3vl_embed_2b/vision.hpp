@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <vector>
 
 #include "core/gguf.hpp"
@@ -91,6 +92,19 @@ Patches Patchify(const std::uint8_t* rgb, int width, int height, int patch,
 Patches PreprocessImage(const std::uint8_t* rgb, int width, int height,
                         int patch, int merge);
 
+// The <|image_pad|> tokens an image of this size takes: its SmartResize
+// grid in merged tokens (`factor` = patch x merge). Needs no weights, so an
+// input's ids can be built before the model loads. Throws as SmartResize.
+int ImageTokens(int width, int height, int factor = kImageFactor);
+
+// qwen_vl_utils' to_rgb, which the reference embedder applies to every
+// image before resizing: with an alpha channel (one value per pixel) the
+// image is composited on white as Pillow pastes it, each channel
+// (x * a + 255 * (255 - a)) / 255 rounded; without one it stays as it is.
+// Throws std::invalid_argument when the sizes disagree.
+void FlattenAlpha(std::vector<std::uint8_t>& rgb,
+                  std::span<const std::uint8_t> alpha);
+
 // The patch coordinates (row, col) of row `index` of Patches (merge-block
 // order) for a grid grid_w patches wide.
 void PatchPosition(int index, int grid_w, int merge, int* row, int* col);
@@ -135,20 +149,28 @@ std::vector<ImageRow> ImageRows(const std::vector<int>& ids, int image_pad_id,
                                 const std::vector<ImageFeatures>& images,
                                 int width);
 
+// A vision tower: VisionReference, or NpuVision (npu_vision.hpp).
+class VisionEncoder {
+public:
+  virtual ~VisionEncoder() = default;
+  virtual const VisionConfig& config() const = 0;
+  // Throws std::invalid_argument for an empty grid or one whose sides are
+  // not multiples of the merge size.
+  virtual ImageFeatures Encode(const Patches& patches) = 0;
+};
+
 // The vision tower in fp32: norms, biases and embeddings dequantized at
 // load, matrix rows as they are used. Slow; the oracle for an NPU path.
-class VisionReference {
+class VisionReference final : public VisionEncoder {
 public:
   // Keeps pointers into `file`, which must outlive it.
   explicit VisionReference(const gguf::File& file);
-  ~VisionReference();
+  ~VisionReference() override;
   VisionReference(const VisionReference&) = delete;
   VisionReference& operator=(const VisionReference&) = delete;
 
-  const VisionConfig& config() const;
-  // Throws std::invalid_argument for an empty grid or one whose sides are
-  // not multiples of the merge size.
-  ImageFeatures Encode(const Patches& patches);
+  const VisionConfig& config() const override;
+  ImageFeatures Encode(const Patches& patches) override;
 
 private:
   struct Impl;
