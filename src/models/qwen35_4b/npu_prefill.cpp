@@ -484,9 +484,10 @@ struct NpuPrefill::Impl {
   // consecutive chunks through the layers together, so one lane's GEMMs run
   // on the NPU while the CPU works on the other's.
   struct Lane {
-    int n = 0;         // tokens
-    int m = 0;         // GEMM rows (n padded to a chunk size)
-    int position = 0;  // of the first
+    int n = 0;              // tokens
+    int m = 0;              // GEMM rows (n padded to a chunk size)
+    int position = 0;       // of the first
+    int rope_position = 0;  // the first's: position + DecodeState::rope_delta
     std::unique_ptr<GemmBuffer> a, c;
     gufo_npu::npu::GemmCall call;
     std::size_t c_sync = 0;     // bytes of C to sync once the call is done
@@ -736,7 +737,7 @@ struct NpuPrefill::Impl {
     for (int t = 0; t < lane.n; ++t) {
       for (int i = 0; i < half; ++i) {
         const double angle =
-            static_cast<double>(lane.position + t) * rope_inv_freq[i];
+            static_cast<double>(lane.rope_position + t) * rope_inv_freq[i];
         lane.rope_cos[t * half + i] = static_cast<float>(std::cos(angle));
         lane.rope_sin[t * half + i] = static_cast<float>(std::sin(angle));
       }
@@ -1133,6 +1134,7 @@ struct NpuPrefill::Impl {
         lane.m = pass.m;
         lane.n = std::min(pass.m, pass.tokens - taken);
         lane.position = state.position + taken;
+        lane.rope_position = lane.position + state.rope_delta;
         Embed(lane, tokens + done + taken);
         taken += lane.n;
         ++used;
@@ -1164,6 +1166,7 @@ struct NpuPrefill::Impl {
     lane.n = n;
     lane.m = pass.m;
     lane.position = position;
+    lane.rope_position = position + state.rope_delta;
     // [RMS(embed(token)) * enorm ; RMS(RMS(h) * output_norm) * hnorm].
     auto* bits = lane.a->as<std::uint16_t>();
     pool.Run(static_cast<std::size_t>(n), [&](std::size_t t) {

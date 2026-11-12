@@ -32,7 +32,8 @@ public:
 
   // `h`: the main model's final residual (before output_norm) at position
   // `position - 1`; `token`: the token at `position`. Appends to the MTP
-  // layer's cache in `state` and returns the logits for position + 1.
+  // layer's cache in `state` and returns the logits for position + 1. The
+  // RoPE position adds state.rope_delta (the main state's, see DecodeState).
   const std::vector<float>& Step(const float* h, int token, int position,
                                  DecodeState& state);
 

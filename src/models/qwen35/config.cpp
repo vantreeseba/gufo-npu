@@ -13,6 +13,30 @@ int IntOr(const gguf::File& file, const std::string& key, int fallback) {
   return file.Find(key) == nullptr ? fallback : Int(file, key);
 }
 
+// The (t, h, w) MRoPE sections of an integer array key; llama.cpp writes a
+// fourth entry (0 for these models), which is ignored.
+std::array<int, 3> Sections(const gguf::File& file, const std::string& key) {
+  std::array<int, 3> out{};
+  const gguf::Value* value = file.Find(key);
+  if (value == nullptr) {
+    return out;
+  }
+  if (value->kind != gguf::Value::Kind::kArray || value->array.size() < 3) {
+    throw std::runtime_error("qwen35: " + key + " is not an array of 3+");
+  }
+  for (std::size_t i = 0; i < out.size(); ++i) {
+    const gguf::Value& item = value->array[i];
+    if (item.kind == gguf::Value::Kind::kUInt) {
+      out[i] = static_cast<int>(item.u);
+    } else if (item.kind == gguf::Value::Kind::kInt && item.i >= 0) {
+      out[i] = static_cast<int>(item.i);
+    } else {
+      throw std::runtime_error("qwen35: " + key + " holds a non-count");
+    }
+  }
+  return out;
+}
+
 }  // namespace
 
 Config ReadConfig(const gguf::File& file) {
@@ -35,6 +59,7 @@ Config ReadConfig(const gguf::File& file) {
   c.head_dim = Int(file, a + "attention.key_length");
   c.rope_dim = Int(file, a + "rope.dimension_count");
   c.rope_theta = static_cast<float>(file.GetFloat(a + "rope.freq_base"));
+  c.rope_sections = Sections(file, a + "rope.dimension_sections");
 
   c.conv_kernel = Int(file, a + "ssm.conv_kernel");
   c.linear_head_dim = Int(file, a + "ssm.state_size");
@@ -60,6 +85,12 @@ Config ReadConfig(const gguf::File& file) {
       c.heads % c.kv_heads != 0 ||
       c.linear_value_heads % c.linear_key_heads != 0) {
     throw std::runtime_error("qwen35: inconsistent shape metadata");
+  }
+  const int sections =
+      c.rope_sections[0] + c.rope_sections[1] + c.rope_sections[2];
+  if (c.rope_dim <= 0 || c.rope_dim % 2 != 0 || c.rope_dim > c.head_dim ||
+      (sections != 0 && sections != c.rope_dim / 2)) {
+    throw std::runtime_error("qwen35: inconsistent RoPE metadata");
   }
   const bool moe = c.architecture == "qwen35moe";
   if (moe != c.IsMoe() ||

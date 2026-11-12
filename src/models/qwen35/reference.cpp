@@ -138,12 +138,15 @@ void Reference::LoadWeights(const gguf::File& file) {
     w.mtp_head_norm = ToFloats(file.Tensor(p + "shared_head_norm.weight"));
   }
 
-  w.rope_inv_freq.resize(c.rope_dim / 2);
-  for (int i = 0; i < c.rope_dim / 2; ++i) {
-    w.rope_inv_freq[i] = static_cast<float>(
-        1.0 / std::pow(static_cast<double>(c.rope_theta),
-                       2.0 * i / static_cast<double>(c.rope_dim)));
+  w.rope_inv_freq = RopeInvFreq(c);
+}
+
+std::vector<RopePosition> Reference::TextPositions(const State& state, int n) {
+  std::vector<RopePosition> positions(n);
+  for (int t = 0; t < n; ++t) {
+    positions[t] = TextPosition(state.position + state.rope_delta + t);
   }
+  return positions;
 }
 
 Reference::~Reference() = default;
@@ -173,16 +176,28 @@ State Reference::NewState() const {
 ForwardOutput Reference::Forward(const std::vector<int>& tokens, State& state,
                                  bool want_logits, bool want_hidden,
                                  const Projections* projections) const {
+  PromptInput input;
+  input.tokens = tokens;
+  return ForwardPrompt(input, state, want_logits, want_hidden, projections);
+}
+
+ForwardOutput Reference::ForwardPrompt(const PromptInput& input, State& state,
+                                       bool want_logits, bool want_hidden,
+                                       const Projections* projections) const {
   const Config& c = config_;
   const auto& w = *weights_;
   const Projections& proj =
       projections != nullptr ? *projections : *gguf_projections_;
+  const auto& tokens = input.tokens;
   const int n = static_cast<int>(tokens.size());
   const int d = c.hidden;
   const auto nd = static_cast<std::size_t>(n) * d;
+  if (!input.positions.empty() && input.positions.size() != tokens.size()) {
+    throw std::invalid_argument("qwen35: positions do not match the tokens");
+  }
   ForwardOutput result;
 
-  // Embeddings: row `token` of token_embd.
+  // Embeddings: row `token` of token_embd, or the given rows.
   std::vector<float> h(nd);
   const auto embed_row = quant::RowBytes(w.embed->type, d);
   for (int t = 0; t < n; ++t) {
@@ -194,17 +209,32 @@ ForwardOutput Reference::Forward(const std::vector<int>& tokens, State& state,
         w.embed->data + static_cast<std::size_t>(tokens[t]) * embed_row,
         h.data() + static_cast<std::size_t>(t) * d, d);
   }
+  for (const auto& rows : input.embeddings) {
+    const std::size_t count = rows.values.size() / d;
+    if (rows.values.size() % d != 0 || rows.first < 0 ||
+        static_cast<std::size_t>(rows.first) + count >
+            static_cast<std::size_t>(n)) {
+      throw std::invalid_argument("qwen35: embedding rows outside the prompt");
+    }
+    std::copy(rows.values.begin(), rows.values.end(),
+              h.begin() + static_cast<std::ptrdiff_t>(rows.first) * d);
+  }
   if (want_hidden) {
     result.hidden.insert(result.hidden.end(), h.begin(), h.end());
   }
 
+  const auto positions =
+      input.positions.empty() ? TextPositions(state, n) : input.positions;
   for (int il = 0; il < c.layers; ++il) {
-    RunLayer(il, h, n, state, proj);
+    RunLayer(il, h, n, state, proj, positions.data());
     if (want_hidden) {
       result.hidden.insert(result.hidden.end(), h.begin(), h.end());
     }
   }
   state.position += n;
+  if (!input.positions.empty()) {
+    state.rope_delta = RopeDeltaAfter(input.positions, state.position);
+  }
 
   if (want_logits) {
     result.logits = Head(h, w.output_norm, proj);
@@ -247,7 +277,7 @@ std::vector<float> Reference::Mtp(const std::vector<float>& h,
   }
   std::vector<float> x(static_cast<std::size_t>(n) * d);
   proj.Apply(Stage::kMtpIn, c.layers, eh.data(), n, x.data());
-  RunLayer(c.layers, x, n, state, proj);
+  RunLayer(c.layers, x, n, state, proj, TextPositions(state, n).data());
   state.position += n;
   return Head(x, w.mtp_head_norm, proj);
 }
@@ -258,8 +288,10 @@ void Reference::ForwardLayer(int layer, std::vector<float>& h, State& state,
       h.size() % static_cast<std::size_t>(config_.hidden) != 0) {
     throw std::invalid_argument("qwen35: bad layer or residual size");
   }
-  RunLayer(layer, h, static_cast<int>(h.size() / config_.hidden), state,
-           projections != nullptr ? *projections : *gguf_projections_);
+  const int n = static_cast<int>(h.size() / config_.hidden);
+  RunLayer(layer, h, n, state,
+           projections != nullptr ? *projections : *gguf_projections_,
+           TextPositions(state, n).data());
 }
 
 std::vector<float> Reference::Logits(const std::vector<float>& h,
@@ -285,7 +317,8 @@ std::vector<float> Reference::Head(const std::vector<float>& h,
 }
 
 void Reference::RunLayer(int il, std::vector<float>& h, int n, State& state,
-                         const Projections& proj) const {
+                         const Projections& proj,
+                         const RopePosition* positions) const {
   const Config& c = config_;
   const auto& w = *weights_;
   const auto& layer = w.layers[il];
@@ -313,12 +346,14 @@ void Reference::RunLayer(int il, std::vector<float>& h, int n, State& state,
       Split(fused, n, {{&qg, 2 * c.heads * hd}, {&k, kv}, {&v, kv}});
     }
 
-    auto rope = [&](float* x, int pos) {
-      const int half = c.rope_dim / 2;
+    // cos/sin at the token's (t, h, w) position (rope.hpp).
+    const int half = c.rope_dim / 2;
+    std::vector<float> rope_cos(half);
+    std::vector<float> rope_sin(half);
+    auto rope = [&](float* x) {
       for (int i = 0; i < half; ++i) {
-        const double angle = static_cast<double>(pos) * w.rope_inv_freq[i];
-        const auto cs = static_cast<float>(std::cos(angle));
-        const auto sn = static_cast<float>(std::sin(angle));
+        const float cs = rope_cos[i];
+        const float sn = rope_sin[i];
         const float a = x[i];
         const float b = x[i + half];
         x[i] = a * cs - b * sn;
@@ -330,12 +365,13 @@ void Reference::RunLayer(int il, std::vector<float>& h, int n, State& state,
     std::vector<float> ctx(static_cast<std::size_t>(c.heads) * hd);
     std::vector<float> query(hd);
     for (int t = 0; t < n; ++t) {
-      const int pos = state.position + t;
+      RopeAngles(c, w.rope_inv_freq, positions[t], rope_cos.data(),
+                 rope_sin.data());
       float* kt = &k[static_cast<std::size_t>(t) * kv];
       for (int kh = 0; kh < c.kv_heads; ++kh) {
         float* head = kt + static_cast<std::size_t>(kh) * hd;
         RmsNorm(head, layer.k_norm.data(), hd, c.rms_eps, head);
-        rope(head, pos);
+        rope(head);
       }
       cache.keys.insert(cache.keys.end(), kt, kt + kv);
       cache.values.insert(cache.values.end(),
@@ -348,7 +384,7 @@ void Reference::RunLayer(int il, std::vector<float>& h, int n, State& state,
       for (int qh = 0; qh < c.heads; ++qh) {
         const float* raw = qt + static_cast<std::size_t>(qh) * 2 * hd;
         RmsNorm(raw, layer.q_norm.data(), hd, c.rms_eps, query.data());
-        rope(query.data(), pos);
+        rope(query.data());
         const int kh = qh / group;
         std::vector<double> scores(length);
         double max_score = -1e300;

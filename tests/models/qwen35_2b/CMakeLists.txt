@@ -1,6 +1,7 @@
 # Qwen3.5-2B (docs/models/qwen3.5-2b). Model tests skip (77) without
 # GUFO_NPU_QWEN35_2B_GGUF (BF16, for the HF oracle checks),
-# GUFO_NPU_QWEN35_2B_Q4_GGUF (UD-Q4_K_XL) and GUFO_NPU_QWEN35_2B_ORACLE.
+# GUFO_NPU_QWEN35_2B_Q4_GGUF (UD-Q4_K_XL) and GUFO_NPU_QWEN35_2B_ORACLE, and
+# for image prompts GUFO_NPU_QWEN35_2B_VL_ORACLE.
 
 add_executable(qwen35_gguf_load_test gguf_load_test.cpp)
 target_link_libraries(qwen35_gguf_load_test PRIVATE gufo_npu_core)
@@ -13,6 +14,17 @@ target_link_libraries(qwen35_reference_oracle_test PRIVATE gufo_npu_qwen35)
 add_test(NAME qwen35_reference_oracle_test COMMAND qwen35_reference_oracle_test)
 set_tests_properties(qwen35_reference_oracle_test PROPERTIES
                      SKIP_RETURN_CODE 77 LABELS "qwen35_2b;model")
+
+# Image prompts: the HF oracle's vision features and MRoPE positions
+# (GUFO_NPU_QWEN35_2B_VL_ORACLE) through the reference.
+add_executable(qwen35_reference_vl_oracle_test reference_vl_oracle_test.cpp)
+target_link_libraries(qwen35_reference_vl_oracle_test PRIVATE gufo_npu_qwen35
+                      nlohmann_json)
+add_test(NAME qwen35_reference_vl_oracle_test
+         COMMAND qwen35_reference_vl_oracle_test)
+set_tests_properties(qwen35_reference_vl_oracle_test PROPERTIES
+                     SKIP_RETURN_CODE 77 LABELS "qwen35_2b;model"
+                     TIMEOUT 3600)
 
 add_executable(qwen35_generate_oracle_test generate_oracle_test.cpp)
 target_link_libraries(qwen35_generate_oracle_test PRIVATE gufo_npu_qwen35

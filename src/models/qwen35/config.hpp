@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
 
@@ -26,6 +27,13 @@ struct Config {
   int head_dim = 0;
   int rope_dim = 0;  // leading dims of each head that are rotated
   float rope_theta = 0;
+  // Interleaved MRoPE (image prompts): how many of the rope_dim / 2
+  // frequencies the time, height and width positions drive (rope.hpp,
+  // MropeAxis). From <arch>.rope.dimension_sections; all zero without it,
+  // when every frequency follows the time position (plain RoPE). The GGUF
+  // has no key for the interleaving: llama.cpp gives these architectures
+  // its interleaved MRoPE type, and HF's Qwen3.5 code always interleaves.
+  std::array<int, 3> rope_sections{};
 
   // Gated DeltaNet (linear attention).
   int conv_kernel = 0;

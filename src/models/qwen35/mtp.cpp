@@ -132,7 +132,8 @@ const std::vector<float>& MtpHead::Step(const float* h, int token, int position,
 
   // One full-attention block.
   const int rope_position =
-      m.options.position_of_token ? position : position - 1;
+      (m.options.position_of_token ? position : position - 1) +
+      state.rope_delta;
   RmsNorm(m.x.data(), m.attn_norm.data(), d, c.rms_eps, m.normed.data());
   q4nx::Gemv(m.in, m.normed.data(), m.qkv.data());
   m.mixer.Attention(m.layer, m.qkv.data(), rope_position, state.layers[m.layer],

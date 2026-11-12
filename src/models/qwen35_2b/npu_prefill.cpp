@@ -144,9 +144,10 @@ struct NpuPrefill::Impl {
   // consecutive chunks through the layers together, so one lane's GEMMs run
   // on the NPU while the CPU works on the other's.
   struct Lane {
-    int n = 0;         // tokens
-    int m = 0;         // GEMM rows (n padded to a chunk size)
-    int position = 0;  // of the first
+    int n = 0;              // tokens
+    int m = 0;              // GEMM rows (n padded to a chunk size)
+    int position = 0;       // of the first
+    int rope_position = 0;  // the first's: position + DecodeState::rope_delta
     std::unique_ptr<GemmBuffer> a, c;
     gufo_npu::npu::GemmCall call;
     std::size_t c_sync = 0;  // bytes of C to sync once the call is done
@@ -369,7 +370,7 @@ struct NpuPrefill::Impl {
                                           quant::RowBytes(embed->type, d),
                         lane.h.data() + t * d, d);
     });
-    lane.mixer->SetChunk(lane.n, lane.position);
+    lane.mixer->SetChunk(lane.n, lane.rope_position);
   }
 
   // Seconds profiled so far, to charge the rest of a call to `other`.
@@ -453,6 +454,7 @@ struct NpuPrefill::Impl {
         lane.m = pass.m;
         lane.n = std::min(pass.m, pass.tokens - taken);
         lane.position = state.position + taken;
+        lane.rope_position = lane.position + state.rope_delta;
         Embed(lane, tokens + done + taken);
         taken += lane.n;
         ++used;
@@ -484,6 +486,7 @@ struct NpuPrefill::Impl {
     lane.n = n;
     lane.m = pass.m;
     lane.position = position;
+    lane.rope_position = position + state.rope_delta;
     // [RMS(embed(token)) * enorm ; RMS(RMS(h) * output_norm) * hnorm].
     auto* bits = lane.a->as<std::uint16_t>();
     pool.Run(static_cast<std::size_t>(n), [&](std::size_t t) {
@@ -508,7 +511,7 @@ struct NpuPrefill::Impl {
     Start(*mtp.in, lane);
     Finish(lane);
     FromC(lane, static_cast<int>(mtp.in->rows()), lane.in.data(), false);
-    lane.mixer->SetChunk(lane.n, lane.position);
+    lane.mixer->SetChunk(lane.n, lane.rope_position);
     lane.mixer->AppendKv(lane.in.data(), mtp.in->rows(), mtp.mix,
                          state.layers[cfg.layers]);
     profile.other_seconds += SecondsSince(start) - (Profiled() - before);
