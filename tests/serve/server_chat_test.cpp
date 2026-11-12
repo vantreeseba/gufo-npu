@@ -17,6 +17,7 @@
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -255,10 +256,18 @@ public:
     info_.takes_mmproj = takes_mmproj;
     info_.vocab = 248320;
   }
+  // A literal <|image_pad|> is its special token, as the tokenizer reads
+  // added tokens in text.
   std::vector<int> Encode(std::string_view text) const override {
+    constexpr std::string_view kPad = "<|image_pad|>";
     std::vector<int> ids;
-    for (const unsigned char c : text) {
-      ids.push_back(c);
+    for (std::size_t i = 0; i < text.size();) {
+      if (text.substr(i).starts_with(kPad)) {
+        ids.push_back(kImagePad);
+        i += kPad.size();
+      } else {
+        ids.push_back(static_cast<unsigned char>(text[i++]));
+      }
     }
     return ids;
   }
