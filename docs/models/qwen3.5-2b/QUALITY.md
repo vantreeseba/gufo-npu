@@ -291,6 +291,49 @@ the reference in fp32. Pass: logits relative error < 2e-3 and every argmax
 equal. 2026-10-27: worst 6.2e-4 with the fp16 cache (9.3e-7 with an fp32
 one), argmax 19/19.
 
+## Image prompts: HF oracle (2026-11-11)
+
+`tools/reference/qwen35_2b_vl_oracle.py` (transformers 5.21.0, torch
+2.13.0+cpu, torchvision 0.28.0, Pillow 13.0.0; fp32,
+`Qwen3_5ForConditionalGeneration` from the HF checkpoint, which carries the
+vision tower) is the reference for image input ([VISION.md](VISION.md)).
+Make it with the reference requirements (`tools/reference/requirements.txt`)
+and the HF model directory:
+
+```sh
+OMP_NUM_THREADS=8 python -I tools/reference/qwen35_2b_vl_oracle.py \
+    --model Qwen3.5-2B-hf --out oracle-2b-vl
+```
+
+About 2.5 minutes on 8 Zen 5 cores; 846 MB written. The
+inputs are drawn with Pillow (no downloads) and written as PNGs next to the
+results; each case is one user message through the chat template (thinking
+off) and the processor at 65,536 to 1,843,200 pixels (64 to 1,800 image
+tokens), a greedy continuation of up to 64 tokens, then one teacher-forced
+pass over prompt + continuation. Files per case: `ids.json` (`ids`,
+`prompt_len`), `positions.i32` (3 x L, rows t, h, w), `grid.json`,
+`pixels.f32` (patches x 1536), `features.f32` (image tokens x 2048),
+`logits.f32` (rows prompt_len - 1 to L - 1), `hidden.f32` (25 x L x 2048),
+`greedy.json`, `imgN.png`; `manifest.json` has the shapes, `rope_delta`
+and the resize comparison per image.
+
+| Case | Images (resized to) | Image tokens | Prompt | rope_delta | Continuation | Teacher-forced argmax = greedy |
+|---|---|---|---|---|---|---|
+| card_shapes | 256 x 192 (320 x 224) | 70 | 91 | -60 | 26 (ends `<\|im_end\|>`) | 26/26 |
+| card_text | 333 x 251 (320 x 256) | 80 | 100 | -70 | 63 (ends `<\|im_end\|>`) | 63/63 |
+| card_kept | 320 x 256 (kept) | 80 | 109 | -70 | 64 | 64/64 |
+| two_images | 288 x 224 (320 x 256), 400 x 160 (416 x 192) | 158 | 189 | -135 | 64 | 64/64 |
+| page | 1280 x 1440 (kept) | 1800 | 1822 | -1755 | 64 | 64/64 |
+
+- The greedy outputs read the images: the shapes and their colours, the
+  text card word for word, and the page's first 64 tokens transcribed
+  exactly.
+- The processor's resize (torchvision's uint8 antialiased bicubic) differs
+  from Pillow's bicubic by at most 2 levels on 0.01-0.2% of values (cards,
+  and letter and A4 scans with `--resize-only`); the vision tower's features
+  from Pillow-resized inputs are at cosine >= 0.99973 per token to the
+  processor's (VISION.md, Preprocessing).
+
 ## Planned
 
 | Check | Tolerance |

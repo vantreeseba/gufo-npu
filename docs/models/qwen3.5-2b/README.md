@@ -22,6 +22,9 @@ revision for the HF oracle tests). FastFlowLM's own pack is
 NPU decode with MTP speculation and NPU prefill: see
 [benchmarks](BENCHMARKS.md) and [quality](QUALITY.md).
 
+Image input (the vision tower, MRoPE and the plan to run it on the NPU):
+[VISION.md](VISION.md).
+
 ## How a token runs
 
 Orange runs on the NPU, blue on the CPU.
