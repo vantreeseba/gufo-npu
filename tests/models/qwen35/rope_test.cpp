@@ -73,9 +73,8 @@ constexpr HfAngles kHf[] = {
     {{100, 103, 120},
      {0.862318873f, 0.831315458f, 0.987003088f, -0.997098923f, 0.391163498f,
       -0.970057726f, 1, 1, 1},
-     {-0.506365657f, -0.555800915f, -0.160701156f, -0.0761166736f,
-      0.920321226f, -0.242874488f, 5.43790047e-05f, 2.73841979e-05f,
-      1.70446165e-05f}},
+     {-0.506365657f, -0.555800915f, -0.160701156f, -0.0761166736f, 0.920321226f,
+      -0.242874488f, 5.43790047e-05f, 2.73841979e-05f, 1.70446165e-05f}},
     {{0, 3, 9},
      {1, -0.239734888f, -0.989509583f, 1, 0.921039045f, 0.748328328f, 1, 1, 1},
      {0, 0.970838368f, -0.14446725f, 0, 0.389470309f, 0.663328469f,
@@ -108,8 +107,8 @@ void TestAngles() {
                         std::fabs(double{sn[kIndex[k]]} - hf.sin[k])});
     }
   }
-  Expect(worst < 2e-5, "angles match HF (max diff " + std::to_string(worst) +
-                           ")");
+  Expect(worst < 2e-5,
+         "angles match HF (max diff " + std::to_string(worst) + ")");
 
   // Equal axes are plain RoPE, bit for bit: the angle every mixer computed
   // before MRoPE, double(p) * inv_freq[i].
@@ -493,8 +492,8 @@ void TestDecodeOffset() {
   // An image-like prompt: text, a 2 x 3 grid of image rows (random
   // embeddings) at (s, s + r, s + c), text after it at s + 3.
   constexpr int kPad = 39;
-  const std::vector<int> prompt = {5, 9, kPad, kPad, kPad, kPad,
-                                   kPad, kPad, 12, 7, 21};
+  const std::vector<int> prompt = {5,    9,    kPad, kPad, kPad, kPad,
+                                   kPad, kPad, 12,   7,    21};
   const auto pp = qwen35::ImagePromptPositions(prompt, kPad, {{1, 4, 6}});
   Expect(pp.rope_delta == -3, "tiny prompt rope_delta");
   qwen35::PromptInput input;
@@ -534,13 +533,14 @@ void TestDecodeOffset() {
     const auto out = reference.ForwardPrompt(whole, state);
     double worst = 0;
     for (std::size_t i = 0; i < next.size(); ++i) {
-      worst = std::max(worst, RelativeL2(want[i], out.logits.data() +
-                                                      (prompt.size() + i) *
-                                                          c.vocab));
+      worst = std::max(
+          worst, RelativeL2(want[i],
+                            out.logits.data() + (prompt.size() + i) * c.vocab));
     }
-    Expect(worst < 1e-6, "reference: continuation at index + rope_delta == "
-                         "explicit positions (rel err " +
-                             std::to_string(worst) + ")");
+    Expect(worst < 1e-6,
+           "reference: continuation at index + rope_delta == "
+           "explicit positions (rel err " +
+               std::to_string(worst) + ")");
   }
 
   // The CPU decoder from the reference's caches, with and without the
@@ -562,9 +562,10 @@ void TestDecodeOffset() {
   };
   const double with = run(-3);
   const double without = run(0);
-  std::printf("decoder vs reference after an image prompt: rel err %.2e with "
-              "rope_delta -3, %.2e with 0\n",
-              with, without);
+  std::printf(
+      "decoder vs reference after an image prompt: rel err %.2e with "
+      "rope_delta -3, %.2e with 0\n",
+      with, without);
   Expect(with < 2e-3, "decoder with rope_delta matches the reference");
   Expect(without > 10 * with, "decoder without rope_delta does not");
 }

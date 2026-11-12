@@ -144,9 +144,9 @@ struct NpuPrefill::Impl {
   // consecutive chunks through the layers together, so one lane's GEMMs run
   // on the NPU while the CPU works on the other's.
   struct Lane {
-    int n = 0;         // tokens
-    int m = 0;         // GEMM rows (n padded to a chunk size)
-    int position = 0;  // of the first
+    int n = 0;              // tokens
+    int m = 0;              // GEMM rows (n padded to a chunk size)
+    int position = 0;       // of the first
     int rope_position = 0;  // the first's: position + DecodeState::rope_delta
     std::unique_ptr<GemmBuffer> a, c;
     gufo_npu::npu::GemmCall call;

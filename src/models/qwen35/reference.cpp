@@ -223,8 +223,8 @@ ForwardOutput Reference::ForwardPrompt(const PromptInput& input, State& state,
     result.hidden.insert(result.hidden.end(), h.begin(), h.end());
   }
 
-  const auto positions = input.positions.empty() ? TextPositions(state, n)
-                                                 : input.positions;
+  const auto positions =
+      input.positions.empty() ? TextPositions(state, n) : input.positions;
   for (int il = 0; il < c.layers; ++il) {
     RunLayer(il, h, n, state, proj, positions.data());
     if (want_hidden) {

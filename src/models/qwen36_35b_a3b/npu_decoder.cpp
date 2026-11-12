@@ -874,8 +874,8 @@ const float* NpuDecoder::Step(const int* tokens, int count, DecodeState& state,
   m.Submit(*m.first[count - 1], m.timeline.first);
   for (int il = 0; il < c.layers; ++il) {
     auto& layer = m.layers[il];
-    m.Mix(layer, il, count, state.position + state.rope_delta,
-          state.layers[il], count == 2);
+    m.Mix(layer, il, count, state.position + state.rope_delta, state.layers[il],
+          count == 2);
     m.SubmitFfn(layer, count, m.timeline.layers, !logits && il + 1 == c.layers);
   }
   state.position += count;

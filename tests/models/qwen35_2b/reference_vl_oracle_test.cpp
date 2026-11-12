@@ -123,7 +123,8 @@ int main() {
     // get_rope_index).
     std::vector<qwen35::RopePosition> want_positions(n);
     for (int t = 0; t < n; ++t) {
-      want_positions[t] = {positions[t], positions[n + t], positions[2 * n + t]};
+      want_positions[t] = {positions[t], positions[n + t],
+                           positions[2 * n + t]};
     }
     const auto ours = qwen35::ImagePromptPositions(ids, image_pad, grids);
     const bool positions_ok =
