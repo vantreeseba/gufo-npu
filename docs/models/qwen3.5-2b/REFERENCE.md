@@ -57,6 +57,23 @@ Chunked (prefill) forms are algebraically equal to the per-token loop.
   pos · 1e7^(−2i/64): `x'[i] = x[i] cos − x[i+32] sin`,
   `x'[i+32] = x[i] sin + x[i+32] cos`. For text, the MRoPE sections all see
   the same position, so this is plain RoPE.
+- Image prompts (interleaved MRoPE, `src/models/qwen35/rope.hpp`): each
+  token has a (t, h, w) position, and frequency i (of 32) takes h when
+  `i % 3 == 1 and i < 3 · sections[1]`, w when `i % 3 == 2 and
+  i < 3 · sections[2]`, t otherwise; sections (11, 11, 10) come from
+  `qwen35.rope.dimension_sections` ([11, 11, 10, 0]; llama.cpp's interleaved
+  MRoPE type for this arch, no key for the interleaving). The angles then
+  pair as above (i, i + 32), so with t = h = w this is the plain RoPE bit for
+  bit. This is HF's `Qwen3_5TextRotaryEmbedding.recomposition_frequencies`
+  (5.21.0) followed by `cat(freqs, freqs)` and `rotate_half` over the 64
+  rotated dims; `qwen35_rope_test` holds cos/sin values printed by it.
+- Positions (HF `get_rope_index`): text counts up on all axes; an image's
+  merged grid cell (r, c) (grid_thw h, w halved by the 2 x 2 merge) at
+  start s gets (s, s + r, s + c); text after it resumes at
+  s + max(h, w) / 2. After the prompt every token rotates at
+  KV index + rope_delta on all axes, rope_delta = max position + 1 −
+  prompt length (`DecodeState::rope_delta`, `State::rope_delta`). The image
+  pads' input rows are the vision tower's output rows (`PromptInput`).
 - GQA: query head h uses kv head `h / (heads / kv_heads)`. Scores
   `q·k / sqrt(256)`, causal softmax, `ctx = Σ p v`, then
   `ctx ⊙ sigmoid(gate)`, then `attn_output`.
