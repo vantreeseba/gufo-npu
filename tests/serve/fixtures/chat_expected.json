@@ -26,7 +26,15 @@
  "tool_first_message": "\n<tool_response>\norphan result\n</tool_response><|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
  "unicode_content": "<|im_start|>user\nÜnïcödé 你好 🦊 ​<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
  "empty_messages": null,
- "reject_image_url": null,
+ "image_url_part": "<|im_start|>user\nwhat is this<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+ "image_first_then_text": "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>  Describe it.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+ "two_images_between_text": "<|im_start|>system\nYou compare pictures.<|im_end|>\n<|im_start|>user\nLeft: <|vision_start|><|image_pad|><|vision_end|> right: <|vision_start|><|image_pad|><|vision_end|> Which is brighter?<|im_end|>\n<|im_start|>assistant\n<think>\n",
+ "images_across_turns": "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>What is this?<|im_end|>\n<|im_start|>assistant\nA cat.<|im_end|>\n<|im_start|>user\nAnd this one?<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+ "image_in_assistant_and_tool": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"snap\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nTake a photo.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nHere is the last one: <|vision_start|><|image_pad|><|vision_end|>\n\n<tool_call>\n<function=snap>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nphoto: <|vision_start|><|image_pad|><|vision_end|>\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+ "image_prefill": "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>Caption it.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nThe picture shows",
+ "system_image_rejected": null,
+ "developer_image_rejected": null,
+ "later_system_image_dropped": "<|im_start|>system\nTop.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>Again<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
  "reject_image": null,
  "reject_unknown_part": null
 }

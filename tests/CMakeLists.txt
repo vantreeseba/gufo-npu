@@ -67,12 +67,13 @@ add_test(NAME serve_text_test COMMAND serve_text_test)
 add_executable(serve_server_test serve/server_test.cpp)
 target_link_libraries(serve_server_test PRIVATE gufo_npu_serve cpp_httplib)
 add_test(NAME serve_server_test COMMAND serve_server_test)
-# The same with the real Qwen3.5 chat format: reasoning and tool calls end
-# to end.
+# The same with the real Qwen3.5 chat format: reasoning, tool calls and
+# image parts end to end.
 add_executable(serve_chat_test serve/server_chat_test.cpp)
 target_link_libraries(serve_chat_test PRIVATE gufo_npu_serve
                       gufo_npu_serve_chat cpp_httplib)
-add_test(NAME serve_chat_test COMMAND serve_chat_test)
+add_test(NAME serve_chat_test
+         COMMAND serve_chat_test "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/image")
 add_executable(serve_engine_pool_test serve/engine_pool_test.cpp)
 target_link_libraries(serve_engine_pool_test PRIVATE gufo_npu_serve cpp_httplib)
 add_test(NAME serve_engine_pool_test COMMAND serve_engine_pool_test)
@@ -118,6 +119,19 @@ add_test(NAME qwen3vl_tokenizer_test
 set_tests_properties(qwen3vl_tokenizer_test PROPERTIES SKIP_RETURN_CODE 77
                      LABELS "qwen3vl_embed_2b;model")
 
+# --max-image-tokens: a whole number of at least 1, then the embedding
+# model's range (4 to 1,800 on the NPU), checked before any file opens.
+add_test(NAME cli_max_image_tokens_not_a_number
+         COMMAND gufo-npu serve --model none.gguf --max-image-tokens 12x)
+add_test(NAME cli_max_image_tokens_zero
+         COMMAND gufo-npu embed --model none.gguf --max-image-tokens 0)
+set_tests_properties(cli_max_image_tokens_not_a_number cli_max_image_tokens_zero
+                     PROPERTIES PASS_REGULAR_EXPRESSION "usage: gufo-npu")
+add_test(NAME cli_max_image_tokens_embed_range
+         COMMAND gufo-npu embed --model none.gguf --mmproj none.gguf
+                 --image none.png --max-image-tokens 1801)
+set_tests_properties(cli_max_image_tokens_embed_range PROPERTIES
+                     PASS_REGULAR_EXPRESSION "outside 4\\.\\.1800")
 add_test(NAME cli_version COMMAND gufo-npu version)
 set_tests_properties(cli_version PROPERTIES PASS_REGULAR_EXPRESSION
                      "^gufo-npu ${GUFO_NPU_VERSION}")

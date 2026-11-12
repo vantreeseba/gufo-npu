@@ -1026,8 +1026,7 @@
   "messages": []
  },
  {
-  "name": "reject_image_url",
-  "reject": true,
+  "name": "image_url_part",
   "messages": [
    {
     "role": "user",
@@ -1041,6 +1040,277 @@
       "image_url": {
        "url": "data:,"
       }
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "name": "image_first_then_text",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "data:image/png;base64,AAAA"
+      }
+     },
+     {
+      "type": "text",
+      "text": "  Describe it.  "
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "name": "two_images_between_text",
+  "thinking": true,
+  "messages": [
+   {
+    "role": "system",
+    "content": "You compare pictures."
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Left: "
+     },
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "data:image/png;base64,AAAA"
+      }
+     },
+     {
+      "type": "text",
+      "text": " right: "
+     },
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "data:image/png;base64,AAAA"
+      }
+     },
+     {
+      "type": "text",
+      "text": " Which is brighter?"
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "name": "images_across_turns",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "data:image/png;base64,AAAA"
+      }
+     },
+     {
+      "type": "text",
+      "text": "What is this?"
+     }
+    ]
+   },
+   {
+    "role": "assistant",
+    "content": "A cat."
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "And this one?"
+     },
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "data:image/png;base64,AAAA"
+      }
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "name": "image_in_assistant_and_tool",
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "snap",
+     "parameters": {
+      "type": "object",
+      "properties": {}
+     }
+    }
+   }
+  ],
+  "messages": [
+   {
+    "role": "user",
+    "content": "Take a photo."
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "text",
+      "text": "Here is the last one: "
+     },
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "data:image/png;base64,AAAA"
+      }
+     }
+    ],
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+       "name": "snap",
+       "arguments": "{}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_1",
+    "content": [
+     {
+      "type": "text",
+      "text": "photo: "
+     },
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "data:image/png;base64,AAAA"
+      }
+     }
+    ]
+   }
+  ]
+ },
+ {
+  "name": "image_prefill",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "data:image/png;base64,AAAA"
+      }
+     },
+     {
+      "type": "text",
+      "text": "Caption it."
+     }
+    ]
+   },
+   {
+    "role": "assistant",
+    "content": "The picture shows"
+   }
+  ]
+ },
+ {
+  "name": "system_image_rejected",
+  "messages": [
+   {
+    "role": "system",
+    "content": [
+     {
+      "type": "text",
+      "text": "Look: "
+     },
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "data:image/png;base64,AAAA"
+      }
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ]
+ },
+ {
+  "name": "developer_image_rejected",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Top."
+   },
+   {
+    "role": "developer",
+    "content": [
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "data:image/png;base64,AAAA"
+      }
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ]
+ },
+ {
+  "name": "later_system_image_dropped",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Top."
+   },
+   {
+    "role": "user",
+    "content": "Hi"
+   },
+   {
+    "role": "system",
+    "content": [
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "data:image/png;base64,AAAA"
+      }
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "data:image/png;base64,AAAA"
+      }
+     },
+     {
+      "type": "text",
+      "text": "Again"
      }
     ]
    }

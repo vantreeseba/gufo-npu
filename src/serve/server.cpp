@@ -405,6 +405,70 @@ struct Server::Impl {
     }
   }
 
+  // Images in a chat need a model that takes them, loaded with its vision
+  // tower.
+  static void RequireImages(const Engine& engine) {
+    const ModelInfo& info = engine.info();
+    if (info.chat_images) {
+      return;
+    }
+    throw InvalidRequest(
+        info.takes_mmproj
+            ? "the model " + info.id +
+                  " was started without its vision tower; start the server "
+                  "with --mmproj for image inputs"
+            : "the model " + info.id +
+                  " takes no images: image inputs need a model that "
+                  "supports them, started with --mmproj (its vision tower)",
+        "messages");
+  }
+
+  // The token ids of a rendered prompt: each text piece encoded, each
+  // image's pad repeated once per image token. `placed` gets the images
+  // the prompt holds, in order, with their layouts and offsets.
+  std::vector<int> PromptIds(const Engine& engine,
+                             const RenderedPrompt& rendered,
+                             const std::vector<PromptImage>& images,
+                             std::vector<PromptImage>& placed) const {
+    if (rendered.images.empty() && !engine.info().chat_images) {
+      return engine.Encode(rendered.text.front());
+    }
+    const std::string pad_token = format.ImagePadToken();
+    const int pad = pad_token.empty() ? -1 : engine.FindToken(pad_token);
+    if (pad < 0) {
+      throw std::logic_error("the model's vocabulary has no image pad token");
+    }
+    std::vector<int> ids;
+    for (std::size_t k = 0; k < rendered.text.size(); ++k) {
+      const auto piece = engine.Encode(rendered.text[k]);
+      if (std::find(piece.begin(), piece.end(), pad) != piece.end()) {
+        throw InvalidRequest(
+            "message text holds " + pad_token + ", which only images may",
+            "messages");
+      }
+      ids.insert(ids.end(), piece.begin(), piece.end());
+      if (k + 1 == rendered.text.size()) {
+        break;
+      }
+      PromptImage img = images.at(static_cast<std::size_t>(rendered.images[k]));
+      try {
+        img.layout =
+            engine.ChatImageLayout(img.image->width, img.image->height);
+      } catch (const std::invalid_argument& e) {
+        throw InvalidRequest(
+            "image " + std::to_string(rendered.images[k] + 1) + ": " + e.what(),
+            "messages");
+      }
+      if (img.layout.tokens < 1) {
+        throw std::logic_error("an image layout without tokens");
+      }
+      img.offset = static_cast<int>(ids.size());
+      ids.insert(ids.end(), static_cast<std::size_t>(img.layout.tokens), pad);
+      placed.push_back(std::move(img));
+    }
+    return ids;
+  }
+
   std::vector<int> StopIds(const Engine& engine) const {
     std::vector<int> ids;
     for (const auto& token : format.StopTokens()) {
@@ -482,14 +546,22 @@ struct Server::Impl {
       Engine& engine = *job->engine;
       RequireGenerator(engine);
       CheckBias(engine, job->chat.sampling);
-      std::string text;
+      std::vector<PromptImage> images;
+      if (job->chat.images > 0) {
+        RequireImages(engine);
+        images = DecodeChatImages(job->chat.prompt);
+      }
+      RenderedPrompt rendered;
       try {
-        text = format.Render(job->chat.prompt);
+        rendered = format.RenderImages(job->chat.prompt);
       } catch (const std::invalid_argument& e) {
         throw InvalidRequest(e.what(), "messages");
       }
-      job->gens.push_back(Gen(engine, engine.Encode(text), job->chat.max_tokens,
+      std::vector<PromptImage> placed;
+      auto ids = PromptIds(engine, rendered, images, placed);
+      job->gens.push_back(Gen(engine, std::move(ids), job->chat.max_tokens,
                               job->chat.sampling, "messages"));
+      job->gens.back().images = std::move(placed);
       job->gens.back().sampling.constraint =
           Constraint(job->chat, engine, job->gens.back().stop_ids);
     } catch (const ApiError& e) {
@@ -708,6 +780,14 @@ struct Server::Impl {
         o << " response_format=json_schema";
       } else if (job.chat.format == ChatRequest::Format::kJsonObject) {
         o << " response_format=json_object";
+      }
+      if (!job.gens.empty() && !job.gens.front().images.empty()) {
+        int image_tokens = 0;
+        for (const auto& img : job.gens.front().images) {
+          image_tokens += img.layout.tokens;
+        }
+        o << " images=" << job.gens.front().images.size()
+          << " image_tokens=" << image_tokens;
       }
       if (!job.chat.prompt.tools.empty()) {
         o << " tools=" << job.chat.prompt.tools.size();

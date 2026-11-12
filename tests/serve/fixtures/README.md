@@ -7,7 +7,10 @@
   `tools/reference/qwen35_chat_template.py --extract MODEL.gguf OUT.jinja`.
 - `chat_cases.json`: OpenAI-style requests (messages, tools, thinking).
   `reject: true` marks requests the server refuses before templating
-  (images, audio).
+  (image parts other than `image_url`, audio). An `image_url` part renders
+  as the template renders an image, with one `<|image_pad|>` (the server
+  repeats it per image token); the image cases render the same with the HF
+  repo's `chat_template.jinja`.
 - `chat_expected.json`: each case rendered by every template with jinja2
   (transformers' environment); `null` where the template or the server
   rejects it. All three templates give the same text, because the server

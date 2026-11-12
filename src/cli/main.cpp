@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <csignal>
@@ -96,13 +97,15 @@ constexpr char kUsage[] =
     "                           (default 5) after 2 warm-up calls\n"
     "  embed --model GGUF [--text TEXT ...] [--image FILE ...] [--mmproj "
     "GGUF]\n"
-    "        [--instruction TEXT] [--dimensions N] [--similarity]\n"
-    "        [--device npu|cpu] [--kernels DIR]\n"
+    "        [--max-image-tokens N] [--instruction TEXT] [--dimensions N]\n"
+    "        [--similarity] [--device npu|cpu] [--kernels DIR]\n"
     "                           embeddings of the inputs in order (one per\n"
     "                           --text or --image, else one per non-empty\n"
     "                           stdin line) as JSON lines; --image (PNG or\n"
     "                           JPEG) needs --mmproj (the vision tower's\n"
-    "                           GGUF); --similarity prints their cosine\n"
+    "                           GGUF); --max-image-tokens caps each image's\n"
+    "                           tokens (default 1800; 4 to 1800 on npu);\n"
+    "                           --similarity prints their cosine\n"
     "                           matrix instead; cpu is the reference\n"
     "                           (default npu)\n"
     "  generate --model GGUF --prompt TEXT [--system TEXT] [--max-tokens N]\n"
@@ -120,7 +123,7 @@ constexpr char kUsage[] =
     "        [--device npu|cpu] [--kernels DIR] [--model-id NAME]\n"
     "        [--max-queue N] [--api-key KEY] [--context-length N]\n"
     "        [--prompt-cache N] [--preload ID] [--unload-after SECONDS]\n"
-    "        [--draft mtp|none] [--mmproj GGUF]\n"
+    "        [--draft mtp|none] [--mmproj GGUF] [--max-image-tokens N]\n"
     "        [--log-level error|warn|info|debug]\n"
     "                           OpenAI-compatible server (docs/SERVING.md),\n"
     "                           by default on 127.0.0.1:8080; --prompt-cache\n"
@@ -130,8 +133,10 @@ constexpr char kUsage[] =
     "                           at a time (--preload: the first, default the\n"
     "                           first --model); --unload-after frees an idle\n"
     "                           model's memory (default 0: never); --mmproj\n"
-    "                           gives the embedding --model its vision tower\n"
-    "                           for image inputs;\n"
+    "                           gives the --model that takes one (today only\n"
+    "                           the embedding model) its vision tower for\n"
+    "                           image inputs; --max-image-tokens caps each\n"
+    "                           image's tokens (default 1800);\n"
     "                           --log-level sets what goes to stderr\n"
     "                           (default info; debug adds /health and\n"
     "                           /metrics polls)\n"
@@ -1189,6 +1194,18 @@ gufo_npu::qwen3vl_embed_2b::Image ReadImage(const std::string& path) {
   }
 }
 
+// --max-image-tokens: a whole number of at least 1 (each model checks its
+// own range); nullopt otherwise.
+std::optional<int> ParseImageTokens(std::string_view text) {
+  int value = 0;
+  const auto [end, error] =
+      std::from_chars(text.data(), text.data() + text.size(), value);
+  if (error != std::errc() || end != text.data() + text.size() || value < 1) {
+    return std::nullopt;
+  }
+  return value;
+}
+
 int Embed(const std::vector<std::string_view>& args) {
   namespace e = gufo_npu::qwen3vl_embed_2b;
   // One input: a text, or an image file.
@@ -1204,11 +1221,19 @@ int Embed(const std::vector<std::string_view>& args) {
   bool similarity = false;
   std::string device = "npu";
   std::optional<std::string> kernels;
+  int max_image_tokens = gufo_npu::serve::kDefaultMaxImageTokens;
   try {
     for (std::size_t i = 0; i < args.size(); ++i) {
       const bool has_value = i + 1 < args.size();
       if (args[i] == "--model" && has_value) {
         model = std::string(args[++i]);
+      } else if (args[i] == "--max-image-tokens" && has_value) {
+        const auto tokens = ParseImageTokens(args[++i]);
+        if (!tokens) {
+          std::cerr << kUsage;
+          return 2;
+        }
+        max_image_tokens = *tokens;
       } else if (args[i] == "--text" && has_value) {
         given.push_back({std::string(args[++i]), std::nullopt});
       } else if (args[i] == "--image" && has_value) {
@@ -1257,6 +1282,14 @@ int Embed(const std::vector<std::string_view>& args) {
     std::cerr << "embed: --image needs --mmproj (the vision tower's GGUF)\n";
     return 2;
   }
+  if (mmproj) {
+    try {
+      e::CheckMaxImageTokens(max_image_tokens, device);
+    } catch (const std::invalid_argument& ex) {
+      std::cerr << "embed: --max-image-tokens: " << ex.what() << "\n";
+      return 2;
+    }
+  }
   try {
     const auto file = gufo_npu::gguf::File::Open(model);
     const auto vision_file =
@@ -1269,8 +1302,10 @@ int Embed(const std::vector<std::string_view>& args) {
       if (in.image) {
         auto image = ReadImage(*in.image);
         inputs.push_back(e::ImageInputIds(
-            tokenizer, e::ImageTokens(image.width, image.height), "",
-            instruction));
+            tokenizer,
+            e::ImageTokens(image.width, image.height, e::kImageFactor,
+                           e::MaxImagePixels(max_image_tokens)),
+            "", instruction));
         pixels.emplace_back(std::move(image));
       } else {
         inputs.push_back(e::InputIds(tokenizer, in.text, instruction));
@@ -1279,7 +1314,8 @@ int Embed(const std::vector<std::string_view>& args) {
     }
     e::EmbeddingModel embedder(
         *file, vision_file.get(), device,
-        device == "npu" ? KernelDir(kernels) : std::filesystem::path());
+        device == "npu" ? KernelDir(kernels) : std::filesystem::path(),
+        max_image_tokens);
     const int image_pad = tokenizer.Find(e::kImagePad);
     const auto start = std::chrono::steady_clock::now();
     // The texts as one batch, then each image.
@@ -1463,6 +1499,13 @@ int Serve(const std::vector<std::string_view>& args) {
       model_paths.emplace_back(args[++i]);
     } else if (args[i] == "--mmproj" && has_value) {
       mmproj = std::string(args[++i]);
+    } else if (args[i] == "--max-image-tokens" && has_value) {
+      const auto tokens = ParseImageTokens(args[++i]);
+      if (!tokens) {
+        std::cerr << kUsage;
+        return 2;
+      }
+      engine_options.max_image_tokens = *tokens;
     } else if (args[i] == "--log-level" && has_value) {
       const auto level = serve::LogLevelFromName(args[++i]);
       if (!level) {
@@ -1519,27 +1562,35 @@ int Serve(const std::vector<std::string_view>& args) {
   if (engine_options.device == "npu") {
     engine_options.kernels = KernelDir(kernels).string();
   }
-  // --mmproj belongs to the one embedding model among the --model files.
+  // --mmproj belongs to the one --model whose package takes a vision tower
+  // (one model is served at a time, so that may be a chat model as well as
+  // the embedding model).
   std::optional<std::size_t> mmproj_model;
   if (mmproj) {
-    std::vector<std::size_t> embedding_models;
+    std::vector<std::size_t> takers;
     try {
       for (std::size_t m = 0; m < model_paths.size(); ++m) {
-        if (gufo_npu::qwen3vl_embed_2b::IsEmbeddingModel(
-                *gufo_npu::gguf::File::Open(model_paths[m]))) {
-          embedding_models.push_back(m);
+        if (serve::TakesMmproj(model_paths[m])) {
+          takers.push_back(m);
         }
       }
     } catch (const std::exception& e) {
       std::cerr << "serve: " << e.what() << "\n";
       return 1;
     }
-    if (embedding_models.size() != 1) {
-      std::cerr << "serve: --mmproj needs exactly one embedding --model "
-                   "(Qwen3-VL-Embedding-2B)\n";
+    if (takers.empty()) {
+      std::cerr << "serve: --mmproj: no --model takes a vision tower (in "
+                   "this build only Qwen3-VL-Embedding-2B does; image input "
+                   "to chat models is not supported yet)\n";
       return 2;
     }
-    mmproj_model = embedding_models.front();
+    if (takers.size() > 1) {
+      std::cerr << "serve: --mmproj: " << takers.size()
+                << " --model files take a vision tower; give each its own "
+                   "server\n";
+      return 2;
+    }
+    mmproj_model = takers.front();
   }
   serve::Logger::SetLevel(log_level);
   serve::Logger::Info(
@@ -1554,7 +1605,8 @@ int Serve(const std::vector<std::string_view>& args) {
           " prompt_cache=" + std::to_string(engine_options.prompt_cache) +
           " context_length=" + std::to_string(engine_options.context_length) +
           " api_key=" + (server_options.api_key.empty() ? "unset" : "set") +
-          " mmproj=" + (mmproj ? "set" : "unset") +
+          " mmproj=" + (mmproj ? "set" : "unset") + " max_image_tokens=" +
+          std::to_string(engine_options.max_image_tokens) +
           " log_level=" + std::string(serve::LogLevelName(log_level)));
 
   // SIGINT/SIGTERM stop the server: blocked in every thread (set before any

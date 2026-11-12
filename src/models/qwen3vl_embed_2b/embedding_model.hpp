@@ -25,15 +25,35 @@ struct Image {
   std::vector<std::uint8_t> rgb;
 };
 
+// Image tokens per image (merged 32 x 32 tokens, SmartResize's bounds): the
+// reference embedder's cap by default, and the range a cap may take: at
+// least the minimum resize, at most 1,800 on "npu" (the ViT attention
+// program's size), image::kMaxPixels' worth on "cpu".
+inline constexpr int kMinImageTokens =
+    kImageMinPixels / (kImageFactor * kImageFactor);
+inline constexpr int kDefaultMaxImageTokens =
+    kImageMaxPixels / (kImageFactor * kImageFactor);
+int MaxImageTokens(std::string_view device);
+// The cap as SmartResize's max_pixels (ImageTokens, PreprocessImage).
+inline int MaxImagePixels(int max_image_tokens) {
+  return max_image_tokens * kImageFactor * kImageFactor;
+}
+// Throws std::invalid_argument for a cap outside [kMinImageTokens,
+// MaxImageTokens(device)].
+void CheckMaxImageTokens(int max_image_tokens, std::string_view device);
+
 class EmbeddingModel {
 public:
   // Keeps pointers into `file` and `mmproj` (nullptr: text only), which
-  // must outlive it; `kernel_dir` serves "npu". Throws
-  // std::invalid_argument for another device or a vision tower that does
-  // not fit the text model, and what the embedders' constructors throw.
+  // must outlive it; `kernel_dir` serves "npu". Images resize to at most
+  // `max_image_tokens` tokens. Throws std::invalid_argument for another
+  // device, a vision tower that does not fit the text model or a cap
+  // CheckMaxImageTokens refuses, and what the embedders' constructors
+  // throw.
   EmbeddingModel(const gguf::File& file, const gguf::File* mmproj,
                  std::string_view device,
-                 const std::filesystem::path& kernel_dir);
+                 const std::filesystem::path& kernel_dir,
+                 int max_image_tokens = kDefaultMaxImageTokens);
   ~EmbeddingModel();
   EmbeddingModel(const EmbeddingModel&) = delete;
   EmbeddingModel& operator=(const EmbeddingModel&) = delete;
@@ -45,7 +65,8 @@ public:
   std::vector<std::vector<float>> Embed(
       const std::vector<std::vector<int>>& inputs);
   // The unit embedding of one input holding `image`: `ids` from
-  // ImageInputIds with ImageTokens(image.width, image.height) image tokens.
+  // ImageInputIds with ImageTokens(image.width, image.height, kImageFactor,
+  // MaxImagePixels(max_image_tokens)) image tokens.
   // Throws std::invalid_argument without a vision tower, for an image
   // whose pixels are not width x height x 3 values, or when the ids
   // disagree with the image.
@@ -53,6 +74,7 @@ public:
                                 const Image& image);
 
 private:
+  int max_image_tokens_;
   std::unique_ptr<Embedder> text_;
   // Destroyed first: NpuVision runs on the NpuEmbedder's GEMM program.
   std::unique_ptr<VisionEncoder> vision_;
