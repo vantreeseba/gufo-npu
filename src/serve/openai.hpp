@@ -41,8 +41,15 @@ ApiError InvalidRequest(const std::string& message,
 inline constexpr int kMaxChoices = 8;
 inline constexpr int kMaxTopLogprobs = 20;
 
+// Most image parts per chat request; a request's images hold at most
+// image::kMaxPixels pixels together (as for embeddings).
+inline constexpr int kMaxChatImages = 16;
+
 struct ChatRequest {
   ChatPrompt prompt;
+  // The image parts in prompt.messages (IsImagePart), checked but not yet
+  // decoded (DecodeChatImages).
+  int images = 0;
   std::optional<int> max_tokens;  // max_completion_tokens or max_tokens
   SamplingParams sampling;        // logit_bias ids are checked by the server
   std::vector<std::string> stop;
@@ -103,7 +110,17 @@ struct EmbeddingsRequest {
 // Reads a /v1/chat/completions body, parsed as ordered JSON so messages
 // and tools keep the client's key order. Throws ApiError for anything the
 // server does not support or that is out of range.
+// Image parts are {"type": "image_url", "image_url": {"url": a base64
+// data URI, "detail": "auto" | "low" | "high"}}; other image-like parts
+// ("image", "input_image") are refused.
 ChatRequest ParseChatRequest(const nlohmann::ordered_json& body);
+
+// The images of a chat request's image parts, in order (IsImagePart),
+// decoded (PNG or JPEG, from the bytes), each with the hash of its file;
+// layout and offset are left for the prompt. Throws ApiError (400 for
+// messages) for an image that does not decode or more than
+// image::kMaxPixels pixels in all.
+std::vector<PromptImage> DecodeChatImages(const ChatPrompt& prompt);
 
 // Reads a /v1/completions body. Throws ApiError as ParseChatRequest does.
 CompletionRequest ParseCompletionRequest(const nlohmann::ordered_json& body);

@@ -24,6 +24,11 @@ std::optional<ModelPackage> NpuPackageFor(const qwen35::Config& config);
 // The package's model name, e.g. "Qwen3.6-35B-A3B".
 const char* PackageName(ModelPackage package);
 
+// Whether the package runs images in chat prompts, given a vision tower
+// (EngineOptions::mmproj_path): it then sets ModelInfo::chat_images and
+// implements Engine::ChatImageLayout. None does yet; Qwen3.5-2B is next.
+bool TakesVisionTower(ModelPackage package);
+
 // A model id for clients: lowercase, spaces and underscores as '-', other
 // characters outside [a-z0-9.-] dropped; e.g. "Qwen3.6 35B-A3B" ->
 // "qwen3.6-35b-a3b".

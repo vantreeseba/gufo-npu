@@ -51,6 +51,9 @@ public:
                           const std::function<bool(int)>& on_token) override {
     return pool_.Generate(index_, request, on_token);
   }
+  ImageLayout ChatImageLayout(int width, int height) const override {
+    return probe_.ChatImageLayout(width, height);
+  }
   std::vector<int> EmbeddingIds(const EmbeddingInput& input,
                                 std::string_view instruction) const override {
     return probe_.EmbeddingIds(input, instruction);

@@ -40,6 +40,16 @@ const char* PackageName(ModelPackage package) {
   return "unknown";
 }
 
+bool TakesVisionTower(ModelPackage package) {
+  switch (package) {
+    case ModelPackage::kQwen35_2B:
+    case ModelPackage::kQwen35_4B:
+    case ModelPackage::kQwen36_35B_A3B:
+      return false;
+  }
+  return false;
+}
+
 std::string NormalizeModelId(std::string_view name) {
   std::string id;
   for (const char ch : name) {

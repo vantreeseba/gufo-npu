@@ -6,6 +6,12 @@
 // The three models' templates differ only where this never looks: the
 // default of enable_thinking (always given here) and the 35B's
 // preserve_thinking switch (never set).
+//
+// An image part renders as <|vision_start|><|image_pad|><|vision_end|>
+// where it stands among the content parts (add_vision_id is never set), in
+// user, assistant and tool messages; a system message with one is refused,
+// as the template refuses it. RenderImages cuts the text at each pad, which
+// the server repeats once per image token.
 
 #include <charconv>
 #include <cmath>
@@ -300,8 +306,73 @@ bool IsSystem(const std::string& role) {
   return role == "system" || role == "developer";
 }
 
-// render_content: a string, a list of text parts, or nothing.
-std::string RenderContent(const Json& message) {
+// ---- Images ----
+
+constexpr std::string_view kVisionStart = "<|vision_start|>";
+constexpr std::string_view kImagePad = "<|image_pad|>";
+constexpr std::string_view kVisionEnd = "<|vision_end|>";
+// Image k's pad in the rendered text, until RenderImages cuts there:
+// kImageMark, k's digits, kImageMark. The byte 0xFF is never in UTF-8, so
+// no message text can forge one.
+constexpr char kImageMark = '\xFF';
+
+// The prompt's image parts, numbered in IsImagePart order.
+class ImageNumbers {
+public:
+  explicit ImageNumbers(const Json& messages) {
+    if (!messages.is_array()) {
+      return;
+    }
+    for (const auto& message : messages) {
+      if (!message.is_object() || !message.contains("content") ||
+          !message["content"].is_array()) {
+        continue;
+      }
+      for (const auto& part : message["content"]) {
+        if (IsImagePart(part)) {
+          parts_.push_back(&part);
+        }
+      }
+    }
+  }
+
+  int Of(const Json& part) const {
+    for (std::size_t k = 0; k < parts_.size(); ++k) {
+      if (parts_[k] == &part) {
+        return static_cast<int>(k);
+      }
+    }
+    throw std::logic_error("chat: an image part outside the messages");
+  }
+
+private:
+  std::vector<const Json*> parts_;
+};
+
+// The rendered text cut at its image marks.
+RenderedPrompt CutAtImages(const std::string& text) {
+  RenderedPrompt out;
+  std::size_t start = 0;
+  for (auto open = text.find(kImageMark); open != std::string::npos;
+       open = text.find(kImageMark, start)) {
+    const auto close = text.find(kImageMark, open + 1);
+    if (close == std::string::npos) {
+      throw std::logic_error("chat: an unclosed image mark");
+    }
+    out.text.push_back(text.substr(start, open - start));
+    int number = 0;
+    std::from_chars(text.data() + open + 1, text.data() + close, number);
+    out.images.push_back(number);
+    start = close + 1;
+  }
+  out.text.push_back(text.substr(start));
+  return out;
+}
+
+// render_content: a string, a list of text and image parts, or nothing.
+// A system message (`system`) may hold no images.
+std::string RenderContent(const Json& message, const ImageNumbers& images,
+                          bool system = false) {
   if (!message.contains("content")) {
     return {};
   }
@@ -323,10 +394,25 @@ std::string RenderContent(const Json& message) {
     const auto type = item.contains("type") && item["type"].is_string()
                           ? item["type"].get<std::string>()
                           : std::string();
-    if (item.contains("image") || item.contains("image_url") ||
-        type == "image" || item.contains("video") || type == "video") {
+    if (IsImagePart(item)) {
+      if (system) {
+        throw std::invalid_argument(
+            "chat: a system message cannot contain images");
+      }
+      out += kVisionStart;
+      out += kImageMark;
+      out += std::to_string(images.Of(item));
+      out += kImageMark;
+      out += kVisionEnd;
+      continue;
+    }
+    if (item.contains("image") || type == "image") {
       throw std::invalid_argument(
-          "chat: images and video are not supported by this model build");
+          "chat: an image part must be {\"type\": \"image_url\", "
+          "\"image_url\": {\"url\": ...}}");
+    }
+    if (item.contains("video") || type == "video") {
+      throw std::invalid_argument("chat: video is not supported");
     }
     if (!item.contains("text")) {
       throw std::invalid_argument("chat: unsupported content part");
@@ -428,15 +514,16 @@ std::string RenderTemplate(const ChatPrompt& prompt, bool* prefill) {
     }
   }
 
+  const ImageNumbers images(messages);
   std::string out;
   // System prompt: the first one or two system/developer messages, merged.
   std::size_t num_sys = 0;
   std::string merged_system;
   if (IsSystem(Role(messages[0]))) {
-    merged_system = Trim(RenderContent(messages[0]));
+    merged_system = Trim(RenderContent(messages[0], images, true));
     num_sys = 1;
     if (count > 1 && IsSystem(Role(messages[1]))) {
-      merged_system += "\n" + Trim(RenderContent(messages[1]));
+      merged_system += "\n" + Trim(RenderContent(messages[1], images, true));
       num_sys = 2;
     }
   }
@@ -463,7 +550,7 @@ std::string RenderTemplate(const ChatPrompt& prompt, bool* prefill) {
     if (Role(messages[k]) != "user") {
       continue;
     }
-    const auto content = Trim(RenderContent(messages[k]));
+    const auto content = Trim(RenderContent(messages[k], images));
     if (!(content.starts_with("<tool_response>") &&
           content.ends_with("</tool_response>"))) {
       last_query = k;
@@ -477,7 +564,7 @@ std::string RenderTemplate(const ChatPrompt& prompt, bool* prefill) {
     if (IsSystem(role)) {
       continue;  // later system messages are dropped
     }
-    std::string content = Trim(RenderContent(message));
+    std::string content = Trim(RenderContent(message, images));
     if (role == "user") {
       out += std::string(kImStart) + "user\n" + content + std::string(kImEnd);
     } else if (role == "assistant") {
@@ -858,9 +945,21 @@ private:
 class Qwen35ChatFormat : public ChatFormat {
 public:
   std::string Render(const ChatPrompt& prompt) const override {
-    bool prefill = false;
-    return RenderTemplate(prompt, &prefill);
+    const RenderedPrompt cut = RenderImages(prompt);
+    std::string text = cut.text.front();
+    for (std::size_t k = 1; k < cut.text.size(); ++k) {
+      text += kImagePad;
+      text += cut.text[k];
+    }
+    return text;
   }
+
+  RenderedPrompt RenderImages(const ChatPrompt& prompt) const override {
+    bool prefill = false;
+    return CutAtImages(RenderTemplate(prompt, &prefill));
+  }
+
+  std::string ImagePadToken() const override { return std::string(kImagePad); }
 
   std::unique_ptr<OutputParser> NewParser(
       const ChatPrompt& prompt) const override {

@@ -3,15 +3,41 @@
 #include <stdexcept>
 #include <string>
 
+#include "core/image.hpp"
+#include "models/qwen3vl_embed_2b/npu/vit_attention.hpp"
 #include "models/qwen3vl_embed_2b/npu_embedder.hpp"
 #include "models/qwen3vl_embed_2b/npu_vision.hpp"
 #include "models/qwen3vl_embed_2b/reference.hpp"
 
 namespace gufo_npu::qwen3vl_embed_2b {
 
+int MaxImageTokens(std::string_view device) {
+  constexpr int kMerged = 4;  // patches per token (merge 2 x 2)
+  return device == "npu"
+             ? npu::kVitAttnMaxPatches / kMerged
+             : static_cast<int>(image::kMaxPixels /
+                                (kImageFactor * kImageFactor));
+}
+
+void CheckMaxImageTokens(int max_image_tokens, std::string_view device) {
+  const int most = MaxImageTokens(device);
+  if (max_image_tokens < kMinImageTokens || max_image_tokens > most) {
+    throw std::invalid_argument(
+        "max image tokens " + std::to_string(max_image_tokens) +
+        " is outside " + std::to_string(kMinImageTokens) + ".." +
+        std::to_string(most) + " for Qwen3-VL-Embedding-2B on " +
+        std::string(device));
+  }
+}
+
 EmbeddingModel::EmbeddingModel(const gguf::File& file, const gguf::File* mmproj,
                                std::string_view device,
-                               const std::filesystem::path& kernel_dir) {
+                               const std::filesystem::path& kernel_dir,
+                               int max_image_tokens)
+    : max_image_tokens_(max_image_tokens) {
+  if (mmproj != nullptr && (device == "cpu" || device == "npu")) {
+    CheckMaxImageTokens(max_image_tokens, device);
+  }
   if (device == "cpu") {
     text_ = std::make_unique<Reference>(file);
     if (mmproj != nullptr) {
@@ -68,8 +94,9 @@ std::vector<float> EmbeddingModel::EmbedImage(const std::vector<int>& ids,
         std::to_string(image.rgb.size()) + " RGB values");
   }
   const VisionConfig& vc = vision_->config();
-  const Patches patches = PreprocessImage(image.rgb.data(), image.width,
-                                          image.height, vc.patch, vc.merge);
+  const Patches patches =
+      PreprocessImage(image.rgb.data(), image.width, image.height, vc.patch,
+                      vc.merge, MaxImagePixels(max_image_tokens_));
   return text_->EmbedImage(ids, image_pad_id, {vision_->Encode(patches)});
 }
 

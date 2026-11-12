@@ -87,15 +87,17 @@ struct Patches {
 Patches Patchify(const std::uint8_t* rgb, int width, int height, int patch,
                  int merge);
 
-// SmartResize, ResizeBicubic and Patchify: what the reference embedder
-// feeds the vision tower for a decoded RGB8 image.
+// SmartResize (to at most `max_pixels`), ResizeBicubic and Patchify: what
+// the reference embedder feeds the vision tower for a decoded RGB8 image.
 Patches PreprocessImage(const std::uint8_t* rgb, int width, int height,
-                        int patch, int merge);
+                        int patch, int merge,
+                        int max_pixels = kImageMaxPixels);
 
 // The <|image_pad|> tokens an image of this size takes: its SmartResize
 // grid in merged tokens (`factor` = patch x merge). Needs no weights, so an
 // input's ids can be built before the model loads. Throws as SmartResize.
-int ImageTokens(int width, int height, int factor = kImageFactor);
+int ImageTokens(int width, int height, int factor = kImageFactor,
+                int max_pixels = kImageMaxPixels);
 
 // qwen_vl_utils' to_rgb, which the reference embedder applies to every
 // image before resizing: with an alpha channel (one value per pixel) the

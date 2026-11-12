@@ -62,24 +62,6 @@ std::optional<std::vector<std::uint8_t>> DecodeBase64(std::string_view text) {
   return out;
 }
 
-// The bytes of a base64 data URI ("data:image/png;base64,..."). The server
-// fetches nothing, so URLs and paths are refused.
-std::vector<std::uint8_t> DataUriBytes(std::string_view uri) {
-  const auto comma = uri.find(',');
-  if (!uri.starts_with("data:image") || comma == std::string_view::npos ||
-      !uri.substr(0, comma).ends_with(";base64")) {
-    throw InvalidRequest(
-        "an image must be a base64 data URI (data:image/png;base64,... or "
-        "data:image/jpeg;base64,...); URLs are not fetched",
-        "input");
-  }
-  auto bytes = DecodeBase64(uri.substr(comma + 1));
-  if (!bytes) {
-    throw InvalidRequest("an image's data URI is not valid base64", "input");
-  }
-  return std::move(*bytes);
-}
-
 // A field that is absent or null reads as missing.
 const json* Field(const json& body, const char* name) {
   const auto it = body.find(name);
@@ -87,6 +69,112 @@ const json* Field(const json& body, const char* name) {
     return nullptr;
   }
   return &*it;
+}
+
+// The bytes of a base64 data URI ("data:image/png;base64,..."). The server
+// fetches nothing, so URLs and paths are refused (400 for `param`).
+bool IsImageDataUri(std::string_view uri) {
+  const auto comma = uri.find(',');
+  return uri.starts_with("data:image") && comma != std::string_view::npos &&
+         uri.substr(0, comma).ends_with(";base64");
+}
+
+std::vector<std::uint8_t> DataUriBytes(std::string_view uri,
+                                       const char* param) {
+  if (!IsImageDataUri(uri)) {
+    throw InvalidRequest(
+        "an image must be a base64 data URI (data:image/png;base64,... or "
+        "data:image/jpeg;base64,...); URLs and paths are not fetched",
+        param);
+  }
+  auto bytes = DecodeBase64(uri.substr(uri.find(',') + 1));
+  if (!bytes) {
+    throw InvalidRequest("an image's data URI is not valid base64", param);
+  }
+  return std::move(*bytes);
+}
+
+// FNV-1a, 64-bit.
+std::uint64_t Fnv1a(const std::vector<std::uint8_t>& bytes) {
+  std::uint64_t h = 0xcbf29ce484222325ull;
+  for (const std::uint8_t b : bytes) {
+    h = (h ^ b) * 0x100000001b3ull;
+  }
+  return h;
+}
+
+// Calls `fn` on each content part of the messages, in order.
+template<typename Fn>
+void ForEachPart(const json& messages, Fn fn) {
+  if (!messages.is_array()) {
+    return;
+  }
+  for (const auto& message : messages) {
+    if (!message.is_object()) {
+      continue;
+    }
+    const auto content = message.find("content");
+    if (content == message.end() || !content->is_array()) {
+      continue;
+    }
+    for (const auto& part : *content) {
+      fn(part);
+    }
+  }
+}
+
+// An image part's data URI, after checking the part's shape (400 for
+// messages); nullptr for a part that is no image.
+const std::string* ImagePartUri(const json& part) {
+  const auto type_is = [&](const char* type) {
+    const auto it = part.find("type");
+    return it != part.end() && *it == type;
+  };
+  if (!IsImagePart(part)) {
+    if (part.is_object() && (part.contains("image") || type_is("image") ||
+                             type_is("input_image"))) {
+      throw InvalidRequest(
+          "an image part must be {\"type\": \"image_url\", \"image_url\": "
+          "{\"url\": \"data:image/png;base64,...\"}}",
+          "messages");
+    }
+    return nullptr;
+  }
+  const auto bad = [] {
+    return InvalidRequest(
+        "an image part must be {\"type\": \"image_url\", \"image_url\": "
+        "{\"url\": a base64 data URI, \"detail\": \"auto\", \"low\" or "
+        "\"high\"}}",
+        "messages");
+  };
+  if (!type_is("image_url")) {
+    throw bad();
+  }
+  for (const auto& [key, value] : part.items()) {
+    if (key != "type" && key != "image_url") {
+      throw bad();
+    }
+  }
+  const json* found = Field(part, "image_url");
+  if (found == nullptr || !found->is_object()) {
+    throw bad();
+  }
+  const json& image_url = *found;
+  for (const auto& [key, value] : image_url.items()) {
+    if (key != "url" && key != "detail") {
+      throw bad();
+    }
+  }
+  if (const json* detail = Field(image_url, "detail")) {
+    if (*detail != "auto" && *detail != "low" && *detail != "high") {
+      throw bad();
+    }
+  }
+  const json* url = Field(image_url, "url");
+  if (url == nullptr || !url->is_string()) {
+    throw bad();
+  }
+  return &url->get_ref<const std::string&>();
 }
 
 std::optional<double> Number(const json& body, const char* name, double lo,
@@ -279,6 +367,22 @@ ChatRequest ParseChatRequest(const json& body) {
     throw InvalidRequest("messages must be a non-empty array", "messages");
   }
   req.prompt.messages = *messages;
+  // Image parts: their shape and data URI now, the pixels once the model
+  // is known to take them (DecodeChatImages).
+  ForEachPart(*messages, [&](const json& part) {
+    const std::string* uri = ImagePartUri(part);
+    if (uri == nullptr) {
+      return;
+    }
+    if (!IsImageDataUri(*uri)) {
+      DataUriBytes(*uri, "messages");  // throws the data URI error
+    }
+    if (++req.images > kMaxChatImages) {
+      throw InvalidRequest("at most " + std::to_string(kMaxChatImages) +
+                               " images per request",
+                           "messages");
+    }
+  });
 
   if (const json* tools = Field(body, "tools")) {
     if (!tools->is_array()) {
@@ -548,7 +652,7 @@ EmbeddingsRequest ParseEmbeddingsRequest(const json& body) {
                                " image inputs per request",
                            "input");
     }
-    const auto bytes = DataUriBytes(data->get<std::string>());
+    const auto bytes = DataUriBytes(data->get<std::string>(), "input");
     try {
       auto decoded = image::Decode(bytes, pixels_left);
       pixels_left -= static_cast<long>(decoded.width) * decoded.height;
@@ -614,6 +718,31 @@ EmbeddingsRequest ParseEmbeddingsRequest(const json& body) {
     throw InvalidRequest("user must be a string", "user");
   }
   return req;
+}
+
+std::vector<PromptImage> DecodeChatImages(const ChatPrompt& prompt) {
+  std::vector<PromptImage> images;
+  long pixels_left = image::kMaxPixels;  // shared by the request's images
+  ForEachPart(prompt.messages, [&](const json& part) {
+    const std::string* uri = ImagePartUri(part);
+    if (uri == nullptr) {
+      return;
+    }
+    const auto bytes = DataUriBytes(*uri, "messages");
+    PromptImage img;
+    img.hash = Fnv1a(bytes);
+    try {
+      auto decoded = image::Decode(bytes, pixels_left);
+      pixels_left -= static_cast<long>(decoded.width) * decoded.height;
+      img.image = std::make_shared<const image::Decoded>(std::move(decoded));
+    } catch (const std::invalid_argument& e) {
+      throw InvalidRequest("image " + std::to_string(images.size() + 1) +
+                               ": " + e.what(),
+                           "messages");
+    }
+    images.push_back(std::move(img));
+  });
+  return images;
 }
 
 }  // namespace gufo_npu::serve

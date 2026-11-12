@@ -1,6 +1,8 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -31,6 +33,11 @@ struct ModelInfo {
   int embedding_min_dimensions = 0;
   // Image inputs too (an embedding model loaded with its vision tower).
   bool embedding_images = false;
+  // The model's package can load a vision tower (TakesMmproj); a chat
+  // model loaded with one sets chat_images: its prompts may hold images
+  // (GenerateRequest::images, Engine::ChatImageLayout).
+  bool takes_mmproj = false;
+  bool chat_images = false;
 };
 
 // One /v1/embeddings input: text, content as token ids (an OpenAI token
@@ -49,8 +56,35 @@ struct PreparedEmbedding {
   std::shared_ptr<const image::Decoded> image;
 };
 
+// How an image enters a chat prompt, as the model's processor resizes it:
+// the size it is resized to, that size in patches, and the image-pad ids
+// it takes (one per merged token: grid_w * grid_h / merge^2).
+struct ImageLayout {
+  int width = 0;  // resized, in pixels
+  int height = 0;
+  int grid_w = 0;  // in patches
+  int grid_h = 0;
+  int tokens = 0;
+};
+
+// An image of a chat prompt, as the engine receives it. The prompt holds
+// layout.tokens image-pad ids (the chat format's ImagePadToken, Qwen's
+// <|image_pad|>) from `offset`, between the template's vision start and end
+// tokens; the model puts the image's features in those rows. Every image's
+// pads are the same id, so a prompt cache must also compare `hash` before
+// it reuses a prefix that holds an image.
+struct PromptImage {
+  std::shared_ptr<const image::Decoded> image;  // as decoded, alpha kept
+  std::uint64_t hash = 0;  // of the encoded file (FNV-1a, 64-bit)
+  ImageLayout layout;
+  int offset = 0;  // index in GenerateRequest::prompt of its first pad
+};
+
 struct GenerateRequest {
   std::vector<int> prompt;
+  // The prompt's images in order, for an engine with info().chat_images
+  // (others refuse a request that has any); see CheckPromptImages.
+  std::vector<PromptImage> images;
   int max_tokens = 0;
   SamplingParams sampling;
   std::vector<int> stop_ids;  // end the generation (the id is reported)
@@ -58,6 +92,37 @@ struct GenerateRequest {
   // Checked between tokens; when set, the generation ends as kCancelled.
   const std::atomic<bool>* cancel = nullptr;
 };
+
+// Throws std::invalid_argument unless request.images fit request.prompt:
+// each has an image and a run of layout.tokens >= 1 ids of `image_pad_id`
+// from its offset, the runs in order and inside the prompt, and no other
+// prompt id is `image_pad_id`.
+inline void CheckPromptImages(const GenerateRequest& request,
+                              int image_pad_id) {
+  const auto& prompt = request.prompt;
+  std::size_t next = 0;  // the first id not yet checked
+  for (const auto& img : request.images) {
+    const auto begin = static_cast<std::size_t>(img.offset);
+    const auto end = begin + static_cast<std::size_t>(img.layout.tokens);
+    if (!img.image || img.offset < 0 || img.layout.tokens < 1 ||
+        begin < next || end > prompt.size()) {
+      throw std::invalid_argument("an image's pads do not fit the prompt");
+    }
+    for (std::size_t i = next; i < end; ++i) {
+      if ((prompt[i] == image_pad_id) != (i >= begin)) {
+        throw std::invalid_argument(
+            "the prompt's image pads do not match its images");
+      }
+    }
+    next = end;
+  }
+  for (std::size_t i = next; i < prompt.size(); ++i) {
+    if (prompt[i] == image_pad_id) {
+      throw std::invalid_argument(
+          "the prompt's image pads do not match its images");
+    }
+  }
+}
 
 enum class FinishReason { kStop, kLength, kCancelled };
 
@@ -102,6 +167,14 @@ public:
   virtual GenerateResult Generate(const GenerateRequest& request,
                                   const std::function<bool(int)>& on_token) = 0;
 
+  // Chat models with info().chat_images only; others throw
+  // std::invalid_argument. A width x height image's layout in a chat
+  // prompt, resized as the model's processor resizes it, to at most
+  // EngineOptions::max_image_tokens tokens. Needs no weights, so it works
+  // before the model loads. Throws std::invalid_argument for an image the
+  // model cannot take (e.g. an aspect ratio above 200).
+  virtual ImageLayout ChatImageLayout(int width, int height) const;
+
   // Embedding models (info().embedding_length > 0) only; others throw
   // std::invalid_argument.
   //
@@ -117,6 +190,10 @@ public:
       const std::vector<PreparedEmbedding>& inputs);
 };
 
+inline ImageLayout Engine::ChatImageLayout(int, int) const {
+  throw std::invalid_argument(info().id + " takes no images");
+}
+
 inline std::vector<int> Engine::EmbeddingIds(const EmbeddingInput&,
                                              std::string_view) const {
   throw std::invalid_argument(info().id + " does not make embeddings");
@@ -126,6 +203,9 @@ inline std::vector<std::vector<float>> Engine::Embed(
     const std::vector<PreparedEmbedding>&) {
   throw std::invalid_argument(info().id + " does not make embeddings");
 }
+
+// The default of EngineOptions::max_image_tokens (--max-image-tokens).
+inline constexpr int kDefaultMaxImageTokens = 1800;
 
 struct EngineOptions {
   std::string model_path;              // GGUF
@@ -138,10 +218,20 @@ struct EngineOptions {
   // Prompt-cache checkpoints kept between requests (reuse of a multi-turn
   // chat's history); 0: off. The CPU reference has no cache.
   int prompt_cache = 2;
-  // An embedding model's vision tower (its mmproj GGUF), for image inputs;
-  // empty: text only. Other models refuse one.
+  // A vision tower (its mmproj GGUF), for image inputs; empty: text only.
+  // Only a model whose package takes one (TakesMmproj) accepts it: today
+  // the embedding model.
   std::string mmproj_path;
+  // Most merged image tokens per image (the processor's smart_resize
+  // max_pixels, in tokens of 32 x 32 pixels). A model with a vision tower
+  // checks it against its own range at probe and load.
+  int max_image_tokens = kDefaultMaxImageTokens;
 };
+
+// Whether the GGUF's model package can load a vision tower
+// (EngineOptions::mmproj_path); reads only the GGUF's metadata. Throws
+// what gguf::File::Open and the config readers throw.
+bool TakesMmproj(const std::string& model_path);
 
 // Loads the GGUF's model on the device, picking the model package by
 // architecture and shape (Qwen3.5-2B, Qwen3.5-4B, Qwen3.6-35B-A3B, and the
