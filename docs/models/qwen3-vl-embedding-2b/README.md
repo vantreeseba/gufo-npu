@@ -65,7 +65,9 @@ it, checked against HF by the oracle (QUALITY.md):
   (`src/core/image.hpp`, PNG and JPEG), an alpha channel is composited on
   white (qwen_vl_utils' `to_rgb`), and it is resized so both sides are
   multiples of 32 with 4 to 1,800 image tokens (`SmartResize`, Pillow's
-  bicubic). VISION.md has the vision tower.
+  bicubic). `--max-image-tokens` (serve and embed) lowers the cap; 1,800
+  is also the most the NPU's ViT attention program takes, while the CPU
+  reference takes up to 65,536. VISION.md has the vision tower.
 
 ## How an input runs
 

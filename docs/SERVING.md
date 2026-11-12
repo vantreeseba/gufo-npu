@@ -49,7 +49,8 @@ needs the host's XRT (see the Dockerfile).
 | `--draft mtp\|none` | `mtp` | MTP speculative decoding (when the GGUF has the MTP layer). Output is the same either way; `none` is for comparisons. |
 | `--preload ID` | the first `--model` | The model loaded at start. |
 | `--unload-after SECONDS` | `0` (never) | Unload a model that has been idle this long, freeing its device and pinned memory; the next request loads it again. |
-| `--mmproj GGUF` | none | The embedding model's vision tower (Qwen3-VL-Embedding-2B's mmproj GGUF), for image inputs to `/v1/embeddings`; about 0.5 GB more device memory. Needs exactly one embedding `--model`. |
+| `--mmproj GGUF` | none | A vision tower (an mmproj GGUF) for the one `--model` whose package takes one, for image inputs. Today only the embedding model does (Qwen3-VL-Embedding-2B's mmproj, for `/v1/embeddings`; about 0.5 GB more device memory); chat models take none yet, so `--mmproj` without the embedding model, or with two models that take one, is refused at start. |
+| `--max-image-tokens N` | `1800` | Most image tokens per image: an image is resized (its processor's smart_resize, sides multiples of 32) to at most N tokens of 32 x 32 pixels. Checked against the model's range when it has a vision tower: 4 to 1,800 for Qwen3-VL-Embedding-2B on the NPU (its ViT attention program's size), up to 65,536 on `cpu`. Also an `embed` option. |
 | `--log-level LEVEL` | `info` | What goes to stderr: `error`, `warn`, `info` or `debug` ([Logs](#logs)). |
 
 `SIGINT` or `SIGTERM` stops the server.
@@ -65,7 +66,7 @@ Request fields:
 
 | Field | Support |
 |---|---|
-| `messages` | `system`, `user`, `assistant` and `tool` messages, rendered with the model's chat template. A final `assistant` message is continued (prefill). |
+| `messages` | `system`, `user`, `assistant` and `tool` messages, rendered with the model's chat template. A final `assistant` message is continued (prefill). Content may be a string or parts: `text` parts, and `image_url` parts for a model that takes images ([Images](#images)). |
 | `model` | With one model, accepted and ignored: replies carry the model's id. With several, the model to run (404 `model_not_found` if unknown; the loaded model when absent). |
 | `tools`, `tool_choice` | Function tools. `tool_choice` may be `"auto"` (default), `"none"`, `"required"` (the reply is one or more tool calls) or `{"type": "function", "function": {"name": ...}}` (calls to that function). Forced calls are constrained token by token; see [Structured outputs](#structured-outputs). |
 | `max_completion_tokens`, `max_tokens` | Most generated tokens (the first wins). Default and ceiling: the rest of the context. |
@@ -110,6 +111,34 @@ with its `index`, `id`, `type` and `function.name` (empty `arguments`), then
 one with the `arguments`. With `logprobs`, each chunk carries the entries of
 the tokens generated since the previous chunk (`logprobs.content`); entries
 of text held back (a possible stop string or markup) ride on a later chunk.
+
+#### Images
+
+An image part is OpenAI's `{"type": "image_url", "image_url": {"url":
+"data:image/png;base64,...", "detail": "auto"}}`: the image as a base64
+data URI, PNG or JPEG (the format is read from the bytes), as for
+embeddings. The server fetches nothing, so URLs and paths get 400 for
+`messages`. `detail` may be `auto`, `low` or `high` and changes nothing:
+`--max-image-tokens` sets the resize. Other image shapes (`{"type":
+"image"}`, `input_image`), video and audio parts get 400.
+
+Only a chat model started with its vision tower (`--mmproj`) takes images.
+**No chat model does in this build yet**: every image request to a chat
+model gets 400 for `messages`, saying the model takes no images (or, for a
+model that takes a vision tower but was started without one, to start the
+server with `--mmproj`). Qwen3.5-2B is the first to come.
+
+For a model that takes them, the template places each image where it
+stands among the parts, as `<|vision_start|>`, one `<|image_pad|>` per
+image token, `<|vision_end|>`, in user, assistant and tool messages; a
+system or developer message with an image gets 400, as the template refuses
+it. The image tokens count in `usage.prompt_tokens` and against the
+context. A request holds at most 16 images, of at most 67,108,864 pixels
+together; an image that does not decode gets 400 for `messages`, as does
+message text that holds `<|image_pad|>` itself. The engine receives the
+prompt's token ids and, per image, the decoded pixels, its resized size
+and patch grid, and where its pads start (`PromptImage` in
+`src/serve/engine.hpp`).
 
 #### Log probabilities
 
@@ -162,8 +191,8 @@ nothing, so URLs and paths get 400. Images need the server started with
 `--mmproj`; without it they get 400 for `input`. They are decoded to the
 pixels Pillow gives (`src/core/image.hpp`), with an alpha channel
 composited on white and EXIF orientation not applied, as the model's
-reference embedder does, then resized as it resizes them, to at most 1,800
-image tokens. A request holds at most 16 images, of at most 67,108,864
+reference embedder does, then resized as it resizes them, to at most
+`--max-image-tokens` (default 1,800) image tokens. A request holds at most 16 images, of at most 67,108,864
 pixels (64 Mi) together; a file that does not decode gets 400 for `input`.
 An image counts one token per 32 x 32 pixels of its resized size in
 `prompt_tokens`. Images run one at a time after the request's texts; a
@@ -319,6 +348,7 @@ Generation keys (summed over a request's choices):
 | `prefill_tps` | `prefill_tokens` over the time to each choice's first token. |
 | `decode_tps` | `generated_tokens` over the decode time. |
 | `draft` | `mtp` or `none`; with `mtp`, `decode_steps` (verify passes), `draft_accepted` and `acceptance_pct`. |
+| `images`, `image_tokens` | A chat prompt's images and their image tokens, when it has any. |
 | `response_format`, `tools`, `tool_choice`, `logprobs` | Present when the request used them. |
 | `reason` | An engine failure's message. |
 
@@ -536,7 +566,9 @@ client (`pip install openai httpx`). Each takes `--base-url` (default
   [Several models](#several-models)).
 - Tool-call arguments streamed while the model writes them (a call is sent
   once complete).
-- Images and audio.
+- Images in chat: the API takes `image_url` parts ([Images](#images)), but
+  no chat model runs them yet, so they get 400. Embeddings take images.
+- Audio and video.
 - The `/v1/responses` API.
 - An embedding model resident next to a chat model: in one server they take
   turns like any two models; run a second server for embeddings to keep
