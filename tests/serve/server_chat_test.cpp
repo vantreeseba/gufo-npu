@@ -1,23 +1,36 @@
 // The server end to end with the real Qwen3.5 chat format over a scripted
 // engine (tests/serve/fakes.hpp): reasoning and tool calls come back as
 // OpenAI message parts, streaming and not, and a tool result round trip
-// renders the prompt the chat format renders for the same messages.
+// renders the prompt the chat format renders for the same messages. Image
+// parts (data URIs of tests/fixtures/image): refused by a model without
+// image support, expanded to one pad per image token with the decoded
+// image and its span for one that has it, and the requests refused.
 #include <httplib/httplib.h>
 
+#include <algorithm>
+#include <cstdint>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <memory>
 #include <nlohmann/json.hpp>
+#include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "fakes.hpp"
 #include "serve/chat_format.hpp"
+#include "serve/openai.hpp"
 #include "serve/server.hpp"
 
 namespace {
 
 using gufo_npu::serve::ChatFormat;
 using gufo_npu::serve::ChatPrompt;
+using gufo_npu::serve::ImageLayout;
 using gufo_npu::serve::Server;
 using gufo_npu::serve::ServerOptions;
 using gufo_npu::serve::testing::FakeEngine;
@@ -228,13 +241,311 @@ void TestToolRoundTrip(FakeEngine& engine, const Running& s,
         "tool result: the engine got the chat format's prompt");
 }
 
+// ---- Images ----
+
+constexpr int kImagePad = 248056;
+
+// A chat model that takes images: one id per byte of text (the byte's
+// value), <|image_pad|> as Qwen's id, and a layout that rounds each side
+// up to 32 pixels (16-pixel patches, 2 x 2 merged).
+class ImageEngine : public FakeEngine {
+public:
+  ImageEngine(bool chat_images, bool takes_mmproj) {
+    info_.chat_images = chat_images;
+    info_.takes_mmproj = takes_mmproj;
+    info_.vocab = 248320;
+  }
+  std::vector<int> Encode(std::string_view text) const override {
+    std::vector<int> ids;
+    for (const unsigned char c : text) {
+      ids.push_back(c);
+    }
+    return ids;
+  }
+  int FindToken(std::string_view token) const override {
+    return token == "<|image_pad|>" ? kImagePad : FakeEngine::FindToken(token);
+  }
+  ImageLayout ChatImageLayout(int width, int height) const override {
+    if (std::max(width, height) > 200 * std::min(width, height)) {
+      throw std::invalid_argument("aspect ratio above 200");
+    }
+    ImageLayout layout;
+    layout.width = (width + 31) / 32 * 32;
+    layout.height = (height + 31) / 32 * 32;
+    layout.grid_w = layout.width / 16;
+    layout.grid_h = layout.height / 16;
+    layout.tokens = layout.grid_w * layout.grid_h / 4;
+    return layout;
+  }
+};
+
+std::vector<std::uint8_t> ReadAll(const std::filesystem::path& path) {
+  std::ifstream in(path, std::ios::binary);
+  return {std::istreambuf_iterator<char>(in), {}};
+}
+
+std::string ToBase64(const std::vector<std::uint8_t>& bytes) {
+  static const char kAlphabet[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  for (std::size_t i = 0; i < bytes.size(); i += 3) {
+    const unsigned n = bytes[i] << 16 |
+                       (i + 1 < bytes.size() ? bytes[i + 1] << 8 : 0) |
+                       (i + 2 < bytes.size() ? bytes[i + 2] : 0);
+    out += kAlphabet[n >> 18 & 63];
+    out += kAlphabet[n >> 12 & 63];
+    out += i + 1 < bytes.size() ? kAlphabet[n >> 6 & 63] : '=';
+    out += i + 2 < bytes.size() ? kAlphabet[n & 63] : '=';
+  }
+  return out;
+}
+
+std::string DataUri(const std::filesystem::path& file, const char* type) {
+  return std::string("data:") + type + ";base64," + ToBase64(ReadAll(file));
+}
+
+ordered_json ImagePart(const std::string& url) {
+  return {{"type", "image_url"}, {"image_url", {{"url", url}}}};
+}
+
+ordered_json TextPart(const std::string& text) {
+  return {{"type", "text"}, {"text", text}};
+}
+
+ordered_json UserParts(ordered_json parts) {
+  return {{"messages",
+           ordered_json::array({{{"role", "user"}, {"content", parts}}})}};
+}
+
+httplib::Result PostRaw(const Running& s, const ordered_json& body) {
+  return s.Client().Post("/v1/chat/completions", body.dump(),
+                         "application/json");
+}
+
+// "param/code" of an error reply.
+std::string ErrorParam(const httplib::Result& r) {
+  if (!r) {
+    return "no response";
+  }
+  const auto body = json::parse(r->body, nullptr, false);
+  if (!body.is_object() || !body.contains("error")) {
+    return "no error body";
+  }
+  const auto& e = body["error"];
+  return (e["param"].is_string() ? e["param"].get<std::string>() : "") + "/" +
+         (e["code"].is_string() ? e["code"].get<std::string>() : "");
+}
+
+std::vector<int> Bytes(const std::string& text) {
+  std::vector<int> ids;
+  for (const unsigned char c : text) {
+    ids.push_back(c);
+  }
+  return ids;
+}
+
+void TestImagesRefusedWithoutSupport(const ChatFormat& format,
+                                     const std::filesystem::path& fixtures) {
+  const auto body = UserParts(
+      {TextPart("What is this?"),
+       ImagePart(DataUri(fixtures / "rgb8.png", "image/png"))});
+  {
+    ImageEngine engine(false, false);  // every chat model today
+    Running s(engine, format);
+    const auto r = PostRaw(s, body);
+    Check(r && r->status == 400 && ErrorParam(r) == "messages/" &&
+              r->body.find("takes no images") != std::string::npos &&
+              r->body.find("--mmproj") != std::string::npos,
+          "images: a model without image support gives 400 for messages");
+    Check(engine.generations() == 0, "images: refused before generating");
+  }
+  {
+    ImageEngine engine(false, true);  // takes a vision tower, started without
+    Running s(engine, format);
+    const auto r = PostRaw(s, body);
+    Check(r && r->status == 400 && ErrorParam(r) == "messages/" &&
+              r->body.find("start the server with --mmproj") !=
+                  std::string::npos,
+          "images: a model started without --mmproj names it");
+  }
+}
+
+void TestImagePrompt(const ChatFormat& format,
+                     const std::filesystem::path& fixtures) {
+  ImageEngine engine(true, true);
+  Running s(engine, format);
+  engine.Script({"A", " cat."});
+  const std::string png = DataUri(fixtures / "rgb8.png", "image/png");
+  const std::string jpeg = DataUri(fixtures / "jpeg420.jpg", "image/jpeg");
+
+  // One image between text: 37 x 29 pixels -> 64 x 32, a 4 x 2 patch grid,
+  // 2 tokens.
+  auto r = Post(s, UserParts({TextPart("Describe "), ImagePart(png),
+                              TextPart(" please")}));
+  auto gen = engine.last();
+  std::vector<int> want = Bytes("<|im_start|>user\nDescribe <|vision_start|>");
+  const auto offset = static_cast<int>(want.size());
+  want.insert(want.end(), 2, kImagePad);
+  const auto tail = Bytes(
+      "<|vision_end|> please<|im_end|>\n<|im_start|>assistant\n"
+      "<think>\n\n</think>\n\n");
+  want.insert(want.end(), tail.begin(), tail.end());
+  Check(r["choices"][0]["message"].value("content", "") == "A cat.",
+        "image: the reply");
+  Check(gen.prompt == want, "image: text ids, the pads, text ids");
+  Check(gen.images.size() == 1 && gen.images[0].offset == offset &&
+            gen.images[0].layout.tokens == 2 &&
+            gen.images[0].layout.grid_w == 4 &&
+            gen.images[0].layout.grid_h == 2 &&
+            gen.images[0].layout.width == 64 &&
+            gen.images[0].layout.height == 32,
+        "image: its span and layout");
+  Check(!gen.images.empty() && gen.images[0].image->width == 37 &&
+            gen.images[0].image->height == 29 &&
+            gen.images[0].image->rgb == ReadAll(fixtures / "rgb8.rgb"),
+        "image: decoded to Pillow's pixels");
+  Check(r["usage"]["prompt_tokens"] == static_cast<int>(want.size()),
+        "image: usage counts the image tokens");
+  bool checked = true;
+  try {
+    gufo_npu::serve::CheckPromptImages(gen, kImagePad);
+  } catch (const std::invalid_argument&) {
+    checked = false;
+  }
+  Check(checked, "image: CheckPromptImages accepts the server's prompt");
+
+  // Two images in order, over two turns, streamed; `detail` is accepted.
+  ordered_json jpeg_part = ImagePart(jpeg);
+  jpeg_part["image_url"]["detail"] = "low";
+  ordered_json body = {
+      {"messages",
+       ordered_json::array(
+           {{{"role", "user"},
+             {"content", ordered_json::array({ImagePart(png), TextPart("?")})}},
+            {{"role", "assistant"}, {"content", "A cat."}},
+            {{"role", "user"},
+             {"content", ordered_json::array({jpeg_part})}}})}};
+  const auto events = Stream(s, body);
+  gen = engine.last();
+  Check(!events.empty() && gen.images.size() == 2 &&
+            gen.images[0].offset < gen.images[1].offset &&
+            gen.images[1].image->rgb == ReadAll(fixtures / "jpeg420.rgb") &&
+            gen.images[0].hash != gen.images[1].hash,
+        "two images: in order, each its own");
+  checked = true;
+  try {
+    gufo_npu::serve::CheckPromptImages(gen, kImagePad);
+  } catch (const std::invalid_argument&) {
+    checked = false;
+  }
+  Check(checked, "two images: CheckPromptImages accepts them");
+
+  // What is refused: 400 for messages.
+  const auto refused = [&](const ordered_json& b, const std::string& what) {
+    const auto res = PostRaw(s, b);
+    Check(res && res->status == 400 && ErrorParam(res) == "messages/",
+          what + ": 400 for messages");
+  };
+  const auto one = [&](const ordered_json& part) {
+    return UserParts({TextPart("x"), part});
+  };
+  refused(one(ImagePart("https://example.com/a.png")), "an image URL");
+  refused(one(ImagePart("/tmp/a.png")), "an image path");
+  refused(one(ImagePart("data:image/png;base64,@@@@")), "invalid base64");
+  refused(one(ImagePart("data:image/png;base64," +
+                        ToBase64({'h', 'e', 'l', 'l', 'o'}))),
+          "bytes that are no image");
+  refused(one(ImagePart(DataUri(fixtures / "truncated.png", "image/png"))),
+          "a truncated PNG");
+  refused(one(ImagePart(DataUri(fixtures / "huge.png", "image/png"))),
+          "an image over the pixel limit");
+  refused(one({{"type", "image_url"}, {"image_url", png}}),
+          "image_url as a string");
+  refused(one({{"type", "image"}, {"image", png}}), "a type image part");
+  refused(one({{"type", "input_image"}, {"image_url", png}}),
+          "an input_image part");
+  ordered_json bad_detail = ImagePart(png);
+  bad_detail["image_url"]["detail"] = "ultra";
+  refused(one(bad_detail), "an unknown detail");
+  ordered_json extra = ImagePart(png);
+  extra["image_url"]["size"] = 3;
+  refused(one(extra), "an unknown image_url field");
+  ordered_json many = ordered_json::array();
+  for (int i = 0; i <= gufo_npu::serve::kMaxChatImages; ++i) {
+    many.push_back(ImagePart(png));
+  }
+  refused(UserParts(many), "too many images");
+  refused({{"messages",
+            ordered_json::array(
+                {{{"role", "system"},
+                  {"content", ordered_json::array({ImagePart(png)})}},
+                 {{"role", "user"}, {"content", "hi"}}})}},
+          "an image in the system message");
+  refused(UserParts({TextPart("a <|image_pad|> b"), ImagePart(png)}),
+          "an image pad in the text");
+  const int before = engine.generations();
+  refused(UserParts({TextPart("plain <|image_pad|>")}),
+          "an image pad in text without images");
+  Check(engine.generations() == before, "refusals generate nothing");
+}
+
+void TestCheckPromptImages() {
+  using gufo_npu::serve::CheckPromptImages;
+  using gufo_npu::serve::GenerateRequest;
+  using gufo_npu::serve::PromptImage;
+  const auto image = std::make_shared<const gufo_npu::image::Decoded>();
+  const auto request = [&](std::vector<int> prompt,
+                           std::vector<std::pair<int, int>> spans) {
+    GenerateRequest r;
+    r.prompt = std::move(prompt);
+    for (const auto& [offset, tokens] : spans) {
+      PromptImage img;
+      img.image = image;
+      img.offset = offset;
+      img.layout.tokens = tokens;
+      r.images.push_back(img);
+    }
+    return r;
+  };
+  const auto ok = [&](const GenerateRequest& r) {
+    try {
+      CheckPromptImages(r, kImagePad);
+      return true;
+    } catch (const std::invalid_argument&) {
+      return false;
+    }
+  };
+  const int p = kImagePad;
+  Check(ok(request({1, p, p, 2, p, 3}, {{1, 2}, {4, 1}})),
+        "CheckPromptImages: two runs");
+  Check(ok(request({1, 2}, {})), "CheckPromptImages: no images");
+  Check(!ok(request({1, p, p, 2}, {{1, 1}})),
+        "CheckPromptImages: a pad outside the runs");
+  Check(!ok(request({1, p, 2}, {{1, 2}})),
+        "CheckPromptImages: a run past its pads");
+  Check(!ok(request({1, p, p}, {{1, 3}})),
+        "CheckPromptImages: a run past the prompt");
+  Check(!ok(request({p, p, 1, p}, {{3, 1}, {0, 2}})),
+        "CheckPromptImages: runs out of order");
+  Check(!ok(request({1, p}, {{1, 0}})), "CheckPromptImages: an empty run");
+}
+
 }  // namespace
 
-int main() {
-  FakeEngine engine;
+int main(int argc, char** argv) {
+  if (argc != 2) {
+    std::fprintf(stderr, "usage: serve_chat_test <image-fixtures>\n");
+    return 2;
+  }
   const auto format = gufo_npu::serve::NewQwen35ChatFormat();
-  Running s(engine, *format);
-  TestReasoning(engine, s);
-  TestToolRoundTrip(engine, s, *format);
+  {
+    FakeEngine engine;
+    Running s(engine, *format);
+    TestReasoning(engine, s);
+    TestToolRoundTrip(engine, s, *format);
+  }
+  TestImagesRefusedWithoutSupport(*format, argv[1]);
+  TestImagePrompt(*format, argv[1]);
+  TestCheckPromptImages();
   return failures == 0 ? 0 : 1;
 }

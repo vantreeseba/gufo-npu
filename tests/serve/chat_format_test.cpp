@@ -9,6 +9,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "models/qwen35/chat.hpp"
@@ -501,6 +502,74 @@ void CheckCliRenderChat() {
   std::printf("ok: qwen35::RenderChat matches\n");
 }
 
+// RenderImages: the render cut at each image's pad, every image numbered
+// in IsImagePart order; Render is the pieces joined by one pad each.
+void CheckRenderImages(const std::string& dir) {
+  const Json cases = ReadJson(dir + "/chat_cases.json");
+  const auto format = NewQwen35ChatFormat();
+  const std::string pad = format->ImagePadToken();
+  if (pad != "<|image_pad|>") {
+    Fail("image pad token: " + pad);
+  }
+  // Per case, the image numbers the prompt holds.
+  const std::vector<std::pair<std::string, std::vector<int>>> want = {
+      {"image_url_part", {0}},
+      {"image_first_then_text", {0}},
+      {"two_images_between_text", {0, 1}},
+      {"images_across_turns", {0, 1}},
+      {"image_in_assistant_and_tool", {0, 1}},
+      {"image_prefill", {0}},
+      {"later_system_image_dropped", {1}},  // image 0 is in a dropped message
+      {"user_only", {}},
+  };
+  for (const auto& [name, images] : want) {
+    const Json* found = nullptr;
+    for (const auto& c : cases) {
+      if (c["name"] == name) {
+        found = &c;
+      }
+    }
+    if (found == nullptr) {
+      Fail("render images: no case " + name);
+      continue;
+    }
+    ChatPrompt prompt;
+    prompt.messages = (*found)["messages"];
+    prompt.tools = found->value("tools", Json::array());
+    prompt.thinking = found->value("thinking", false);
+    const auto cut = format->RenderImages(prompt);
+    if (cut.images != images || cut.text.size() != images.size() + 1) {
+      Fail("render images " + name + ": images or pieces");
+      continue;
+    }
+    std::string joined = cut.text.front();
+    for (std::size_t k = 1; k < cut.text.size(); ++k) {
+      if (!cut.text[k - 1].ends_with("<|vision_start|>") ||
+          !cut.text[k].starts_with("<|vision_end|>")) {
+        Fail("render images " + name + ": a cut outside the vision markup");
+      }
+      joined += pad + cut.text[k];
+    }
+    if (joined != format->Render(prompt)) {
+      Fail("render images " + name + ": pieces do not join to Render");
+    }
+  }
+  // Image parts other than image_url are refused, as video is.
+  for (const char* part :
+       {R"({"type": "image", "image": "x"})", R"({"image": "x"})",
+        R"({"type": "video", "video": "x"})"}) {
+    ChatPrompt prompt;
+    prompt.messages = Json::array(
+        {{{"role", "user"}, {"content", Json::array({Json::parse(part)})}}});
+    try {
+      format->RenderImages(prompt);
+      Fail(std::string("render images: accepted ") + part);
+    } catch (const std::invalid_argument&) {
+    }
+  }
+  std::printf("ok: images cut at their pads\n");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -514,6 +583,7 @@ int main(int argc, char** argv) {
     CheckHoldBack();
     CheckRoundTrip();
     CheckCliRenderChat();
+    CheckRenderImages(argv[1]);
     const auto stops = NewQwen35ChatFormat()->StopTokens();
     if (stops != std::vector<std::string>{"<|im_end|>", "<|endoftext|>"}) {
       Fail("stop tokens");

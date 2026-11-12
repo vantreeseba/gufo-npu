@@ -54,6 +54,13 @@ int main() {
   mismatched.architecture = "qwen35";
   Expect(!NpuPackageFor(mismatched), "a dense arch with experts is refused");
 
+  // No chat package takes a vision tower (--mmproj) yet.
+  for (const auto package : {ModelPackage::kQwen35_2B, ModelPackage::kQwen35_4B,
+                             ModelPackage::kQwen36_35B_A3B}) {
+    Expect(!gufo_npu::serve::TakesVisionTower(package),
+           "chat packages take no vision tower yet");
+  }
+
   Expect(NormalizeModelId("Qwen3.6-35B-A3B") == "qwen3.6-35b-a3b",
          "ids are lowercase");
   Expect(NormalizeModelId("Qwen3.5 4B_MTP") == "qwen3.5-4b-mtp",
