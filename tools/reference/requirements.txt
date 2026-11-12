@@ -1,8 +1,11 @@
-# HF transformers oracles: the CPU reference (tools/reference/qwen35_oracle.py)
-# and Qwen3-VL-Embedding-2B (qwen3vl_embedding_oracle.py).
+# HF transformers oracles: the CPU reference (tools/reference/qwen35_oracle.py),
+# Qwen3-VL-Embedding-2B (qwen3vl_embedding_oracle.py) and Qwen3.5-2B image
+# prompts (qwen35_2b_vl_oracle.py, which needs torchvision and Pillow).
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.13.0+cpu
+torchvision==0.28.0+cpu
 transformers==5.21.0
+pillow==13.0.0
 safetensors
 numpy
 huggingface_hub
