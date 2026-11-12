@@ -345,8 +345,8 @@ Patches Patchify(const std::uint8_t* rgb, int width, int height, int patch,
 
 Patches PreprocessImage(const std::uint8_t* rgb, int width, int height,
                         int patch, int merge, int max_pixels) {
-  const ImageSize size = SmartResize(height, width, patch * merge,
-                                     kImageMinPixels, max_pixels);
+  const ImageSize size =
+      SmartResize(height, width, patch * merge, kImageMinPixels, max_pixels);
   if (size.width == width && size.height == height) {
     return Patchify(rgb, width, height, patch, merge);
   }

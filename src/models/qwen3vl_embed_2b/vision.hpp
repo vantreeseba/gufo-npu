@@ -90,8 +90,7 @@ Patches Patchify(const std::uint8_t* rgb, int width, int height, int patch,
 // SmartResize (to at most `max_pixels`), ResizeBicubic and Patchify: what
 // the reference embedder feeds the vision tower for a decoded RGB8 image.
 Patches PreprocessImage(const std::uint8_t* rgb, int width, int height,
-                        int patch, int merge,
-                        int max_pixels = kImageMaxPixels);
+                        int patch, int merge, int max_pixels = kImageMaxPixels);
 
 // The <|image_pad|> tokens an image of this size takes: its SmartResize
 // grid in merged tokens (`factor` = patch x merge). Needs no weights, so an

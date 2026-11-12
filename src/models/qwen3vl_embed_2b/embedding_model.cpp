@@ -13,10 +13,9 @@ namespace gufo_npu::qwen3vl_embed_2b {
 
 int MaxImageTokens(std::string_view device) {
   constexpr int kMerged = 4;  // patches per token (merge 2 x 2)
-  return device == "npu"
-             ? npu::kVitAttnMaxPatches / kMerged
-             : static_cast<int>(image::kMaxPixels /
-                                (kImageFactor * kImageFactor));
+  return device == "npu" ? npu::kVitAttnMaxPatches / kMerged
+                         : static_cast<int>(image::kMaxPixels /
+                                            (kImageFactor * kImageFactor));
 }
 
 void CheckMaxImageTokens(int max_image_tokens, std::string_view device) {

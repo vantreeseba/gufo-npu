@@ -491,10 +491,10 @@ public:
         info_(std::move(info)),
         image_pad_(tokenizer_.Find(qwen3vl_embed_2b::kImagePad)),
         max_image_tokens_(options.max_image_tokens),
-        model_(*file_, mmproj_.get(), options.device,
-               options.device == "npu" ? KernelDir(options.kernels)
-                                       : fs::path(),
-               options.max_image_tokens) {}
+        model_(
+            *file_, mmproj_.get(), options.device,
+            options.device == "npu" ? KernelDir(options.kernels) : fs::path(),
+            options.max_image_tokens) {}
 
   const ModelInfo& info() const override { return info_; }
   const Tokenizer& tokenizer() const override { return tokenizer_; }

@@ -346,9 +346,9 @@ std::vector<int> Bytes(const std::string& text) {
 
 void TestImagesRefusedWithoutSupport(const ChatFormat& format,
                                      const std::filesystem::path& fixtures) {
-  const auto body = UserParts(
-      {TextPart("What is this?"),
-       ImagePart(DataUri(fixtures / "rgb8.png", "image/png"))});
+  const auto body =
+      UserParts({TextPart("What is this?"),
+                 ImagePart(DataUri(fixtures / "rgb8.png", "image/png"))});
   {
     ImageEngine engine(false, false);  // every chat model today
     Running s(engine, format);
@@ -363,10 +363,10 @@ void TestImagesRefusedWithoutSupport(const ChatFormat& format,
     ImageEngine engine(false, true);  // takes a vision tower, started without
     Running s(engine, format);
     const auto r = PostRaw(s, body);
-    Check(r && r->status == 400 && ErrorParam(r) == "messages/" &&
-              r->body.find("start the server with --mmproj") !=
-                  std::string::npos,
-          "images: a model started without --mmproj names it");
+    Check(
+        r && r->status == 400 && ErrorParam(r) == "messages/" &&
+            r->body.find("start the server with --mmproj") != std::string::npos,
+        "images: a model started without --mmproj names it");
   }
 }
 
@@ -475,12 +475,12 @@ void TestImagePrompt(const ChatFormat& format,
     many.push_back(ImagePart(png));
   }
   refused(UserParts(many), "too many images");
-  refused({{"messages",
-            ordered_json::array(
-                {{{"role", "system"},
-                  {"content", ordered_json::array({ImagePart(png)})}},
-                 {{"role", "user"}, {"content", "hi"}}})}},
-          "an image in the system message");
+  refused(
+      {{"messages", ordered_json::array(
+                        {{{"role", "system"},
+                          {"content", ordered_json::array({ImagePart(png)})}},
+                         {{"role", "user"}, {"content", "hi"}}})}},
+      "an image in the system message");
   refused(UserParts({TextPart("a <|image_pad|> b"), ImagePart(png)}),
           "an image pad in the text");
   const int before = engine.generations();

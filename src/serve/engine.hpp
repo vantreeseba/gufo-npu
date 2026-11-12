@@ -104,8 +104,8 @@ inline void CheckPromptImages(const GenerateRequest& request,
   for (const auto& img : request.images) {
     const auto begin = static_cast<std::size_t>(img.offset);
     const auto end = begin + static_cast<std::size_t>(img.layout.tokens);
-    if (!img.image || img.offset < 0 || img.layout.tokens < 1 ||
-        begin < next || end > prompt.size()) {
+    if (!img.image || img.offset < 0 || img.layout.tokens < 1 || begin < next ||
+        end > prompt.size()) {
       throw std::invalid_argument("an image's pads do not fit the prompt");
     }
     for (std::size_t i = next; i < end; ++i) {

@@ -378,9 +378,9 @@ ChatRequest ParseChatRequest(const json& body) {
       DataUriBytes(*uri, "messages");  // throws the data URI error
     }
     if (++req.images > kMaxChatImages) {
-      throw InvalidRequest("at most " + std::to_string(kMaxChatImages) +
-                               " images per request",
-                           "messages");
+      throw InvalidRequest(
+          "at most " + std::to_string(kMaxChatImages) + " images per request",
+          "messages");
     }
   });
 
@@ -736,9 +736,9 @@ std::vector<PromptImage> DecodeChatImages(const ChatPrompt& prompt) {
       pixels_left -= static_cast<long>(decoded.width) * decoded.height;
       img.image = std::make_shared<const image::Decoded>(std::move(decoded));
     } catch (const std::invalid_argument& e) {
-      throw InvalidRequest("image " + std::to_string(images.size() + 1) +
-                               ": " + e.what(),
-                           "messages");
+      throw InvalidRequest(
+          "image " + std::to_string(images.size() + 1) + ": " + e.what(),
+          "messages");
     }
     images.push_back(std::move(img));
   });
