@@ -8,6 +8,7 @@
 #include "core/gguf.hpp"
 #include "models/qwen35/config.hpp"
 #include "models/qwen35/decoder.hpp"
+#include "models/qwen35/rope.hpp"
 #include "models/qwen35/state_capture.hpp"
 
 // The token mixers of a prompt chunk on the CPU, for the NPU prefills of the
@@ -62,9 +63,14 @@ public:
   // multiples of 32, DeltaNet heads of at most 128).
   PrefillMixer(const Config& config, BurstPool& pool, int max_tokens);
 
-  // The chunk the next calls work on: `count` tokens from `position` (their
-  // RoPE angles, as the decoder computes them).
+  // The chunk the next calls work on: `count` tokens from RoPE position
+  // `position` (a text chunk's KV index plus DecodeState::rope_delta), their
+  // RoPE angles as the decoder computes them.
   void SetChunk(int count, int position);
+  // The same with each token's (t, h, w) MRoPE position (`count` of them),
+  // for chunks with image tokens. With t == h == w == position + i it
+  // computes the same angles as SetChunk(count, position).
+  void SetChunk(int count, const RopePosition* positions);
   int count() const { return n_; }
 
   // `in`: the chunk's input projection rows (fp32, `in_stride` apart):
@@ -88,12 +94,13 @@ public:
 
 private:
   void Rope(float* x, int t) const;
+  // Checks `count` against the scratch and makes it the chunk's.
+  void SetCount(int count);
 
   Config config_;
   BurstPool& pool_;
   int max_tokens_ = 0;
   int n_ = 0;
-  int position_ = 0;
   std::vector<float> rope_inv_freq_;
   Floats gates_;                // decay | beta per token and value head
   Floats u_;                    // conv output: q | k | v per token

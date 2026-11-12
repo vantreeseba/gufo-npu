@@ -6,6 +6,13 @@ target_link_libraries(qwen35_config_test PRIVATE gufo_npu_qwen35)
 add_test(NAME qwen35_config_test COMMAND qwen35_config_test)
 set_tests_properties(qwen35_config_test PROPERTIES LABELS qwen35_family)
 
+# RoPE positions: interleaved MRoPE against HF, plain RoPE bit for bit, and
+# DecodeState::rope_delta on a tiny random model.
+add_executable(qwen35_rope_test rope_test.cpp)
+target_link_libraries(qwen35_rope_test PRIVATE gufo_npu_qwen35_npu)
+add_test(NAME qwen35_rope_test COMMAND qwen35_rope_test)
+set_tests_properties(qwen35_rope_test PROPERTIES LABELS qwen35_family)
+
 add_executable(qwen35_prompt_cache_logic_test prompt_cache_test.cpp)
 target_link_libraries(qwen35_prompt_cache_logic_test PRIVATE gufo_npu_qwen35)
 add_test(NAME qwen35_prompt_cache_logic_test COMMAND qwen35_prompt_cache_logic_test)

@@ -121,6 +121,7 @@ DecodeState StatePool::Acquire() {
   }
   // Every buffer takes the fresh state's contents; assign keeps capacity.
   state.position = proto_->position;
+  state.rope_delta = proto_->rope_delta;
   for (std::size_t il = 0; il < state.layers.size(); ++il) {
     const auto& from = proto_->layers[il];
     auto& to = state.layers[il];
@@ -494,8 +495,8 @@ const std::vector<float>& Decoder::Step(int token, State& state) {
     if (c.IsFullAttention(il)) {
       projections_.Apply(Stage::kAttentionIn, il, s.normed.data(), 1,
                          s.in.data());
-      mixer_.Attention(il, s.in.data(), state.position, state.layers[il],
-                       s.mixed.data());
+      mixer_.Attention(il, s.in.data(), state.position + state.rope_delta,
+                       state.layers[il], s.mixed.data());
     } else {
       projections_.Apply(Stage::kLinearIn, il, s.normed.data(), 1, s.in.data());
       mixer_.Linear(il, s.in.data(), state.layers[il], s.mixed.data());

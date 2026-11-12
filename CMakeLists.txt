@@ -85,6 +85,7 @@ add_library(gufo_npu_qwen35 STATIC
   src/models/qwen35/mtp.cpp
   src/models/qwen35/prompt_cache.cpp
   src/models/qwen35/reference.cpp
+  src/models/qwen35/rope.cpp
 )
 target_link_libraries(gufo_npu_qwen35 PUBLIC gufo_npu_core)
 # The decode steps' CPU math vectorizes with AVX2 + FMA (Zen 5 has more; the

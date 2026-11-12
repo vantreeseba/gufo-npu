@@ -343,7 +343,7 @@ struct NpuPrefill::Impl {
       FromC(n, static_cast<int>(in_rows), in.data(), false);
       profile.other_seconds += SecondsSince(start);
       start = Clock::now();
-      mixer->SetChunk(n, state.position + s);
+      mixer->SetChunk(n, state.position + state.rope_delta + s);
       if (l.mix.attention) {
         mixer->Attention(in.data(), in_rows, l.mix, st, mixed.data());
         profile.attention_seconds += SecondsSince(start);
@@ -614,7 +614,7 @@ struct NpuPrefill::Impl {
       Gemm(n, mtp_in->dim, mtp_in->rows, *a_dense, *mtp_b, eh_bytes, *c_dense);
       start = Clock::now();
       FromC(n, static_cast<int>(mtp_in->rows), in.data(), false);
-      mixer->SetChunk(n, position + s);
+      mixer->SetChunk(n, position + mtp.rope_delta + s);
       mixer->AppendKv(in.data(), mtp_in->rows, mtp_mix, mtp.layers[c.layers]);
       profile.other_seconds += SecondsSince(start);
     }

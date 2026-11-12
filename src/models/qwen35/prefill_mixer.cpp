@@ -388,12 +388,7 @@ PrefillMixer::PrefillMixer(const Config& config, BurstPool& pool,
       cfg.linear_head_dim % kDeltaColumns != 0) {
     throw std::runtime_error("npu prefill: unsupported DeltaNet head size");
   }
-  rope_inv_freq_.resize(cfg.rope_dim / 2);
-  for (int i = 0; i < cfg.rope_dim / 2; ++i) {
-    rope_inv_freq_[i] = static_cast<float>(
-        1.0 / std::pow(static_cast<double>(cfg.rope_theta),
-                       2.0 * i / static_cast<double>(cfg.rope_dim)));
-  }
+  rope_inv_freq_ = RopeInvFreq(cfg);
   const auto rows = static_cast<std::size_t>(max_tokens);
   gates_.resize(rows * 2 * cfg.linear_value_heads);
   u_.resize(rows * cfg.ConvChannels());
@@ -402,23 +397,31 @@ PrefillMixer::PrefillMixer(const Config& config, BurstPool& pool,
   rope_sin_.resize(rope_cos_.size());
 }
 
-// cos/sin of each RoPE frequency at the chunk's positions, as the decoder
-// computes them.
-void PrefillMixer::SetChunk(int count, int position) {
+void PrefillMixer::SetCount(int count) {
   if (count < 0 || count > max_tokens_) {
     throw std::logic_error(
         "npu prefill: chunk longer than the mixer's scratch");
   }
   n_ = count;
-  position_ = position;
+}
+
+// cos/sin of each RoPE frequency at the chunk's positions, as the decoder
+// computes them.
+void PrefillMixer::SetChunk(int count, int position) {
+  SetCount(count);
   const int half = config_.rope_dim / 2;
   for (int t = 0; t < n_; ++t) {
-    for (int i = 0; i < half; ++i) {
-      const double angle =
-          static_cast<double>(position_ + t) * rope_inv_freq_[i];
-      rope_cos_[t * half + i] = static_cast<float>(std::cos(angle));
-      rope_sin_[t * half + i] = static_cast<float>(std::sin(angle));
-    }
+    RopeAngles(config_, rope_inv_freq_, TextPosition(position + t),
+               rope_cos_.data() + t * half, rope_sin_.data() + t * half);
+  }
+}
+
+void PrefillMixer::SetChunk(int count, const RopePosition* positions) {
+  SetCount(count);
+  const int half = config_.rope_dim / 2;
+  for (int t = 0; t < n_; ++t) {
+    RopeAngles(config_, rope_inv_freq_, positions[t],
+               rope_cos_.data() + t * half, rope_sin_.data() + t * half);
   }
 }
 

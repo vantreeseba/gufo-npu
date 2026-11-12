@@ -22,7 +22,15 @@ namespace gufo_npu::qwen35 {
 
 // Per-sequence state of a decode (decoder layers, then MTP layers).
 struct DecodeState {
-  int position = 0;
+  int position = 0;  // tokens run so far: the KV caches' next index
+  // The RoPE position of the token at index p is p + rope_delta on every
+  // axis: an image prompt's text continues after its largest MRoPE
+  // position (HF's rope_deltas; rope.hpp, RopeDeltaAfter), so its RoPE
+  // positions run ahead of or behind the KV index. 0 for text-only prompts.
+  // Every decoder, prefill and MTP step of the family adds it to the RoPE
+  // position (never to the KV index); an MTP state carries the main
+  // state's.
+  int rope_delta = 0;
   struct Layer {
     std::vector<float> conv;  // [conv_kernel - 1][channels], oldest first
     std::vector<float> ssm;   // [value heads][key dim i][value dim j]
@@ -84,7 +92,8 @@ public:
               float* ssm_out = nullptr);
   // `in` is the layer's kAttentionIn output [q and gate | k | v] (k is
   // normalized and rotated in place); writes the heads * head_dim inputs of
-  // attn_output to `ctx`.
+  // attn_output to `ctx`. `position` is the RoPE position (a text token's,
+  // state position + rope_delta).
   void Attention(int layer, float* in, int position, DecodeState::Layer& state,
                  float* ctx);
 
@@ -115,8 +124,9 @@ public:
   const Config& config() const { return mixer_.config(); }
   State NewState() const { return mixer_.NewState(); }
 
-  // Runs `token` at state.position, advances the state and returns the
-  // logits (vocab values, valid until the next Step).
+  // Runs `token` at state.position (RoPE at + state.rope_delta), advances
+  // the state and returns the logits (vocab values, valid until the next
+  // Step).
   const std::vector<float>& Step(int token, State& state);
 
 private:

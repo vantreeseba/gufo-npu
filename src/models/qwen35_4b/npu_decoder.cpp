@@ -450,8 +450,8 @@ const float* NpuDecoder::Step(const int* tokens, int count,
   }
   m.Submit(*m.first[count - 1]);
   for (int il = 0; il < c.layers; ++il) {
-    m.Mix(m.layers[il], il, count, state.position, state.layers[il],
-          count == 2);
+    m.Mix(m.layers[il], il, count, state.position + state.rope_delta,
+          state.layers[il], count == 2);
     m.Submit(*m.layers[il].chain[count - 1]);
   }
   state.position += count;
@@ -519,7 +519,8 @@ void NpuDecoder::FillMtp(const float* const* hidden, const int* tokens,
   // eh_proj and the block's input projection; the attention appends to the
   // cache.
   m.Submit(*m.mtp_first[count - 1]);
-  m.Mix(m.mtp, c.layers, count, position, state.layers[c.layers], false);
+  m.Mix(m.mtp, c.layers, count, position + state.rope_delta,
+        state.layers[c.layers], false);
 }
 
 int NpuDecoder::Draft(const float* const* hidden, const int* tokens, int count,
